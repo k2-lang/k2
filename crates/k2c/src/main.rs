@@ -24,6 +24,8 @@
 //! k2c ast <file.k2>          # dump the structured AST (S-expression)
 //! k2c resolve <file.k2>      # resolve names/scopes and print the scope tree
 //! k2c check <file.k2>        # type-check and print per-declaration signatures
+//! k2c mir <file.k2>          # lower to MIR and print the dump (Debug mode)
+//! k2c mir --release-fast <f> # lower with safety checks stripped
 //! k2c help                   # print usage
 //! k2c version                # print the version
 //! ```
@@ -42,6 +44,7 @@ use std::path::Path;
 
 use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
+use k2_mir::{dump_mir, lower_program, BuildMode, Severity as MirSeverity};
 use k2_parse::{parse, to_sexpr, Severity};
 use k2_resolve::{
     dump_resolution, dump_scopes, resolve_file, resolve_module, FileLoader, LoadError,
@@ -88,6 +91,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "ast" => cmd_ast(rest),
         "resolve" => cmd_resolve(rest),
         "check" => cmd_check(rest),
+        "mir" => cmd_mir(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -648,6 +652,153 @@ fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// The `mir` subcommand: parse the source, resolve names, type-check, then lower
+/// to MIR under a chosen build mode and print a readable MIR dump. Parse,
+/// resolution, and type errors each gate lowering (printed, then a nonzero exit,
+/// mirroring `check`). Build mode is selected with `--release-fast` (drop safety
+/// checks), `--release-safe`, or `--debug` (the default, checks on). Lowering and
+/// leak diagnostics are printed to stderr; the dump goes to stdout (unless
+/// `--quiet`, which prints only a one-line summary). Exits nonzero if any
+/// error-severity diagnostic (parse/resolve/type/lower/leak) was produced.
+fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<&str> = None;
+    let mut quiet = false;
+    let mut mode = BuildMode::Debug;
+    for arg in args {
+        match arg.as_str() {
+            "--release-fast" => mode = BuildMode::ReleaseFast,
+            "--release-safe" => mode = BuildMode::ReleaseSafe,
+            "--debug" => mode = BuildMode::Debug,
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `mir` flag `{other}`"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!("`mir` takes exactly one path; got extra `{other}`"));
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| "`mir` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
+
+    let (source, label) = read_source(path)?;
+    let pres = parse(&source);
+
+    // Parse errors gate lowering: report them and stop, like `check`.
+    if !pres.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &pres.diagnostics {
+            if diag.severity == Severity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot lower {label}: it has parse errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Resolution errors also gate lowering.
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &resolved.diagnostics {
+            if diag.severity == ResolveSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot lower {label}: it has resolution errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Type errors also gate lowering.
+    let typed = check_file(&pres.file, &resolved);
+    if !typed.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &typed.diagnostics {
+            if diag.severity == TypeSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot lower {label}: it has type errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Lower to MIR.
+    let prog = match lower_program(&pres.file, &resolved, typed, mode) {
+        Ok(p) => p,
+        Err(diags) => {
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            for diag in &diags {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+            let _ = writeln!(err, "error: cannot lower {label}: lowering failed");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    // Report lowering + leak diagnostics to stderr.
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    for diag in &prog.diagnostics {
+        if diag.severity == MirSeverity::Error {
+            error_count += 1;
+        }
+        let sev = match diag.severity {
+            MirSeverity::Error => "error",
+            MirSeverity::Warning => "warning",
+        };
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {sev}: {}",
+            diag.span.line, diag.span.col, diag.message
+        );
+    }
+    drop(err);
+
+    if error_count == 0 && !quiet {
+        print!("{}", dump_mir(&prog));
+    }
+    if quiet {
+        let _ = writeln!(
+            io::stderr(),
+            "# {} fn(s), {} block(s), {} check(s), {} diag(s)",
+            prog.funcs.len(),
+            prog.block_count(),
+            prog.check_count(),
+            prog.diagnostics.len()
+        );
+    }
+
+    if error_count == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
 /// The filesystem [`FileLoader`] used by `resolve --modules`: it reads a `.k2`
 /// file from disk and parses it, mapping I/O and parse failures to the loader's
 /// error type. The driver is the only crate that performs filesystem I/O for
@@ -769,6 +920,8 @@ fn print_usage() {
          \x20   resolve --modules <f>  Build the module graph across path imports; report cycles.\n\
          \x20   check <file.k2>      Type-check a file; print per-decl signatures (or diagnostics).\n\
          \x20   check --uses <f>     Also dump the per-occurrence type table.\n\
+         \x20   mir <file.k2>        Lower to MIR (Debug mode) and print the dump.\n\
+         \x20   mir --release-fast <f>  Lower with safety checks stripped.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\
@@ -785,6 +938,12 @@ fn print_usage() {
          CHECK FLAGS:\n\
          \x20   --signatures         Print one signature/type per declaration (the default).\n\
          \x20   --uses               Also print the inferred type of every expression occurrence.\n\
+         \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n\
+         \n\
+         MIR FLAGS:\n\
+         \x20   --debug              Lower in Debug mode with safety checks (the default).\n\
+         \x20   --release-safe       Lower in ReleaseSafe mode (safety checks kept).\n\
+         \x20   --release-fast       Lower in ReleaseFast mode (safety checks stripped).\n\
          \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n"
     );
 }

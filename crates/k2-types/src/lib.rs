@@ -88,6 +88,20 @@ pub struct Typed {
     /// The type bound to each value definition (const/var/param/local/capture),
     /// and the [`Type::Fn`] type of each `fn`/method definition.
     pub binding_types: HashMap<DefId, TypeId>,
+    /// Spans whose expression *value is a `type`*: a type-returning generic call
+    /// (`List(u32)`) maps to the instantiated aggregate [`TypeId`]. The MIR
+    /// lowerer reuses this as the monomorphization key for an associated call
+    /// `List(u32).init(...)` and for a `[serializedSize(Packet)]u8` array length.
+    pub type_valued_spans: HashMap<(u32, u32), TypeId>,
+    /// The comptime-known integer value at an expression span (e.g. a `@sizeOf`
+    /// or `serializedSize(T)` occurrence), so the MIR lowerer can inline a
+    /// comptime array length / folded const as a literal instead of emitting
+    /// comptime-only code.
+    pub comptime_span_ints: HashMap<(u32, u32), i128>,
+    /// The compile-time-known `i128` value of each `const` binding that folded
+    /// to a `comptime_int`, so a `const N = serializedSize(T)` use lowers to a
+    /// literal rather than to a runtime call.
+    pub comptime_int_values: HashMap<DefId, i128>,
     /// Every diagnostic produced, in roughly source order.
     pub diagnostics: Vec<Diagnostic>,
 }

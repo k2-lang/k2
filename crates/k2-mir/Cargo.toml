@@ -1,0 +1,29 @@
+# k2-mir — the mid-level IR, monomorphization, safety checks, and the
+# conservative leak/escape analysis (milestone v0.7).
+#
+# This crate consumes the type-checked, comptime-folded program (`SourceFile` +
+# `Resolved` + `Typed`) and lowers it to a backend-agnostic, executable MIR that
+# the v0.8 bytecode VM runs: a set of monomorphized functions, each a control-
+# flow graph of basic blocks with explicit terminators, all desugaring done, all
+# safety checks made explicit (gated by build mode), and still-`Deferred`
+# std/sys/build member calls represented as opaque intrinsic nodes. Like every
+# other front-end crate it depends on the Rust standard library ONLY — zero
+# third-party crates, so the toolchain builds fully offline.
+[package]
+name = "k2-mir"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Mid-level IR, monomorphization, safety checks, and leak analysis for the k2 language"
+
+[lib]
+name = "k2_mir"
+path = "src/lib.rs"
+
+[dependencies]
+k2-syntax = { path = "../k2-syntax" }
+k2-resolve = { path = "../k2-resolve" }
+k2-types = { path = "../k2-types" }
+
+[dev-dependencies]
+k2-parse = { path = "../k2-parse" }

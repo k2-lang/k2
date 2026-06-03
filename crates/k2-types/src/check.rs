@@ -213,6 +213,9 @@ impl<'a> Checker<'a> {
             types: self.types,
             members: self.members,
             binding_types: self.binding_types,
+            type_valued_spans: self.type_valued_spans,
+            comptime_span_ints: self.comptime_span_ints,
+            comptime_int_values: self.comptime_int_values,
             diagnostics: self.diags,
         }
     }
