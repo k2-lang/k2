@@ -1,0 +1,33 @@
+# EditorConfig — https://editorconfig.org
+# Top-level config for the k2 repository.
+root = true
+
+# Defaults for every file.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust toolchain sources follow rustfmt's defaults (4-space indent, set above).
+[*.rs]
+max_line_length = 100
+
+# k2 source uses 4-space indentation, matching the language's own formatter.
+[*.k2]
+indent_size = 4
+
+# Markdown: keep trailing whitespace, since two trailing spaces mean a hard
+# line break.
+[*.md]
+trim_trailing_whitespace = false
+
+# Data and manifest formats conventionally use 2-space indentation.
+[*.{toml,yml,yaml,json}]
+indent_size = 2
+
+# Makefiles require real tabs.
+[Makefile]
+indent_style = tab

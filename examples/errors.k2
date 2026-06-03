@@ -1,0 +1,184 @@
+// errors.k2 — Errors as values: error sets, try, catch, errdefer.
+//
+// In k2, failures are ORDINARY VALUES carried in error unions, not a separate
+// stack-unwinding control-flow channel. An error value is a small integer tag:
+// no allocation, no payload object, no backtrace in the value itself. The only
+// sugar is `try`, which expands to a visible early `return`.
+//
+// This file demonstrates:
+//   * declaring an error set (`error{ ... }`) — error sets are types,
+//   * merging error sets with `||`,
+//   * `try` to propagate, `catch` to handle (default and capture forms),
+//   * `errdefer` to unwind a half-built, heap-owned resource,
+//   * exhaustive `switch` over a captured error set,
+//   * the `!` sigil reserved strictly for error unions, `not` for negation.
+//
+// Run it:
+//   k2 run examples/errors.k2
+
+const std = @import("std");
+
+/// An explicit error set. Each name is a distinct, comptime-known error value.
+/// Error sets are introspectable types (see comptime_reflection.k2).
+const ParseError = error{ Empty, NotANumber, Overflow };
+
+/// Parse `text` into a heap-owned, doubled copy of its u32 value.
+///
+/// The return type merges two error sets with `||`: this function can fail with
+/// a parse error OR with the allocator's OutOfMemory. `!` is the error-union
+/// sigil — it never means "not".
+fn parseDoubled(alloc: Allocator, text: []const u8) (ParseError || error{OutOfMemory})!*u32 {
+    if (text.len == 0) return ParseError.Empty;
+
+    // Acquire the resource, then register its cleanup on the error path.
+    const cell: *u32 = try alloc.create(u32);
+    // `errdefer` runs ONLY if this scope exits via an error. It is the standard
+    // way to release a half-built resource you intend to hand off: if a later
+    // step fails, the partial work is unwound; on success it survives.
+    errdefer alloc.destroy(cell);
+
+    var value: u32 = 0;
+    for (text) |ch| {
+        // `not` is k2's keyword for boolean negation; `!` is reserved strictly
+        // for error unions and never means "not". Here we reject any byte that
+        // is not a digit with an explicit error value.
+        if (not isDigit(ch)) return ParseError.NotANumber;
+        // Guard against overflow before it can become a safe-build panic:
+        // a mistake (overflow) is not an error value, so we convert the
+        // pre-condition into an explicit, returnable error instead.
+        if (value > (0xFFFF_FFFF - 9) / 10) return ParseError.Overflow;
+        value = value * 10 + @as(u32, ch - '0');
+    }
+    cell.* = value * 2;
+    return cell; // success: errdefer is SKIPPED; ownership passes to the caller.
+}
+
+/// Parse `text` into a plain `u32`. No allocator, so the signature proves it
+/// cannot touch the heap; its only failures are parse errors. This is the
+/// non-allocating sibling used to show `catch <default>` cleanly.
+fn parseU32(text: []const u8) ParseError!u32 {
+    if (text.len == 0) return ParseError.Empty;
+    var value: u32 = 0;
+    for (text) |ch| {
+        if (not isDigit(ch)) return ParseError.NotANumber;
+        if (value > (0xFFFF_FFFF - 9) / 10) return ParseError.Overflow;
+        value = value * 10 + @as(u32, ch - '0');
+    }
+    return value;
+}
+
+/// Pure predicate: no allocator, no I/O, no clock. Its signature proves it can
+/// only compute. Used to show the `not` boolean-negation keyword above.
+fn isDigit(ch: u8) bool {
+    return ch >= '0' and ch <= '9';
+}
+
+/// Translate any ParseError into a stable, user-facing exit code. Because the
+/// captured error has the exact set `ParseError`, this `switch` is checked for
+/// exhaustiveness: add a member to ParseError and this stops compiling until
+/// you handle it — failures cannot silently slip past.
+fn exitCodeFor(e: ParseError) u8 {
+    return switch (e) {
+        error.Empty => 10,
+        error.NotANumber => 11,
+        error.Overflow => 12,
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const alloc = sys.heap;
+
+    // --- catch with a capture block: handle, then stop -----------------------
+    // The capture `|err|` binds the error value; the block must produce the
+    // success type or diverge (here it `return`s). This is how you make a
+    // DECISION about a failure.
+    const ptr = parseDoubled(alloc, "21") catch |err| {
+        try out.print("parse failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    // The caller now owns `ptr` and pairs it with its own release.
+    defer alloc.destroy(ptr);
+    try out.print("doubled(\"21\") = {d}\n", .{ptr.*});
+
+    // --- try: propagate when this frame cannot handle it ---------------------
+    // `processAll` uses `try` internally; we surface any failure here. Because
+    // `main` returns `!void`, an unhandled error becomes a process exit.
+    try processAll(out, alloc);
+
+    // --- catch with a default value: no capture, just a fallback -------------
+    // On success the result is the parsed value; on ANY error it becomes the
+    // fallback. The fallback expression is evaluated only on the error path.
+    // `parseU32` returns a plain `u32` (no heap), so the default is a plain 0.
+    const ok = parseU32("123") catch 0;
+    const bad = parseU32("oops") catch 0;
+    try out.print("parseU32(\"123\") = {d}, parseU32(\"oops\") = {d}\n", .{ ok, bad });
+
+    // --- mapping errors to exit codes via exhaustive switch ------------------
+    const inputs = [_][]const u8{ "", "12x", "99999999999" };
+    for (inputs) |in| {
+        // The captured `err` has the operand's EXACT merged set
+        // (`ParseError || error{OutOfMemory}`), so this `switch` must cover
+        // every member or the compiler rejects it — no failure mode slips past.
+        const r = parseDoubled(alloc, in) catch |err| {
+            const code: u8 = switch (err) {
+                error.Empty => 10,
+                error.NotANumber => 11,
+                error.Overflow => 12,
+                error.OutOfMemory => 1,
+            };
+            try out.print("input {s:>14} -> error {s} (code {d})\n", .{ in, @errorName(err), code });
+            continue;
+        };
+        defer alloc.destroy(r);
+        try out.print("input {s:>14} -> {d}\n", .{ in, r.* });
+    }
+}
+
+/// Demonstrates `try` composing left-to-right: each fallible step is a visible
+/// early-return point. The inferred `!void` error set is the union of whatever
+/// the `try`'d calls can fail with.
+fn processAll(out: anytype, alloc: Allocator) !void {
+    const a = try parseDoubled(alloc, "5");
+    defer alloc.destroy(a);
+    const b = try parseDoubled(alloc, "9");
+    defer alloc.destroy(b);
+    try out.print("doubled(\"5\") + doubled(\"9\") = {d}\n", .{a.* + b.*});
+}
+
+// --- Tests: error values are easy to assert on, with no exception machinery --
+
+test "valid input is parsed and doubled" {
+    const alloc = std.testing.allocator;
+    const cell = try parseDoubled(alloc, "21");
+    defer alloc.destroy(cell);
+    try std.testing.expectEqual(@as(u32, 42), cell.*);
+}
+
+test "empty input returns ParseError.Empty and leaks nothing" {
+    const alloc = std.testing.allocator;
+    // `expectError` asserts the union holds exactly this error value. The
+    // testing allocator independently verifies the early return freed nothing
+    // half-built (it never allocated, here).
+    try std.testing.expectError(ParseError.Empty, parseDoubled(alloc, ""));
+}
+
+test "a non-digit triggers errdefer cleanup, so no leak" {
+    // If errdefer did not free the half-built `cell`, the testing allocator
+    // would report a leak and fail this test.
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(ParseError.NotANumber, parseDoubled(alloc, "12x"));
+}
+
+test "exit codes are exhaustive over ParseError" {
+    try std.testing.expectEqual(@as(u8, 10), exitCodeFor(error.Empty));
+    try std.testing.expectEqual(@as(u8, 11), exitCodeFor(error.NotANumber));
+    try std.testing.expectEqual(@as(u8, 12), exitCodeFor(error.Overflow));
+}
+
+test "parseU32 succeeds, and catch supplies a default on failure" {
+    try std.testing.expectEqual(@as(u32, 123), try parseU32("123"));
+    // `catch 0` turns any failure into the fallback value, with no capture.
+    try std.testing.expectEqual(@as(u32, 0), parseU32("oops") catch 0);
+    try std.testing.expectError(ParseError.Overflow, parseU32("99999999999"));
+}

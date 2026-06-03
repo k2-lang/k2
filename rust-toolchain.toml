@@ -1,0 +1,9 @@
+# Pin the k2 toolchain build to the stable Rust channel.
+#
+# The k2 compiler front-end uses no nightly or unstable features anywhere, so a
+# plain `stable` channel is sufficient and keeps CI reproducible and offline.
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

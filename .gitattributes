@@ -1,0 +1,28 @@
+# Normalize line endings: store text with LF in the repository and let Git
+# handle the working-tree conversion. This keeps the lexer's CRLF/CR handling
+# tests honest across platforms.
+* text=auto eol=lf
+
+# Explicitly mark source and docs as text.
+*.rs    text
+*.k2    text
+*.md    text
+*.toml  text
+*.yml   text
+*.yaml  text
+*.ebnf  text
+*.json  text
+
+# Cargo.lock is text but machine-generated; collapse its diffs in reviews.
+Cargo.lock linguist-generated=true
+
+# Help GitHub's language stats: docs and examples shouldn't dominate the
+# language bar, and `.k2` has no linguist entry yet, so mark examples as such.
+docs/**        linguist-documentation=true
+examples/*.k2  linguist-documentation=true
+
+# Treat these as binary (no diff, no EOL munging) if they ever appear.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.pdf   binary

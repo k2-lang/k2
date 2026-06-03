@@ -1,0 +1,128 @@
+// build.k2 — A realistic build description, written in k2 itself.
+//
+// The build system IS k2: this file is ordinary k2 executed by the compiler's
+// comptime engine. There is no second configuration language — no YAML, no
+// Makefile dialect. Targets, dependencies, cross-compilation triples, and build
+// modes are expressed with the same language, types, and tooling as the program
+// being built.
+//
+// `build(b)` does not compile anything itself; it DESCRIBES a directed acyclic
+// graph of build steps. The toolchain then walks the requested step and runs
+// the real backends (Cranelift for Debug, LLVM for Release).
+//
+// Common invocations:
+//   k2 build                              # default install step (Debug)
+//   k2 build run                          # build + run the example executable
+//   k2 build test                         # compile and run every `test { ... }`
+//   k2 build -Doptimize=ReleaseFast       # optimized native build
+//   k2 build -Dtarget=aarch64-linux-gnu   # cross-compile
+//   k2 build -Dwith-stderr-log=true       # set a custom build option
+
+const build = @import("build");
+
+/// The single build entry point. `b: *Build` is the BUILD capability — the
+/// build-time analogue of `*System`. There is no ambient build state; every
+/// artifact, option, and step flows through `b`.
+pub fn build(b: *Build) void {
+    // --- User-selectable options (filled from the command line) --------------
+    // `standardTarget` honors -Dtarget=<triple>, defaulting to the host.
+    const target = b.standardTarget();
+    // `standardOptimize` honors -Doptimize={Debug,ReleaseSafe,ReleaseFast},
+    // defaulting to Debug (Cranelift + full safety toolkit).
+    const optimize = b.standardOptimize();
+
+    // A custom boolean option, queryable as -Dwith-stderr-log=true|false.
+    // It is read back IN CODE via @import("build_options"); because it is
+    // comptime-known, the dead branch is eliminated entirely — zero runtime
+    // cost for a compile-time switch.
+    const with_stderr_log = b.option(bool, "with-stderr-log", "Mirror output to stderr") orelse false;
+
+    // --- A small reusable library shared by the examples ---------------------
+    // `root_source` is the single module that IS the library's public surface;
+    // other files are reached from it via path imports (@import("...k2")).
+    const lib = b.addLibrary(.{
+        .name = "examples_support",
+        .root_source = b.path("support/root.k2"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Surface the build option to the library's code as a comptime constant.
+    lib.addOption(bool, "with_stderr_log", with_stderr_log);
+    b.installArtifact(lib);
+
+    // --- The example executables --------------------------------------------
+    // Each example is its own root_source. The loop below builds one executable
+    // per example name and wires the shared library into each one's import
+    // namespace, so the description stays declarative.
+    const examples = [_][]const u8{
+        "hello",
+        "allocators",
+        "generic_list",
+        "errors",
+        "comptime_reflection",
+    };
+
+    // A `run` step that builds and runs ONE chosen example:
+    //   k2 build run -Dexample=allocators
+    const which = b.option([]const u8, "example", "Which example `run` executes") orelse "hello";
+    const run_step = b.step("run", "Build and run one example (-Dexample=NAME)");
+
+    // `inline for` unrolls at comptime over the comptime-known list, so each
+    // example name specializes the artifact-construction code.
+    inline for (examples) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            // `b.fmt` builds the source path comptime-deterministically; the
+            // build engine performs no runtime I/O (it only describes the graph).
+            .root_source = b.path(b.fmt("{s}.k2", .{name})),
+            .target = target,
+            .optimize = optimize,
+        });
+        // Inside each example, `@import("examples_support")` now resolves here.
+        exe.addModule("examples_support", lib.module());
+        exe.addOption(bool, "with_stderr_log", with_stderr_log);
+        b.installArtifact(exe);
+
+        // Wire the chosen example into the `run` step.
+        if (strEql(name, which)) {
+            const run_exe = b.addRunArtifact(exe);
+            run_exe.passForwardedArgs(); // forward args after `--` to the program
+            run_step.dependOn(&run_exe.step);
+        }
+    }
+
+    // --- Tests: every `test { ... }` block in the examples -------------------
+    // A single test artifact whose root imports all the examples, so one
+    // `k2 build test` runs the whole suite. Test blocks are compiled ONLY in
+    // test builds and cost nothing in shipped binaries.
+    const tests = b.addTest(.{
+        .name = "examples_tests",
+        .root_source = b.path("tests/all.k2"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests.addModule("examples_support", lib.module());
+    const run_tests = b.addRunArtifact(tests);
+
+    const test_step = b.step("test", "Run all example tests");
+    test_step.dependOn(&run_tests.step);
+
+    // --- A platform-specific extra, branching on the resolved target ---------
+    // `target` is a comptime value inside build(b), so ordinary `if`/`switch`
+    // over `target.os` adds sources or steps per platform with no special DSL.
+    if (target.os == .windows) {
+        // e.g. link a Windows-only support file; omitted here for brevity.
+        // exe.addSourceFile(b.path("support/win.k2"));
+    }
+}
+
+/// A tiny string-equality helper, written in plain k2. The build engine has no
+/// ambient authority either — this is pure computation over comptime-known
+/// data, exactly like the rest of the script.
+fn strEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x != y) return false;
+    }
+    return true;
+}

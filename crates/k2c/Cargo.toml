@@ -1,0 +1,18 @@
+[package]
+name = "k2c"
+version = "0.1.0"
+edition = "2021"
+description = "The k2 compiler driver (front-end CLI)."
+license = "MIT OR Apache-2.0"
+
+# The binary produced by this crate.
+[[bin]]
+name = "k2c"
+path = "src/main.rs"
+
+# Standard library only, plus the sibling front-end crates by path. Argument
+# parsing is done by hand — no third-party CLI crate — so the toolchain builds
+# fully offline.
+[dependencies]
+k2-lexer = { path = "../k2-lexer" }
+k2-syntax = { path = "../k2-syntax" }

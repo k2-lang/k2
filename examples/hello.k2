@@ -1,0 +1,38 @@
+// hello.k2 — Hello, world in k2.
+//
+// The smallest complete k2 program. It demonstrates the two facts that set k2
+// apart from the first line of code: there is no ambient stdout, and the entry
+// point receives the program's sole authority — `*System` — as a parameter.
+//
+// Run it:
+//   k2 run examples/hello.k2
+
+const std = @import("std");
+
+/// Program entry point. `sys` is the root capability handle — the SOLE source
+/// of authority in a k2 program. Every effect (I/O, heap, clock, randomness,
+/// env, network) is reached through `sys`; there are no globals that touch the
+/// OS behind your back.
+///
+/// The return type `!void` is an error union: `main` may fail, and if it
+/// returns an error the runtime prints the error name and exits nonzero.
+pub fn main(sys: *System) !void {
+    // No ambient stdout: we take the writer from the `io` capability. A
+    // function that was never handed `sys.io` literally cannot print.
+    const out = sys.io.stdout();
+
+    // `print` takes a format string and a tuple of arguments. `{s}` formats a
+    // string, `{d}` a decimal integer. There are no arguments here, so the
+    // tuple is empty: `.{}`.
+    try out.print("Hello, k2!\n", .{});
+
+    // Format placeholders, illustrated. The tuple positionally fills each `{}`.
+    const star = "Sol";
+    const joules: u64 = 384_600_000_000_000_000_000_000_000;
+    try out.print("k2 directs every joule of {s}: ~{d} W.\n", .{ star, joules });
+
+    // stderr is a separate writer on the same capability — also explicit,
+    // never ambient. Diagnostics go here so they do not pollute stdout.
+    const err = sys.io.stderr();
+    try err.print("(this line went to stderr)\n", .{});
+}

@@ -1,0 +1,11 @@
+[package]
+name = "k2-lexer"
+version = "0.1.0"
+edition = "2021"
+description = "Lexer (tokenizer) for the k2 programming language."
+license = "MIT OR Apache-2.0"
+
+# Standard library only — no third-party dependencies. This keeps the front-end
+# buildable fully offline, as required by the k2 charter's "native speed, no
+# runtime / first-class cross-compilation" tooling story.
+[dependencies]

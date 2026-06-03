@@ -1,0 +1,167 @@
+// comptime_reflection.k2 — Generating code with @typeInfo.
+//
+// comptime is k2's SINGLE metaprogramming mechanism: ordinary k2 code run by
+// the compiler. Types are first-class comptime values, and `@typeInfo` reflects
+// a type into structured, matchable data. There is no macro language and no
+// runtime reflection — the per-field code is unrolled and specialized at
+// compile time, so the emitted machine code is exactly what you would write by
+// hand for the concrete type.
+//
+// This file demonstrates:
+//   * `@typeInfo(T)` to inspect a struct's fields at comptime,
+//   * `@compileError` to reject invalid type arguments at the call site,
+//   * `inline for` to unroll over the comptime-known field list,
+//   * `@field(value, name)` to read a field by its reflected, comptime name,
+//   * a generated struct printer AND a compact little-endian serializer,
+//   * `@sizeOf` for compile-time layout sizing.
+//
+// Run it:
+//   k2 run examples/comptime_reflection.k2
+
+const std = @import("std");
+
+// ----------------------------------------------------------------------------
+// 1. A generated struct printer.
+// ----------------------------------------------------------------------------
+
+/// Print every field of ANY struct, one per line, generated at comptime.
+/// `T` is a comptime type parameter; `out` is any writer; `value` is the data.
+fn printFields(comptime T: type, out: anytype, value: T) !void {
+    const info = @typeInfo(T);
+    // Reject non-structs at COMPILE time with a precise, source-located message
+    // instead of failing at runtime.
+    if (info != .Struct) {
+        @compileError("printFields requires a struct, got " ++ @typeName(T));
+    }
+    // `inline for` unrolls the loop over the comptime-known field list; each
+    // copy of the body is type-checked for that field's concrete type. A
+    // runtime `for` could not do this — the fields have different types.
+    inline for (info.Struct.fields) |field| {
+        // `@field(value, field.name)` reads a field whose NAME is a comptime
+        // string — the dynamic counterpart of `value.x` for generated code.
+        try out.print("  {s}: {s} = {any}\n", .{ field.name, @typeName(field.type), @field(value, field.name) });
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 2. A compact little-endian serializer for structs of unsigned integers.
+// ----------------------------------------------------------------------------
+
+/// Errors this serializer can produce.
+const SerializeError = error{BufferTooSmall};
+
+/// Compile-time total byte size of a flat struct of unsigned-integer fields.
+/// Used both as an array length and as a runtime bound check below.
+fn serializedSize(comptime T: type) usize {
+    const info = @typeInfo(T);
+    if (info != .Struct) {
+        @compileError("serialize requires a struct, got " ++ @typeName(T));
+    }
+    var total: usize = 0;
+    inline for (info.Struct.fields) |field| {
+        const fi = @typeInfo(field.type);
+        // Constrain element types with ordinary comptime code — no trait
+        // grammar, just an `if` that may call `@compileError`.
+        if (fi != .Int or fi.Int.signedness != .unsigned) {
+            @compileError("serialize requires unsigned-integer fields; field '" ++
+                field.name ++ "' is " ++ @typeName(field.type));
+        }
+        total += @sizeOf(field.type);
+    }
+    return total;
+}
+
+/// Write `value` into `buf` as little-endian fields, in declaration order.
+/// Returns the number of bytes written. The loop is unrolled at comptime, so
+/// each field becomes straight-line byte stores — zero runtime reflection.
+fn serialize(comptime T: type, value: T, buf: []u8) SerializeError!usize {
+    const need = comptime serializedSize(T);
+    if (buf.len < need) return SerializeError.BufferTooSmall;
+
+    var offset: usize = 0;
+    inline for (@typeInfo(T).Struct.fields) |field| {
+        const FieldT = field.type;
+        const n = @sizeOf(FieldT);
+        var word = @field(value, field.name);
+
+        // Emit one byte store per byte of the field, least-significant first.
+        comptime var b: usize = 0;
+        inline while (b < n) : (b += 1) {
+            buf[offset + b] = @intCast(word & 0xFF);
+            word >>= 8;
+        }
+        offset += n;
+    }
+    return offset;
+}
+
+// ----------------------------------------------------------------------------
+// 3. A demonstration of both, over a concrete type.
+// ----------------------------------------------------------------------------
+
+/// A flat record. Both the printer and the serializer work over it with no
+/// per-type code written by us — the compiler generates it from @typeInfo.
+const Packet = struct {
+    magic: u16,
+    length: u32,
+    flags: u8,
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const pkt = Packet{ .magic = 0xBEEF, .length = 1024, .flags = 0b101 };
+
+    try out.print("Packet fields:\n", .{});
+    try printFields(Packet, out, pkt);
+
+    // The serialized size is comptime-known, so the buffer is a stack array
+    // sized exactly right — no heap, no allocator needed.
+    var buf: [serializedSize(Packet)]u8 = undefined;
+    const written = try serialize(Packet, pkt, &buf);
+
+    try out.print("serialized {d} bytes:", .{written});
+    for (buf[0..written]) |byte| {
+        try out.print(" {x:0>2}", .{byte});
+    }
+    try out.print("\n", .{});
+
+    // The printer is generic: a DIFFERENT struct just works, with no new code.
+    const Color = struct { r: u8, g: u8, b: u8 };
+    const c = Color{ .r = 16, .g = 128, .b = 255 };
+    try out.print("Color fields:\n", .{});
+    try printFields(Color, out, c);
+}
+
+// ----------------------------------------------------------------------------
+// Tests. The whole point of "errors are values, mistakes are panics" extends to
+// types: a bad type argument is a COMPILE error, not a runtime surprise. We can
+// only test the well-formed instantiations here; the rejected ones would not
+// compile (which is exactly the guarantee we want).
+// ----------------------------------------------------------------------------
+
+test "serializedSize sums field sizes at comptime" {
+    // u16 + u32 + u8 = 7 bytes.
+    try std.testing.expectEqual(@as(usize, 7), comptime serializedSize(Packet));
+}
+
+test "serialize writes little-endian bytes in declaration order" {
+    const pkt = Packet{ .magic = 0xBEEF, .length = 1, .flags = 0xFF };
+    var buf: [serializedSize(Packet)]u8 = undefined;
+    const n = try serialize(Packet, pkt, &buf);
+    try std.testing.expectEqual(@as(usize, 7), n);
+    // magic 0xBEEF little-endian -> EF BE
+    try std.testing.expectEqual(@as(u8, 0xEF), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0xBE), buf[1]);
+    // length 1 little-endian over 4 bytes -> 01 00 00 00
+    try std.testing.expectEqual(@as(u8, 0x01), buf[2]);
+    try std.testing.expectEqual(@as(u8, 0x00), buf[5]);
+    // flags
+    try std.testing.expectEqual(@as(u8, 0xFF), buf[6]);
+}
+
+test "serialize rejects an undersized buffer as a value, not a panic" {
+    const pkt = Packet{ .magic = 0, .length = 0, .flags = 0 };
+    var tiny: [3]u8 = undefined;
+    try std.testing.expectError(SerializeError.BufferTooSmall, serialize(Packet, pkt, &tiny));
+}

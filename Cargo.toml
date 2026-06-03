@@ -1,0 +1,24 @@
+# k2 compiler workspace.
+#
+# k2 — "Kardashev Type II": total control over the machine, with zero waste.
+#
+# This is a Cargo *virtual* workspace: the root has no [package], only the
+# member crates that make up the compiler front-end. The whole toolchain is
+# written in Rust (see docs/why_rust). Every member targets stable Rust and
+# depends on the standard library ONLY — there are zero third-party crates so
+# that CI can build the front-end fully offline.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/k2-lexer",
+    "crates/k2-syntax",
+    "crates/k2c",
+]
+
+# Shared release profile. ReleaseFast-style stripping of the *k2* language's
+# safety checks is a property of the k2 programs we compile, not of the Rust
+# compiler binary; here we just ask for an optimized toolchain build.
+[profile.release]
+opt-level = 3
+lto = "thin"

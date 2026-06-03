@@ -1,0 +1,25 @@
+# Rust / Cargo build artifacts
+/target
+**/target
+
+# Cargo.lock is intentionally committed for the binary/workspace (reproducible
+# CI builds). Remove the next line only if this becomes a published library.
+# Cargo.lock
+
+# Backtraces and profiling
+*.profraw
+perf.data*
+flamegraph.svg
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# k2 toolchain output (reserved for future build artifacts)
+/zig-cache/
+/.k2-cache/
+/k2-out/

@@ -1,0 +1,551 @@
+(* ===================================================================== *)
+(*  k2 — Official Grammar (EBNF)                                          *)
+(*  "Kardashev Type II" — total control over the machine, zero waste.    *)
+(*                                                                        *)
+(*  This file is the complete, self-consistent grammar for the WHOLE     *)
+(*  k2 language: declarations, types, expressions, statements, control   *)
+(*  flow, structs/enums/unions, comptime, and error handling.            *)
+(*                                                                        *)
+(*  It is co-normative with docs/spec/01-lexical-structure.md. The       *)
+(*  TERMINALS of this grammar are exactly the token kinds that the       *)
+(*  lexer emits (see section "Lexical terminals" at the bottom).         *)
+(*                                                                        *)
+(*  EBNF conventions used here (ISO-14977 flavored):                     *)
+(*     =        defines a rule                                           *)
+(*     ,        concatenation                                           *)
+(*     |        alternation                                             *)
+(*     [ ... ]  optional (zero or one)                                  *)
+(*     { ... }  repetition (zero or more)                               *)
+(*     ( ... )  grouping                                                *)
+(*     "..."    a literal terminal (keyword / operator / punctuation)   *)
+(*     (* .. *) a comment                                               *)
+(*  Lowercase rule names denote nonterminals; rule names in the         *)
+(*  "Lexical terminals" section denote token kinds from the lexer.      *)
+(*                                                                        *)
+(*  Precedence/associativity for binary operators is encoded directly   *)
+(*  in the expression rules (lowest-precedence rule at the top of the   *)
+(*  expression cascade) and matches the table in                        *)
+(*  docs/spec/01-lexical-structure.md section 7.3.                      *)
+(* ===================================================================== *)
+
+
+(* ===================================================================== *)
+(*  1. COMPILATION UNIT                                                   *)
+(* ===================================================================== *)
+
+source_file      = { doc_comment } , { top_level_decl } , EOF ;
+
+(* Top-level items. Only declarations and tests live at file scope;     *)
+(* there are no free statements at the top level.                       *)
+top_level_decl   = [ doc_comment ] ,
+                   ( const_decl
+                   | var_decl
+                   | fn_decl
+                   | test_decl
+                   | comptime_block ) ;
+
+
+(* ===================================================================== *)
+(*  2. DECLARATIONS                                                       *)
+(* ===================================================================== *)
+
+(* `pub` exports a top-level or struct-member declaration.              *)
+(* `extern`/`export`/`inline` apply to functions; `align` to layout.    *)
+
+const_decl       = [ "pub" ] , "const" , identifier ,
+                   [ ":" , type ] , "=" , expr , ";" ;
+
+var_decl         = [ "pub" ] , "var" , identifier ,
+                   [ ":" , type ] , [ "=" , expr ] , ";" ;
+
+(* A function declaration. `comptime` may also prefix individual        *)
+(* parameters (see param). `align(expr)` sets call-ABI alignment.       *)
+fn_decl          = { fn_qualifier } , "fn" , fn_name , "(" , [ param_list ] , ")" ,
+                   [ "align" , "(" , expr , ")" ] ,
+                   return_type ,
+                   ( block | ";" ) ;          (* `;` => extern prototype *)
+
+fn_qualifier     = "pub" | "extern" | "export" | "inline" ;
+
+fn_name          = identifier | escaped_identifier ;
+
+param_list       = param , { "," , param } , [ "," ] ;
+
+param            = [ "comptime" ] , param_name , ":" , param_type
+                 | "..." ;                    (* C-variadic, for extern *)
+
+param_name       = identifier | "_" ;
+
+(* `anytype` is an inferred parameter type used by generic helpers      *)
+(* (e.g. `out: anytype` in the reflection snippet). It is a predeclared *)
+(* identifier, admitted here explicitly for clarity.                    *)
+param_type       = type | "anytype" ;
+
+return_type      = type ;                      (* includes !T, E!T, void *)
+
+(* A test declaration: named by a string literal or an identifier.      *)
+test_decl        = "test" , [ string_literal | identifier ] , block ;
+
+(* A bare comptime block evaluated at compile time at file scope.       *)
+comptime_block   = "comptime" , block ;
+
+
+(* ===================================================================== *)
+(*  3. TYPES                                                              *)
+(*                                                                        *)
+(*  Types are written in postfix-modifier form to the RIGHT of names.    *)
+(*  Modifiers stack left-to-right: ?, !, *, []  and array [N].           *)
+(* ===================================================================== *)
+
+type             = error_union_type ;
+
+(* E!T explicit error union, or !T inferred error union. Right side is  *)
+(* a prefixed type. `!T` is written with no left operand.               *)
+error_union_type = [ prefixed_type ] , "!" , prefixed_type
+                 | prefixed_type ;
+
+(* Optional, pointer, slice, and array modifiers (the "postfix-modifier *)
+(* form" is realized as a chain of prefixes on the core type here).     *)
+prefixed_type    = "?" , prefixed_type                        (* optional ?T   *)
+                 | pointer_type
+                 | slice_type
+                 | array_type
+                 | core_type ;
+
+pointer_type     = "*" , [ "const" ] , [ align_clause ] , prefixed_type ;
+
+slice_type       = "[" , "]" , [ "const" ] , [ align_clause ] , prefixed_type ;
+
+array_type       = "[" , expr , "]" , prefixed_type ;         (* [N]T          *)
+
+align_clause     = "align" , "(" , expr , ")" ;
+
+core_type        = error_set_type
+                 | container_type
+                 | fn_type
+                 | type_path
+                 | "(" , type , ")" ;
+
+(* A named/primitive type or a path into a namespace, possibly the      *)
+(* result of a comptime function call (e.g. List(u32), std.ArrayList).  *)
+(* Primitive type names (i32, usize, bool, type, anyerror, ...) are     *)
+(* ordinary identifiers resolved during name resolution.                *)
+type_path        = primary_expr ;
+
+(* A comptime error set: error { A, B, C }.                             *)
+error_set_type   = "error" , "{" , [ error_field_list ] , "}" ;
+
+error_field_list = identifier , { "," , identifier } , [ "," ] ;
+
+(* Function pointer / function type, e.g. `fn (i32) bool`.              *)
+fn_type          = "fn" , "(" , [ fn_type_params ] , ")" , return_type ;
+
+fn_type_params   = fn_type_param , { "," , fn_type_param } , [ "," ] ;
+
+fn_type_param    = [ "comptime" ] , [ identifier , ":" ] , param_type ;
+
+
+(* --- Container type definitions (assigned to consts) ------------------ *)
+
+container_type   = struct_type
+                 | enum_type
+                 | union_type ;
+
+struct_type      = [ "extern" ] , "struct" , "{" , { container_member } , "}" ;
+
+enum_type        = "enum" , [ "(" , type , ")" ] ,        (* optional tag type *)
+                   "{" , { enum_member } , "}" ;
+
+(* Tagged union: union(enum) { ... }. The (enum) form makes it a        *)
+(* discriminated/tagged union as used throughout the charter.           *)
+union_type       = "union" , [ "(" , ( "enum" | type ) , ")" ] ,
+                   "{" , { union_member } , "}" ;
+
+(* Members shared by struct/union bodies: fields, methods, and nested   *)
+(* declarations. `pub` may prefix any member.                           *)
+container_member = [ doc_comment ] ,
+                   ( field_decl
+                   | const_decl
+                   | var_decl
+                   | fn_decl
+                   | test_decl
+                   | comptime_block ) ;
+
+field_decl       = [ "pub" ] , [ "comptime" ] , identifier , ":" , type ,
+                   [ "align" , "(" , expr , ")" ] ,
+                   [ "=" , expr ] , "," ;     (* default value optional *)
+
+enum_member      = [ doc_comment ] ,
+                   ( enum_field
+                   | const_decl
+                   | fn_decl
+                   | test_decl ) ;
+
+enum_field       = identifier , [ "=" , expr ] , "," ; (* optional explicit value *)
+
+union_member     = [ doc_comment ] ,
+                   ( union_field
+                   | const_decl
+                   | var_decl
+                   | fn_decl
+                   | test_decl
+                   | comptime_block ) ;
+
+union_field      = [ "pub" ] , identifier , ":" , type , "," ;
+
+
+(* ===================================================================== *)
+(*  4. STATEMENTS                                                         *)
+(* ===================================================================== *)
+
+block            = "{" , { statement } , "}" ;
+
+statement        = const_decl
+                 | var_decl
+                 | comptime_block
+                 | defer_stmt
+                 | errdefer_stmt
+                 | return_stmt
+                 | break_stmt
+                 | continue_stmt
+                 | if_stmt
+                 | while_stmt
+                 | for_stmt
+                 | switch_stmt
+                 | assign_stmt
+                 | expr_stmt ;
+
+defer_stmt       = "defer" , ( block | expr ) , ";" ;
+
+errdefer_stmt    = "errdefer" , [ "|" , identifier , "|" ] ,
+                   ( block | expr ) , ";" ;
+
+return_stmt      = "return" , [ expr ] , ";" ;
+
+(* `break`/`continue` may target a labeled loop and `break` may carry a *)
+(* value out of a labeled block/loop used as an expression.             *)
+break_stmt       = "break" , [ ":" , identifier ] , [ expr ] , ";" ;
+
+continue_stmt    = "continue" , [ ":" , identifier ] , ";" ;
+
+(* Assignment is a STATEMENT (never an expression). `_` discards.       *)
+assign_stmt      = assign_target , assign_op , expr , ";" ;
+
+assign_target    = "_"
+                 | unary_expr ;               (* lvalue: name, .field, [i], .* *)
+
+assign_op        = "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                 | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+
+(* A bare expression used for its effect (typically a call). Statement  *)
+(* forms of if/while/for/switch are listed separately below so they may *)
+(* appear without a trailing ";".                                       *)
+expr_stmt        = expr , ";" ;
+
+
+(* ===================================================================== *)
+(*  5. CONTROL FLOW (statement forms)                                    *)
+(*                                                                        *)
+(*  if/while/for/switch are expression-oriented; their statement forms   *)
+(*  reuse the same expression nonterminals and need no trailing ";".     *)
+(* ===================================================================== *)
+
+if_stmt          = "if" , "(" , expr , ")" , [ payload_capture ] ,
+                   block_or_stmt ,
+                   [ "else" , [ payload_capture ] , block_or_stmt ] ;
+
+(* `inline while` forces comptime unrolling of the loop (the condition  *)
+(* and body run at compile time); see docs/spec/07-comptime.md section 6.*)
+while_stmt       = [ block_label ] , [ "inline" ] ,
+                   "while" , "(" , expr , ")" , [ payload_capture ] ,
+                   [ ":" , "(" , assign_or_expr , ")" ] ,   (* continue expr *)
+                   block_or_stmt ,
+                   [ "else" , [ payload_capture ] , block_or_stmt ] ;
+
+(* `inline for` unrolls the loop at comptime over a comptime-known range *)
+(* or tuple/field list; see docs/spec/07-comptime.md section 6.          *)
+for_stmt         = [ block_label ] , [ "inline" ] ,
+                   "for" , "(" , for_operands , ")" , for_capture ,
+                   block_or_stmt ,
+                   [ "else" , block_or_stmt ] ;
+
+switch_stmt      = "switch" , "(" , expr , ")" , "{" ,
+                   { switch_arm } , "}" ;
+
+(* A control-flow body is a block or a single nested statement.         *)
+block_or_stmt    = block | statement ;
+
+block_label      = identifier , ":" ;
+
+(* `|x|` or `|*x|` (by-pointer) optional/error payload capture.         *)
+payload_capture  = "|" , [ "*" ] , capture_name , { "," , capture_name } , "|" ;
+
+capture_name     = identifier | "_" ;
+
+(* `for` iterates one or more slices/arrays plus optional index range.  *)
+for_operands     = for_operand , { "," , for_operand } ;
+
+for_operand      = expr                       (* a slice/array to iterate *)
+                 | expr , ".." , [ expr ] ;   (* index range, e.g. 0..    *)
+
+for_capture      = "|" , for_one_capture , { "," , for_one_capture } , "|" ;
+
+for_one_capture  = [ "*" ] , capture_name ;   (* `*slot` binds by pointer *)
+
+assign_or_expr   = assign_stmt_inline | expr ;
+
+assign_stmt_inline = assign_target , assign_op , expr ;
+
+(* Switch arms map patterns to an expression/block via `=>`.            *)
+switch_arm       = switch_pattern , "=>" , switch_body , "," ;
+
+switch_pattern   = "else"
+                 | switch_item , { "," , switch_item } ;
+
+switch_item      = expr , [ "..." , expr ] ;  (* inclusive range a...b   *)
+
+switch_body      = [ payload_capture ] , ( block | expr ) ;
+
+
+(* ===================================================================== *)
+(*  6. EXPRESSIONS                                                        *)
+(*                                                                        *)
+(*  The cascade below encodes precedence from LOWEST (orelse/catch) to   *)
+(*  HIGHEST (postfix/primary), matching                                  *)
+(*  docs/spec/01-lexical-structure.md section 7.3.                       *)
+(* ===================================================================== *)
+
+expr             = coalesce_expr ;
+
+(* Lvl 12: orelse / catch  (left-assoc; catch may bind |err|).          *)
+coalesce_expr    = or_expr ,
+                   { ( "orelse" , or_expr )
+                   | ( "catch" , [ "|" , capture_name , "|" ] , or_expr ) } ;
+
+(* Lvl 11: logical or (short-circuit).                                  *)
+or_expr          = and_expr , { "or" , and_expr } ;
+
+(* Lvl 10: logical and (short-circuit).                                 *)
+and_expr         = compare_expr , { "and" , compare_expr } ;
+
+(* Lvl 9: comparison — NON-ASSOCIATIVE (at most one comparator).        *)
+compare_expr     = bitor_expr , [ compare_op , bitor_expr ] ;
+
+compare_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
+
+(* Lvl 8: bitwise or.                                                   *)
+bitor_expr       = bitxor_expr , { "|" , bitxor_expr } ;
+
+(* Lvl 7: bitwise xor.                                                  *)
+bitxor_expr      = bitand_expr , { "^" , bitand_expr } ;
+
+(* Lvl 6: bitwise and.                                                  *)
+bitand_expr      = shift_expr , { "&" , shift_expr } ;
+
+(* Lvl 5: shifts.                                                       *)
+shift_expr       = add_expr , { ( "<<" | ">>" ) , add_expr } ;
+
+(* Lvl 4: additive and concatenation.                                  *)
+add_expr         = mul_expr , { ( "+" | "-" | "++" ) , mul_expr } ;
+
+(* Lvl 3: multiplicative.                                               *)
+mul_expr         = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
+
+(* Lvl 2: prefix/unary operators (right-assoc), including `try`,        *)
+(* `not`, address-of `&`, and prefix `comptime`.                        *)
+unary_expr       = unary_op , unary_expr
+                 | postfix_expr ;
+
+unary_op         = "-" | "~" | "not" | "&" | "try" | "comptime" ;
+
+(* Lvl 1: postfix chain on a primary — calls, indexing, slicing, field  *)
+(* access, deref `.*`, optional unwrap `.?`.                            *)
+postfix_expr     = primary_expr , { postfix_op } ;
+
+postfix_op       = "(" , [ arg_list ] , ")"                  (* call          *)
+                 | "[" , expr , "]"                          (* index         *)
+                 | "[" , expr , ".." , [ expr ] , "]"        (* slice a[i..j]  *)
+                 | "." , identifier                          (* field/method  *)
+                 | ".*"                                      (* dereference   *)
+                 | ".?" ;                                    (* optional unwrap *)
+
+arg_list         = expr , { "," , expr } , [ "," ] ;
+
+
+(* --- Primary expressions --------------------------------------------- *)
+
+primary_expr     = literal
+                 | identifier
+                 | builtin_call
+                 | escaped_identifier
+                 | enum_literal                              (* .Name         *)
+                 | error_literal                             (* error.Name    *)
+                 | init_literal                              (* .{ ... }      *)
+                 | container_type                            (* struct/enum/union literal type *)
+                 | error_set_type
+                 | grouped_expr
+                 | block_expr
+                 | if_expr
+                 | while_expr
+                 | for_expr
+                 | switch_expr
+                 | unreachable_expr ;
+
+grouped_expr     = "(" , expr , ")" ;
+
+(* A labeled block used as an expression yields a value via `break`.    *)
+block_expr       = [ block_label ] , block ;
+
+builtin_call     = builtin , "(" , [ builtin_arg_list ] , ")" ;
+
+(* Builtin arguments may be types or expressions (e.g. @sizeOf(u32),    *)
+(* @as(u32, x), @intCast(i * i)). `type` and `expr` overlap on names,   *)
+(* so we accept either form syntactically.                              *)
+builtin_arg_list = builtin_arg , { "," , builtin_arg } , [ "," ] ;
+
+builtin_arg      = type | expr ;
+
+(* `.Name` enum/error literal in inferred context.                      *)
+enum_literal     = "." , identifier ;
+
+(* `error.Name` is a specific error VALUE (e.g. error.Empty), distinct   *)
+(* from the `error { ... }` set TYPE form (error_set_type) and from the  *)
+(* `.Name` enum/error shorthand. Used in `return error.Foo;` and switch  *)
+(* arms; see docs/spec/01-lexical-structure.md section 7.1.              *)
+error_literal    = "error" , "." , identifier ;
+
+(* `.{ ... }` anonymous struct/tuple/initializer literal.               *)
+init_literal     = "." , "{" , [ init_body ] , "}" ;
+
+init_body        = field_init , { "," , field_init } , [ "," ]   (* named  *)
+                 | expr , { "," , expr } , [ "," ] ;             (* tuple  *)
+
+field_init       = "." , identifier , "=" , expr ;
+
+(* `unreachable` is a noreturn primary asserting an impossible path.    *)
+unreachable_expr = "unreachable" ;
+
+
+(* --- Control flow in expression position ----------------------------- *)
+
+if_expr          = "if" , "(" , expr , ")" , [ payload_capture ] , expr ,
+                   "else" , [ payload_capture ] , expr ;
+
+while_expr       = [ block_label ] , [ "inline" ] ,
+                   "while" , "(" , expr , ")" , [ payload_capture ] , block ,
+                   [ "else" , [ payload_capture ] , expr ] ;
+
+for_expr         = [ block_label ] , [ "inline" ] ,
+                   "for" , "(" , for_operands , ")" , for_capture , block ,
+                   [ "else" , expr ] ;
+
+switch_expr      = "switch" , "(" , expr , ")" , "{" ,
+                   { switch_arm } , "}" ;
+
+
+(* --- Literals -------------------------------------------------------- *)
+
+literal          = int_literal
+                 | float_literal
+                 | char_literal
+                 | string_literal
+                 | multiline_string
+                 | "true"
+                 | "false"
+                 | "null"
+                 | "undefined" ;
+
+
+(* ===================================================================== *)
+(*  7. LEXICAL TERMINALS                                                  *)
+(*                                                                        *)
+(*  These token kinds are produced by the lexer and defined precisely    *)
+(*  in docs/spec/01-lexical-structure.md. They are reproduced here in    *)
+(*  EBNF for completeness; the spec is authoritative on edge cases.      *)
+(* ===================================================================== *)
+
+(* --- Identifiers and builtins (spec sections 4, 4.1, 4.2) ------------ *)
+
+identifier         = ( letter | "_" ) , { letter | digit | "_" } ;
+
+(* The closed set of @-builtins; semantic analysis rejects unknown ones.*)
+builtin            = "@" , identifier ;
+
+escaped_identifier = "@" , string_literal ;
+
+letter             = "A" … "Z" | "a" … "z" ;
+digit              = "0" … "9" ;
+
+(* --- Integer literals (spec 6.1) ------------------------------------- *)
+
+int_literal        = dec_int | hex_int | oct_int | bin_int ;
+dec_int            = dec_digit , { dec_digit | "_" , dec_digit } ;
+hex_int            = "0x" , hex_digit , { hex_digit | "_" , hex_digit } ;
+oct_int            = "0o" , oct_digit , { oct_digit | "_" , oct_digit } ;
+bin_int            = "0b" , bin_digit , { bin_digit | "_" , bin_digit } ;
+
+dec_digit          = "0" … "9" ;
+hex_digit          = "0" … "9" | "a" … "f" | "A" … "F" ;
+oct_digit          = "0" … "7" ;
+bin_digit          = "0" | "1" ;
+
+(* --- Float literals (spec 6.2) --------------------------------------- *)
+
+float_literal      = dec_float | hex_float ;
+dec_float          = dec_int , "." , dec_digits , [ dec_exp ]
+                   | dec_int , dec_exp ;
+dec_exp            = ( "e" | "E" ) , [ "+" | "-" ] , dec_digits ;
+hex_float          = "0x" , hex_digits , "." , hex_digits , hex_exp
+                   | "0x" , hex_digits , hex_exp ;
+hex_exp            = ( "p" | "P" ) , [ "+" | "-" ] , dec_digits ;
+
+dec_digits         = dec_digit , { dec_digit | "_" , dec_digit } ;
+hex_digits         = hex_digit , { hex_digit | "_" , hex_digit } ;
+
+(* --- Character & string literals (spec 6.3–6.6) ---------------------- *)
+
+char_literal       = "'" , ( char_scalar | escape_seq ) , "'" ;
+string_literal     = '"' , { str_scalar | escape_seq } , '"' ;
+multiline_string   = ml_line , { line_terminator , ml_line } ;
+ml_line            = "\\" , { source_char_no_nl } ;
+
+escape_seq         = "\" , ( "n" | "r" | "t" | "\" | "'" | '"'
+                           | "x" , hex_digit , hex_digit
+                           | "u" , "{" , hex_digit , { hex_digit } , "}" ) ;
+
+(* char_scalar  : any Unicode scalar except  '  \  or a line terminator *)
+(* str_scalar   : any Unicode scalar except  "  \  or a line terminator *)
+(* source_char_no_nl : any Unicode scalar except a line terminator      *)
+(* line_terminator   : LF | CRLF  (spec 1.3)                            *)
+
+(* --- Comments (spec 3) ----------------------------------------------- *)
+(* line_comment ( "//" ... ) is discarded and produces no token.        *)
+(* doc_comment  ( "///" ... ) is retained as a token and may attach to  *)
+(* the following declaration.                                           *)
+
+doc_comment        = "///" , { source_char_no_nl } ;
+
+(* --- End of input ---------------------------------------------------- *)
+
+EOF                = ? end of input ? ;
+
+
+(* ===================================================================== *)
+(*  8. CROSS-REFERENCE: keyword set (spec 5) — LOCKED, 35 keywords       *)
+(*                                                                        *)
+(*  const var pub fn comptime return struct enum union error if else     *)
+(*  while for switch break continue defer errdefer try catch orelse and  *)
+(*  or not unreachable test extern export inline align true false null   *)
+(*  undefined                                                            *)
+(*                                                                        *)
+(*  Boolean operators are the WORDS and/or/not. The symbol `!` is the    *)
+(*  error-union type constructor ONLY (?T optional, E!T / !T error       *)
+(*  unions). There is no boolean `!`, no `&&`, no `||`, and assignment   *)
+(*  is a statement, never an expression. There is no ternary operator;   *)
+(*  use `if (c) a else b`.                                               *)
+(*                                                                        *)
+(*  Note: `inline` is both an fn_qualifier AND an optional prefix on     *)
+(*  `for`/`while` (loop and expression forms) that forces comptime       *)
+(*  unrolling — see while_stmt/for_stmt/while_expr/for_expr and          *)
+(*  docs/spec/07-comptime.md section 6.                                  *)
+(* ===================================================================== *)

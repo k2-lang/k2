@@ -1,0 +1,11 @@
+[package]
+name = "k2-syntax"
+version = "0.1.0"
+edition = "2021"
+description = "AST node definitions and spans for the k2 programming language."
+license = "MIT OR Apache-2.0"
+
+# Standard library only. The single dependency is the sibling lexer crate,
+# referenced by path within the workspace — no third-party crates.
+[dependencies]
+k2-lexer = { path = "../k2-lexer" }
