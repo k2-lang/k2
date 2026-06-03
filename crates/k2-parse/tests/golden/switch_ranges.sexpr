@@ -1,0 +1,46 @@
+(source-file
+  (fn f
+    (params)
+    (ret
+      (ident u8)
+    )
+    (block
+      (return
+        (switch
+          (on
+            (ident e)
+          )
+          (arm
+            (pattern
+              (range
+                (lo
+                  (int 1)
+                )
+                (hi
+                  (int 3)
+                )
+              )
+            )
+            (body
+              (ident a)
+            )
+          )
+          (arm
+            (pattern
+              (error-lit X)
+            )
+            (body
+              (int 1)
+            )
+          )
+          (arm
+            (else)
+            (body
+              (int 0)
+            )
+          )
+        )
+      )
+    )
+  )
+)

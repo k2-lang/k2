@@ -1,0 +1,736 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub List
+    (params
+      (param :comptime T
+        (ident type)
+      )
+    )
+    (ret
+      (ident type)
+    )
+    (block
+      (return
+        (container struct
+          (decl
+            (const Self
+              (builtin @This)
+            )
+          )
+          (field items
+            (ty
+              (slice
+                (ident T)
+              )
+            )
+          )
+          (field len
+            (ty
+              (ident usize)
+            )
+          )
+          (field alloc
+            (ty
+              (ident Allocator)
+            )
+          )
+          (decl
+            (fn :pub init
+              (params
+                (param alloc
+                  (ident Allocator)
+                )
+              )
+              (ret
+                (ident Self)
+              )
+              (block
+                (return
+                  (init
+                    (ty
+                      (ident Self)
+                    )
+                    (fields
+                      (field-init items
+                        (unary addrof
+                          (init
+                            (ty)
+                            (tuple)
+                          )
+                        )
+                      )
+                      (field-init len
+                        (int 0)
+                      )
+                      (field-init alloc
+                        (ident alloc)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+          (decl
+            (fn :pub deinit
+              (params
+                (param self
+                  (ptr
+                    (ident Self)
+                  )
+                )
+              )
+              (ret
+                (ident void)
+              )
+              (block
+                (expr
+                  (call
+                    (field free
+                      (field alloc
+                        (ident self)
+                      )
+                    )
+                    (field items
+                      (ident self)
+                    )
+                  )
+                )
+              )
+            )
+          )
+          (decl
+            (fn :pub push
+              (params
+                (param self
+                  (ptr
+                    (ident Self)
+                  )
+                )
+                (param value
+                  (ident T)
+                )
+              )
+              (ret
+                (err-union
+                  (err)
+                  (ok
+                    (ident void)
+                  )
+                )
+              )
+              (block
+                (if
+                  (cond
+                    (binary eq
+                      (field len
+                        (ident self)
+                      )
+                      (field len
+                        (field items
+                          (ident self)
+                        )
+                      )
+                    )
+                  )
+                  (then
+                    (block
+                      (const new_cap
+                        (if
+                          (cond
+                            (binary eq
+                              (field len
+                                (field items
+                                  (ident self)
+                                )
+                              )
+                              (int 0)
+                            )
+                          )
+                          (then
+                            (int 8)
+                          )
+                          (else
+                            (binary mul
+                              (field len
+                                (field items
+                                  (ident self)
+                                )
+                              )
+                              (int 2)
+                            )
+                          )
+                        )
+                      )
+                      (assign =
+                        (field items
+                          (ident self)
+                        )
+                        (unary try
+                          (call
+                            (field realloc
+                              (field alloc
+                                (ident self)
+                              )
+                            )
+                            (field items
+                              (ident self)
+                            )
+                            (ident new_cap)
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+                (assign =
+                  (index
+                    (field items
+                      (ident self)
+                    )
+                    (field len
+                      (ident self)
+                    )
+                  )
+                  (ident value)
+                )
+                (assign +=
+                  (field len
+                    (ident self)
+                  )
+                  (int 1)
+                )
+              )
+            )
+          )
+          (decl
+            (fn :pub get
+              (params
+                (param self
+                  (ptr :const
+                    (ident Self)
+                  )
+                )
+                (param index
+                  (ident usize)
+                )
+              )
+              (ret
+                (optional
+                  (ident T)
+                )
+              )
+              (block
+                (if
+                  (cond
+                    (binary ge
+                      (ident index)
+                      (field len
+                        (ident self)
+                      )
+                    )
+                  )
+                  (then
+                    (block
+                      (return
+                        (null)
+                      )
+                    )
+                  )
+                )
+                (return
+                  (index
+                    (field items
+                      (ident self)
+                    )
+                    (ident index)
+                  )
+                )
+              )
+            )
+          )
+          (decl
+            (fn :pub slice
+              (params
+                (param self
+                  (ptr :const
+                    (ident Self)
+                  )
+                )
+              )
+              (ret
+                (slice :const
+                  (ident T)
+                )
+              )
+              (block
+                (return
+                  (slice-expr
+                    (field items
+                      (ident self)
+                    )
+                    (lo
+                      (int 0)
+                    )
+                    (hi
+                      (field len
+                        (ident self)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var nums
+        (call
+          (field init
+            (call
+              (ident List)
+              (ident u32)
+            )
+          )
+          (field heap
+            (ident sys)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident nums)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident nums)
+            )
+            (int 40)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident nums)
+            )
+            (int 2)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident nums)
+            )
+            (int 100)
+          )
+        )
+      )
+      (var sum
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (call
+            (field slice
+              (ident nums)
+            )
+          )
+        )
+        (capture n)
+        (body
+          (block
+            (assign +=
+              (ident sum)
+              (ident n)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"nums.len = {d}, sum = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field len
+                  (ident nums)
+                )
+                (ident sum)
+              )
+            )
+          )
+        )
+      )
+      (const third
+        (binary orelse
+          (call
+            (field get
+              (ident nums)
+            )
+            (int 2)
+          )
+          (int 0)
+        )
+      )
+      (const missing
+        (binary orelse
+          (call
+            (field get
+              (ident nums)
+            )
+            (int 99)
+          )
+          (int 0)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"nums[2] = {d}, nums[99] = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident third)
+                (ident missing)
+              )
+            )
+          )
+        )
+      )
+      (var words
+        (call
+          (field init
+            (call
+              (ident List)
+              (slice :const
+                (ident u8)
+              )
+            )
+          )
+          (field heap
+            (ident sys)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident words)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident words)
+            )
+            (str "\"total\"")
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident words)
+            )
+            (str "\"control,\"")
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident words)
+            )
+            (str "\"zero waste\"")
+          )
+        )
+      )
+      (for
+        (operands
+          (call
+            (field slice
+              (ident words)
+            )
+          )
+          (range
+            (lo
+              (int 0)
+            )
+            (hi)
+          )
+        )
+        (capture w i)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"words[{d}] = {s}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident i)
+                      (ident w)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"push grows and get returns the right elements\""
+    (block
+      (var list
+        (call
+          (field init
+            (call
+              (ident List)
+              (ident i32)
+            )
+          )
+          (field allocator
+            (field testing
+              (ident std)
+            )
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident list)
+            )
+          )
+        )
+      )
+      (var i
+        (ty
+          (ident i32)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 20)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field push
+                    (ident list)
+                  )
+                  (binary mul
+                    (ident i)
+                    (ident i)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 20)
+            )
+            (field len
+              (ident list)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident i32)
+              (int 0)
+            )
+            (unwrap
+              (call
+                (field get
+                  (ident list)
+                )
+                (int 0)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident i32)
+              (int 361)
+            )
+            (unwrap
+              (call
+                (field get
+                  (ident list)
+                )
+                (int 19)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"get past the end yields null, not a panic\""
+    (block
+      (var list
+        (call
+          (field init
+            (call
+              (ident List)
+              (ident u8)
+            )
+          )
+          (field allocator
+            (field testing
+              (ident std)
+            )
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident list)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field push
+              (ident list)
+            )
+            (int 7)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (optional
+                (ident u8)
+              )
+              (null)
+            )
+            (call
+              (field get
+                (ident list)
+              )
+              (int 1)
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -163,33 +163,37 @@ union_type       = "union" , [ "(" , ( "enum" | type ) , ")" ] ,
 
 (* Members shared by struct/union bodies: fields, methods, and nested   *)
 (* declarations. `pub` may prefix any member.                           *)
-container_member = [ doc_comment ] ,
-                   ( field_decl
-                   | const_decl
-                   | var_decl
-                   | fn_decl
-                   | test_decl
-                   | comptime_block ) ;
+(*                                                                       *)
+(* RECONCILIATION NOTE (parser ⇄ grammar): the recursive-descent parser  *)
+(* drives all three container bodies (struct/enum/union) through ONE     *)
+(* uniform member parser, so the nested-DECLARATION set is identical     *)
+(* across containers — `const`, `var`, `fn`, `test`, and `comptime`      *)
+(* blocks are all accepted in any container, and only the FIELD shape    *)
+(* differs (enum fields are name `[= value]`; struct/union fields are    *)
+(* `name : type`). `enum_member`/`union_member` below are therefore      *)
+(* defined in terms of this shared `container_decl` set rather than a     *)
+(* hand-narrowed per-container list, to stay co-normative with the        *)
+(* parser. (The earlier narrower lists were aspirational; tightening the *)
+(* parser was judged higher-risk than documenting the actual, uniform    *)
+(* behavior.)                                                            *)
+container_member = [ doc_comment ] , ( field_decl | container_decl ) ;
+
+(* The nested-declaration members admitted in EVERY container body.      *)
+container_decl   = const_decl
+                 | var_decl
+                 | fn_decl
+                 | test_decl
+                 | comptime_block ;
 
 field_decl       = [ "pub" ] , [ "comptime" ] , identifier , ":" , type ,
                    [ "align" , "(" , expr , ")" ] ,
                    [ "=" , expr ] , "," ;     (* default value optional *)
 
-enum_member      = [ doc_comment ] ,
-                   ( enum_field
-                   | const_decl
-                   | fn_decl
-                   | test_decl ) ;
+enum_member      = [ doc_comment ] , ( enum_field | container_decl ) ;
 
 enum_field       = identifier , [ "=" , expr ] , "," ; (* optional explicit value *)
 
-union_member     = [ doc_comment ] ,
-                   ( union_field
-                   | const_decl
-                   | var_decl
-                   | fn_decl
-                   | test_decl
-                   | comptime_block ) ;
+union_member     = [ doc_comment ] , ( union_field | container_decl ) ;
 
 union_field      = [ "pub" ] , identifier , ":" , type , "," ;
 
@@ -367,7 +371,18 @@ postfix_op       = "(" , [ arg_list ] , ")"                  (* call          *)
                  | "[" , expr , ".." , [ expr ] , "]"        (* slice a[i..j]  *)
                  | "." , identifier                          (* field/method  *)
                  | ".*"                                      (* dereference   *)
-                 | ".?" ;                                    (* optional unwrap *)
+                 | ".?"                                      (* optional unwrap *)
+                 | typed_init ;                              (* T{ ... }       *)
+
+(* A TYPED initializer `T{ ... }` — the same `{ init_body }` payload as the     *)
+(* anonymous `.{ ... }` (init_literal), but with an explicit type prefix. The   *)
+(* type is the preceding postfix_expr, so `Packet{ .magic = ... }`,             *)
+(* `Color{ ... }`, `Self{ .items = ... }`, and array forms like                 *)
+(* `[_]u8{ 1, 2, 3 }` (the `{ ... }` binds to the WHOLE array type) all parse.  *)
+(* Realized as a postfix operator so it composes with the rest of the chain;    *)
+(* a `{` in control-flow header position (if/while/for/switch) is a block, not  *)
+(* a typed init, exactly as the parser's `no_struct_lit` context tracks.        *)
+typed_init       = "{" , [ init_body ] , "}" ;
 
 arg_list         = expr , { "," , expr } , [ "," ] ;
 
@@ -414,7 +429,9 @@ enum_literal     = "." , identifier ;
 (* arms; see docs/spec/01-lexical-structure.md section 7.1.              *)
 error_literal    = "error" , "." , identifier ;
 
-(* `.{ ... }` anonymous struct/tuple/initializer literal.               *)
+(* `.{ ... }` ANONYMOUS struct/tuple/initializer literal (inferred type). *)
+(* The TYPED form `T{ ... }` is a postfix operator on a type/expression —  *)
+(* see `typed_init` under postfix_op.                                      *)
 init_literal     = "." , "{" , [ init_body ] , "}" ;
 
 init_body        = field_init , { "," , field_init } , [ "," ]   (* named  *)

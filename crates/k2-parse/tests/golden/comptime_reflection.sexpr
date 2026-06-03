@@ -1,0 +1,845 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn printFields
+    (params
+      (param :comptime T
+        (ident type)
+      )
+      (param out
+        (anytype)
+      )
+      (param value
+        (ident T)
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const info
+        (builtin @typeInfo
+          (ident T)
+        )
+      )
+      (if
+        (cond
+          (binary ne
+            (ident info)
+            (enum-lit Struct)
+          )
+        )
+        (then
+          (block
+            (expr
+              (builtin @compileError
+                (binary concat
+                  (str "\"printFields requires a struct, got \"")
+                  (builtin @typeName
+                    (ident T)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (for :inline
+        (operands
+          (field fields
+            (field Struct
+              (ident info)
+            )
+          )
+        )
+        (capture field)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"  {s}: {s} = {any}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (field name
+                        (ident field)
+                      )
+                      (builtin @typeName
+                        (field type
+                          (ident field)
+                        )
+                      )
+                      (builtin @field
+                        (ident value)
+                        (field name
+                          (ident field)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (const SerializeError
+    (error-set BufferTooSmall)
+  )
+  (fn serializedSize
+    (params
+      (param :comptime T
+        (ident type)
+      )
+    )
+    (ret
+      (ident usize)
+    )
+    (block
+      (const info
+        (builtin @typeInfo
+          (ident T)
+        )
+      )
+      (if
+        (cond
+          (binary ne
+            (ident info)
+            (enum-lit Struct)
+          )
+        )
+        (then
+          (block
+            (expr
+              (builtin @compileError
+                (binary concat
+                  (str "\"serialize requires a struct, got \"")
+                  (builtin @typeName
+                    (ident T)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var total
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (for :inline
+        (operands
+          (field fields
+            (field Struct
+              (ident info)
+            )
+          )
+        )
+        (capture field)
+        (body
+          (block
+            (const fi
+              (builtin @typeInfo
+                (field type
+                  (ident field)
+                )
+              )
+            )
+            (if
+              (cond
+                (binary or
+                  (binary ne
+                    (ident fi)
+                    (enum-lit Int)
+                  )
+                  (binary ne
+                    (field signedness
+                      (field Int
+                        (ident fi)
+                      )
+                    )
+                    (enum-lit unsigned)
+                  )
+                )
+              )
+              (then
+                (block
+                  (expr
+                    (builtin @compileError
+                      (binary concat
+                        (binary concat
+                          (binary concat
+                            (str "\"serialize requires unsigned-integer fields; field '\"")
+                            (field name
+                              (ident field)
+                            )
+                          )
+                          (str "\"' is \"")
+                        )
+                        (builtin @typeName
+                          (field type
+                            (ident field)
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+            (assign +=
+              (ident total)
+              (builtin @sizeOf
+                (field type
+                  (ident field)
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (ident total)
+      )
+    )
+  )
+  (fn serialize
+    (params
+      (param :comptime T
+        (ident type)
+      )
+      (param value
+        (ident T)
+      )
+      (param buf
+        (slice
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err
+          (ident SerializeError)
+        )
+        (ok
+          (ident usize)
+        )
+      )
+    )
+    (block
+      (const need
+        (comptime
+          (call
+            (ident serializedSize)
+            (ident T)
+          )
+        )
+      )
+      (if
+        (cond
+          (binary lt
+            (field len
+              (ident buf)
+            )
+            (ident need)
+          )
+        )
+        (then
+          (block
+            (return
+              (field BufferTooSmall
+                (ident SerializeError)
+              )
+            )
+          )
+        )
+      )
+      (var offset
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (for :inline
+        (operands
+          (field fields
+            (field Struct
+              (builtin @typeInfo
+                (ident T)
+              )
+            )
+          )
+        )
+        (capture field)
+        (body
+          (block
+            (const FieldT
+              (field type
+                (ident field)
+              )
+            )
+            (const n
+              (builtin @sizeOf
+                (ident FieldT)
+              )
+            )
+            (var word
+              (builtin @field
+                (ident value)
+                (field name
+                  (ident field)
+                )
+              )
+            )
+            (var b
+              (ty
+                (ident usize)
+              )
+              (int 0)
+            )
+            (while :inline
+              (cond
+                (binary lt
+                  (ident b)
+                  (ident n)
+                )
+              )
+              (cont
+                (assign +=
+                  (ident b)
+                  (int 1)
+                )
+              )
+              (body
+                (block
+                  (assign =
+                    (index
+                      (ident buf)
+                      (binary add
+                        (ident offset)
+                        (ident b)
+                      )
+                    )
+                    (builtin @intCast
+                      (binary bitand
+                        (ident word)
+                        (int 0xFF)
+                      )
+                    )
+                  )
+                  (assign >>=
+                    (ident word)
+                    (int 8)
+                  )
+                )
+              )
+            )
+            (assign +=
+              (ident offset)
+              (ident n)
+            )
+          )
+        )
+      )
+      (return
+        (ident offset)
+      )
+    )
+  )
+  (const Packet
+    (container struct
+      (field magic
+        (ty
+          (ident u16)
+        )
+      )
+      (field length
+        (ty
+          (ident u32)
+        )
+      )
+      (field flags
+        (ty
+          (ident u8)
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const pkt
+        (init
+          (ty
+            (ident Packet)
+          )
+          (fields
+            (field-init magic
+              (int 0xBEEF)
+            )
+            (field-init length
+              (int 1024)
+            )
+            (field-init flags
+              (int 0b101)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"Packet fields:\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident printFields)
+            (ident Packet)
+            (ident out)
+            (ident pkt)
+          )
+        )
+      )
+      (var buf
+        (ty
+          (array-type
+            (len
+              (call
+                (ident serializedSize)
+                (ident Packet)
+              )
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const written
+        (unary try
+          (call
+            (ident serialize)
+            (ident Packet)
+            (ident pkt)
+            (unary addrof
+              (ident buf)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"serialized {d} bytes:\"")
+            (init
+              (ty)
+              (tuple
+                (ident written)
+              )
+            )
+          )
+        )
+      )
+      (for
+        (operands
+          (slice-expr
+            (ident buf)
+            (lo
+              (int 0)
+            )
+            (hi
+              (ident written)
+            )
+          )
+        )
+        (capture byte)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\" {x:0>2}\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident byte)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (const Color
+        (container struct
+          (field r
+            (ty
+              (ident u8)
+            )
+          )
+          (field g
+            (ty
+              (ident u8)
+            )
+          )
+          (field b
+            (ty
+              (ident u8)
+            )
+          )
+        )
+      )
+      (const c
+        (init
+          (ty
+            (ident Color)
+          )
+          (fields
+            (field-init r
+              (int 16)
+            )
+            (field-init g
+              (int 128)
+            )
+            (field-init b
+              (int 255)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"Color fields:\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident printFields)
+            (ident Color)
+            (ident out)
+            (ident c)
+          )
+        )
+      )
+    )
+  )
+  (test "\"serializedSize sums field sizes at comptime\""
+    (block
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 7)
+            )
+            (comptime
+              (call
+                (ident serializedSize)
+                (ident Packet)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"serialize writes little-endian bytes in declaration order\""
+    (block
+      (const pkt
+        (init
+          (ty
+            (ident Packet)
+          )
+          (fields
+            (field-init magic
+              (int 0xBEEF)
+            )
+            (field-init length
+              (int 1)
+            )
+            (field-init flags
+              (int 0xFF)
+            )
+          )
+        )
+      )
+      (var buf
+        (ty
+          (array-type
+            (len
+              (call
+                (ident serializedSize)
+                (ident Packet)
+              )
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const n
+        (unary try
+          (call
+            (ident serialize)
+            (ident Packet)
+            (ident pkt)
+            (unary addrof
+              (ident buf)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 7)
+            )
+            (ident n)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 0xEF)
+            )
+            (index
+              (ident buf)
+              (int 0)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 0xBE)
+            )
+            (index
+              (ident buf)
+              (int 1)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 0x01)
+            )
+            (index
+              (ident buf)
+              (int 2)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 0x00)
+            )
+            (index
+              (ident buf)
+              (int 5)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 0xFF)
+            )
+            (index
+              (ident buf)
+              (int 6)
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"serialize rejects an undersized buffer as a value, not a panic\""
+    (block
+      (const pkt
+        (init
+          (ty
+            (ident Packet)
+          )
+          (fields
+            (field-init magic
+              (int 0)
+            )
+            (field-init length
+              (int 0)
+            )
+            (field-init flags
+              (int 0)
+            )
+          )
+        )
+      )
+      (var tiny
+        (ty
+          (array-type
+            (len
+              (int 3)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (expr
+        (unary try
+          (call
+            (field expectError
+              (field testing
+                (ident std)
+              )
+            )
+            (field BufferTooSmall
+              (ident SerializeError)
+            )
+            (call
+              (ident serialize)
+              (ident Packet)
+              (ident pkt)
+              (unary addrof
+                (ident tiny)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

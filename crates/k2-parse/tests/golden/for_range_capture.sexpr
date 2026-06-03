@@ -1,0 +1,33 @@
+(source-file
+  (fn f
+    (params)
+    (ret
+      (ident void)
+    )
+    (block
+      (for
+        (operands
+          (ident xs)
+          (range
+            (lo
+              (int 0)
+            )
+            (hi)
+          )
+        )
+        (capture (ref slot) i)
+        (body
+          (block
+            (expr
+              (call
+                (ident use)
+                (ident slot)
+                (ident i)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -13,6 +13,7 @@ resolver = "2"
 members = [
     "crates/k2-lexer",
     "crates/k2-syntax",
+    "crates/k2-parse",
     "crates/k2c",
 ]
 

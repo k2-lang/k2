@@ -1,0 +1,23 @@
+(source-file
+  (fn f
+    (params)
+    (ret
+      (err-union
+        (err
+          (binary errset-merge
+            (ident A)
+            (ident B)
+          )
+        )
+        (ok
+          (ptr
+            (ident u32)
+          )
+        )
+      )
+    )
+    (block
+      (return)
+    )
+  )
+)

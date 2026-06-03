@@ -1,0 +1,12 @@
+[package]
+name = "k2-parse"
+version = "0.1.0"
+edition = "2021"
+description = "Recursive-descent parser for the k2 programming language."
+license = "MIT OR Apache-2.0"
+
+# Standard library only, plus the sibling lexer/syntax crates by path — no
+# third-party dependencies, so the front-end builds fully offline.
+[dependencies]
+k2-lexer = { path = "../k2-lexer" }
+k2-syntax = { path = "../k2-syntax" }

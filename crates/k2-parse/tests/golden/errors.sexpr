@@ -1,0 +1,935 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (const ParseError
+    (error-set Empty NotANumber Overflow)
+  )
+  (fn parseDoubled
+    (params
+      (param alloc
+        (ident Allocator)
+      )
+      (param text
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err
+          (binary errset-merge
+            (ident ParseError)
+            (error-set OutOfMemory)
+          )
+        )
+        (ok
+          (ptr
+            (ident u32)
+          )
+        )
+      )
+    )
+    (block
+      (if
+        (cond
+          (binary eq
+            (field len
+              (ident text)
+            )
+            (int 0)
+          )
+        )
+        (then
+          (block
+            (return
+              (field Empty
+                (ident ParseError)
+              )
+            )
+          )
+        )
+      )
+      (const cell
+        (ty
+          (ptr
+            (ident u32)
+          )
+        )
+        (unary try
+          (call
+            (field create
+              (ident alloc)
+            )
+            (ident u32)
+          )
+        )
+      )
+      (errdefer
+        (expr
+          (call
+            (field destroy
+              (ident alloc)
+            )
+            (ident cell)
+          )
+        )
+      )
+      (var value
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident text)
+        )
+        (capture ch)
+        (body
+          (block
+            (if
+              (cond
+                (unary not
+                  (call
+                    (ident isDigit)
+                    (ident ch)
+                  )
+                )
+              )
+              (then
+                (block
+                  (return
+                    (field NotANumber
+                      (ident ParseError)
+                    )
+                  )
+                )
+              )
+            )
+            (if
+              (cond
+                (binary gt
+                  (ident value)
+                  (binary div
+                    (binary sub
+                      (int 0xFFFF_FFFF)
+                      (int 9)
+                    )
+                    (int 10)
+                  )
+                )
+              )
+              (then
+                (block
+                  (return
+                    (field Overflow
+                      (ident ParseError)
+                    )
+                  )
+                )
+              )
+            )
+            (assign =
+              (ident value)
+              (binary add
+                (binary mul
+                  (ident value)
+                  (int 10)
+                )
+                (builtin @as
+                  (ident u32)
+                  (binary sub
+                    (ident ch)
+                    (char "'0'")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (assign =
+        (deref
+          (ident cell)
+        )
+        (binary mul
+          (ident value)
+          (int 2)
+        )
+      )
+      (return
+        (ident cell)
+      )
+    )
+  )
+  (fn parseU32
+    (params
+      (param text
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err
+          (ident ParseError)
+        )
+        (ok
+          (ident u32)
+        )
+      )
+    )
+    (block
+      (if
+        (cond
+          (binary eq
+            (field len
+              (ident text)
+            )
+            (int 0)
+          )
+        )
+        (then
+          (block
+            (return
+              (field Empty
+                (ident ParseError)
+              )
+            )
+          )
+        )
+      )
+      (var value
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident text)
+        )
+        (capture ch)
+        (body
+          (block
+            (if
+              (cond
+                (unary not
+                  (call
+                    (ident isDigit)
+                    (ident ch)
+                  )
+                )
+              )
+              (then
+                (block
+                  (return
+                    (field NotANumber
+                      (ident ParseError)
+                    )
+                  )
+                )
+              )
+            )
+            (if
+              (cond
+                (binary gt
+                  (ident value)
+                  (binary div
+                    (binary sub
+                      (int 0xFFFF_FFFF)
+                      (int 9)
+                    )
+                    (int 10)
+                  )
+                )
+              )
+              (then
+                (block
+                  (return
+                    (field Overflow
+                      (ident ParseError)
+                    )
+                  )
+                )
+              )
+            )
+            (assign =
+              (ident value)
+              (binary add
+                (binary mul
+                  (ident value)
+                  (int 10)
+                )
+                (builtin @as
+                  (ident u32)
+                  (binary sub
+                    (ident ch)
+                    (char "'0'")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (ident value)
+      )
+    )
+  )
+  (fn isDigit
+    (params
+      (param ch
+        (ident u8)
+      )
+    )
+    (ret
+      (ident bool)
+    )
+    (block
+      (return
+        (binary and
+          (binary ge
+            (ident ch)
+            (char "'0'")
+          )
+          (binary le
+            (ident ch)
+            (char "'9'")
+          )
+        )
+      )
+    )
+  )
+  (fn exitCodeFor
+    (params
+      (param e
+        (ident ParseError)
+      )
+    )
+    (ret
+      (ident u8)
+    )
+    (block
+      (return
+        (switch
+          (on
+            (ident e)
+          )
+          (arm
+            (pattern
+              (error-lit Empty)
+            )
+            (body
+              (int 10)
+            )
+          )
+          (arm
+            (pattern
+              (error-lit NotANumber)
+            )
+            (body
+              (int 11)
+            )
+          )
+          (arm
+            (pattern
+              (error-lit Overflow)
+            )
+            (body
+              (int 12)
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const alloc
+        (field heap
+          (ident sys)
+        )
+      )
+      (const ptr
+        (catch err
+          (call
+            (ident parseDoubled)
+            (ident alloc)
+            (str "\"21\"")
+          )
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"parse failed: {s}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (builtin @errorName
+                        (ident err)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+            (return)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field destroy
+              (ident alloc)
+            )
+            (ident ptr)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"doubled(\\\"21\\\") = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (deref
+                  (ident ptr)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident processAll)
+            (ident out)
+            (ident alloc)
+          )
+        )
+      )
+      (const ok
+        (catch
+          (call
+            (ident parseU32)
+            (str "\"123\"")
+          )
+          (int 0)
+        )
+      )
+      (const bad
+        (catch
+          (call
+            (ident parseU32)
+            (str "\"oops\"")
+          )
+          (int 0)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"parseU32(\\\"123\\\") = {d}, parseU32(\\\"oops\\\") = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident ok)
+                (ident bad)
+              )
+            )
+          )
+        )
+      )
+      (const inputs
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (slice :const
+                (ident u8)
+              )
+            )
+          )
+          (tuple
+            (str "\"\"")
+            (str "\"12x\"")
+            (str "\"99999999999\"")
+          )
+        )
+      )
+      (for
+        (operands
+          (ident inputs)
+        )
+        (capture in)
+        (body
+          (block
+            (const r
+              (catch err
+                (call
+                  (ident parseDoubled)
+                  (ident alloc)
+                  (ident in)
+                )
+                (block
+                  (const code
+                    (ty
+                      (ident u8)
+                    )
+                    (switch
+                      (on
+                        (ident err)
+                      )
+                      (arm
+                        (pattern
+                          (error-lit Empty)
+                        )
+                        (body
+                          (int 10)
+                        )
+                      )
+                      (arm
+                        (pattern
+                          (error-lit NotANumber)
+                        )
+                        (body
+                          (int 11)
+                        )
+                      )
+                      (arm
+                        (pattern
+                          (error-lit Overflow)
+                        )
+                        (body
+                          (int 12)
+                        )
+                      )
+                      (arm
+                        (pattern
+                          (error-lit OutOfMemory)
+                        )
+                        (body
+                          (int 1)
+                        )
+                      )
+                    )
+                  )
+                  (expr
+                    (unary try
+                      (call
+                        (field print
+                          (ident out)
+                        )
+                        (str "\"input {s:>14} -> error {s} (code {d})\\n\"")
+                        (init
+                          (ty)
+                          (tuple
+                            (ident in)
+                            (builtin @errorName
+                              (ident err)
+                            )
+                            (ident code)
+                          )
+                        )
+                      )
+                    )
+                  )
+                  (continue)
+                )
+              )
+            )
+            (defer
+              (expr
+                (call
+                  (field destroy
+                    (ident alloc)
+                  )
+                  (ident r)
+                )
+              )
+            )
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"input {s:>14} -> {d}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident in)
+                      (deref
+                        (ident r)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn processAll
+    (params
+      (param out
+        (anytype)
+      )
+      (param alloc
+        (ident Allocator)
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const a
+        (unary try
+          (call
+            (ident parseDoubled)
+            (ident alloc)
+            (str "\"5\"")
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field destroy
+              (ident alloc)
+            )
+            (ident a)
+          )
+        )
+      )
+      (const b
+        (unary try
+          (call
+            (ident parseDoubled)
+            (ident alloc)
+            (str "\"9\"")
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field destroy
+              (ident alloc)
+            )
+            (ident b)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"doubled(\\\"5\\\") + doubled(\\\"9\\\") = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary add
+                  (deref
+                    (ident a)
+                  )
+                  (deref
+                    (ident b)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"valid input is parsed and doubled\""
+    (block
+      (const alloc
+        (field allocator
+          (field testing
+            (ident std)
+          )
+        )
+      )
+      (const cell
+        (unary try
+          (call
+            (ident parseDoubled)
+            (ident alloc)
+            (str "\"21\"")
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field destroy
+              (ident alloc)
+            )
+            (ident cell)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u32)
+              (int 42)
+            )
+            (deref
+              (ident cell)
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"empty input returns ParseError.Empty and leaks nothing\""
+    (block
+      (const alloc
+        (field allocator
+          (field testing
+            (ident std)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectError
+              (field testing
+                (ident std)
+              )
+            )
+            (field Empty
+              (ident ParseError)
+            )
+            (call
+              (ident parseDoubled)
+              (ident alloc)
+              (str "\"\"")
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"a non-digit triggers errdefer cleanup, so no leak\""
+    (block
+      (const alloc
+        (field allocator
+          (field testing
+            (ident std)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectError
+              (field testing
+                (ident std)
+              )
+            )
+            (field NotANumber
+              (ident ParseError)
+            )
+            (call
+              (ident parseDoubled)
+              (ident alloc)
+              (str "\"12x\"")
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"exit codes are exhaustive over ParseError\""
+    (block
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 10)
+            )
+            (call
+              (ident exitCodeFor)
+              (error-lit Empty)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 11)
+            )
+            (call
+              (ident exitCodeFor)
+              (error-lit NotANumber)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (int 12)
+            )
+            (call
+              (ident exitCodeFor)
+              (error-lit Overflow)
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"parseU32 succeeds, and catch supplies a default on failure\""
+    (block
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u32)
+              (int 123)
+            )
+            (unary try
+              (call
+                (ident parseU32)
+                (str "\"123\"")
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u32)
+              (int 0)
+            )
+            (catch
+              (call
+                (ident parseU32)
+                (str "\"oops\"")
+              )
+              (int 0)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectError
+              (field testing
+                (ident std)
+              )
+            )
+            (field Overflow
+              (ident ParseError)
+            )
+            (call
+              (ident parseU32)
+              (str "\"99999999999\"")
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -1,0 +1,98 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"Hello, k2!\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (const star
+        (str "\"Sol\"")
+      )
+      (const joules
+        (ty
+          (ident u64)
+        )
+        (int 384_600_000_000_000_000_000_000_000)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"k2 directs every joule of {s}: ~{d} W.\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident star)
+                (ident joules)
+              )
+            )
+          )
+        )
+      )
+      (const err
+        (call
+          (field stderr
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident err)
+            )
+            (str "\"(this line went to stderr)\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+    )
+  )
+)

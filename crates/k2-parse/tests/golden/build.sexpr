@@ -1,0 +1,412 @@
+(source-file
+  (const build
+    (builtin @import
+      (str "\"build\"")
+    )
+  )
+  (fn :pub build
+    (params
+      (param b
+        (ptr
+          (ident Build)
+        )
+      )
+    )
+    (ret
+      (ident void)
+    )
+    (block
+      (const target
+        (call
+          (field standardTarget
+            (ident b)
+          )
+        )
+      )
+      (const optimize
+        (call
+          (field standardOptimize
+            (ident b)
+          )
+        )
+      )
+      (const with_stderr_log
+        (binary orelse
+          (call
+            (field option
+              (ident b)
+            )
+            (ident bool)
+            (str "\"with-stderr-log\"")
+            (str "\"Mirror output to stderr\"")
+          )
+          (bool false)
+        )
+      )
+      (const lib
+        (call
+          (field addLibrary
+            (ident b)
+          )
+          (init
+            (ty)
+            (fields
+              (field-init name
+                (str "\"examples_support\"")
+              )
+              (field-init root_source
+                (call
+                  (field path
+                    (ident b)
+                  )
+                  (str "\"support/root.k2\"")
+                )
+              )
+              (field-init target
+                (ident target)
+              )
+              (field-init optimize
+                (ident optimize)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field addOption
+            (ident lib)
+          )
+          (ident bool)
+          (str "\"with_stderr_log\"")
+          (ident with_stderr_log)
+        )
+      )
+      (expr
+        (call
+          (field installArtifact
+            (ident b)
+          )
+          (ident lib)
+        )
+      )
+      (const examples
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (slice :const
+                (ident u8)
+              )
+            )
+          )
+          (tuple
+            (str "\"hello\"")
+            (str "\"allocators\"")
+            (str "\"generic_list\"")
+            (str "\"errors\"")
+            (str "\"comptime_reflection\"")
+          )
+        )
+      )
+      (const which
+        (binary orelse
+          (call
+            (field option
+              (ident b)
+            )
+            (slice :const
+              (ident u8)
+            )
+            (str "\"example\"")
+            (str "\"Which example `run` executes\"")
+          )
+          (str "\"hello\"")
+        )
+      )
+      (const run_step
+        (call
+          (field step
+            (ident b)
+          )
+          (str "\"run\"")
+          (str "\"Build and run one example (-Dexample=NAME)\"")
+        )
+      )
+      (for :inline
+        (operands
+          (ident examples)
+        )
+        (capture name)
+        (body
+          (block
+            (const exe
+              (call
+                (field addExecutable
+                  (ident b)
+                )
+                (init
+                  (ty)
+                  (fields
+                    (field-init name
+                      (ident name)
+                    )
+                    (field-init root_source
+                      (call
+                        (field path
+                          (ident b)
+                        )
+                        (call
+                          (field fmt
+                            (ident b)
+                          )
+                          (str "\"{s}.k2\"")
+                          (init
+                            (ty)
+                            (tuple
+                              (ident name)
+                            )
+                          )
+                        )
+                      )
+                    )
+                    (field-init target
+                      (ident target)
+                    )
+                    (field-init optimize
+                      (ident optimize)
+                    )
+                  )
+                )
+              )
+            )
+            (expr
+              (call
+                (field addModule
+                  (ident exe)
+                )
+                (str "\"examples_support\"")
+                (call
+                  (field module
+                    (ident lib)
+                  )
+                )
+              )
+            )
+            (expr
+              (call
+                (field addOption
+                  (ident exe)
+                )
+                (ident bool)
+                (str "\"with_stderr_log\"")
+                (ident with_stderr_log)
+              )
+            )
+            (expr
+              (call
+                (field installArtifact
+                  (ident b)
+                )
+                (ident exe)
+              )
+            )
+            (if
+              (cond
+                (call
+                  (ident strEql)
+                  (ident name)
+                  (ident which)
+                )
+              )
+              (then
+                (block
+                  (const run_exe
+                    (call
+                      (field addRunArtifact
+                        (ident b)
+                      )
+                      (ident exe)
+                    )
+                  )
+                  (expr
+                    (call
+                      (field passForwardedArgs
+                        (ident run_exe)
+                      )
+                    )
+                  )
+                  (expr
+                    (call
+                      (field dependOn
+                        (ident run_step)
+                      )
+                      (unary addrof
+                        (field step
+                          (ident run_exe)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const tests
+        (call
+          (field addTest
+            (ident b)
+          )
+          (init
+            (ty)
+            (fields
+              (field-init name
+                (str "\"examples_tests\"")
+              )
+              (field-init root_source
+                (call
+                  (field path
+                    (ident b)
+                  )
+                  (str "\"tests/all.k2\"")
+                )
+              )
+              (field-init target
+                (ident target)
+              )
+              (field-init optimize
+                (ident optimize)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field addModule
+            (ident tests)
+          )
+          (str "\"examples_support\"")
+          (call
+            (field module
+              (ident lib)
+            )
+          )
+        )
+      )
+      (const run_tests
+        (call
+          (field addRunArtifact
+            (ident b)
+          )
+          (ident tests)
+        )
+      )
+      (const test_step
+        (call
+          (field step
+            (ident b)
+          )
+          (str "\"test\"")
+          (str "\"Run all example tests\"")
+        )
+      )
+      (expr
+        (call
+          (field dependOn
+            (ident test_step)
+          )
+          (unary addrof
+            (field step
+              (ident run_tests)
+            )
+          )
+        )
+      )
+      (if
+        (cond
+          (binary eq
+            (field os
+              (ident target)
+            )
+            (enum-lit windows)
+          )
+        )
+        (then
+          (block)
+        )
+      )
+    )
+  )
+  (fn strEql
+    (params
+      (param a
+        (slice :const
+          (ident u8)
+        )
+      )
+      (param b
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (ident bool)
+    )
+    (block
+      (if
+        (cond
+          (binary ne
+            (field len
+              (ident a)
+            )
+            (field len
+              (ident b)
+            )
+          )
+        )
+        (then
+          (block
+            (return
+              (bool false)
+            )
+          )
+        )
+      )
+      (for
+        (operands
+          (ident a)
+          (ident b)
+        )
+        (capture x y)
+        (body
+          (block
+            (if
+              (cond
+                (binary ne
+                  (ident x)
+                  (ident y)
+                )
+              )
+              (then
+                (block
+                  (return
+                    (bool false)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (bool true)
+      )
+    )
+  )
+)

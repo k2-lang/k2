@@ -2,11 +2,10 @@
 //!
 //! k2 — *Kardashev Type II*: total control over the machine, with zero waste.
 //!
-//! This binary is the entry point of the k2 toolchain front-end. At this stage
-//! it wires up the [`k2_lexer`] (and links [`k2_syntax`] for the AST types that
-//! a future parser will populate). It exposes a single working subcommand,
-//! `tokenize` (alias `lex`), that reads a `.k2` file — or standard input — and
-//! prints the token stream.
+//! This binary is the entry point of the k2 toolchain front-end. It wires up
+//! the [`k2_lexer`], the [`k2_parse`] parser, and the [`k2_syntax`] AST. It
+//! exposes two working subcommands: `tokenize` (alias `lex`), which prints the
+//! token stream, and `parse`, which prints the S-expression AST.
 //!
 //! Argument parsing is done by hand with `std::env::args`: no third-party CLI
 //! crate, so the toolchain builds and runs fully offline.
@@ -17,13 +16,16 @@
 //! k2c tokenize <file.k2>     # lex a file and print its tokens
 //! k2c tokenize -             # lex from standard input
 //! k2c lex <file.k2>          # `lex` is an alias for `tokenize`
+//! k2c parse <file.k2>        # parse a file and print its S-expression AST
+//! k2c parse -                # parse from standard input
 //! k2c help                   # print usage
 //! k2c version                # print the version
 //! ```
 //!
-//! The process exits `0` on success and a nonzero status on a usage or I/O
-//! error (lexical *errors* in the source are reported as `Error` tokens in the
-//! stream, not as a process failure — recovery is the lexer's job).
+//! For `tokenize`, the process exits `0` on success and nonzero only on a usage
+//! or I/O error (lexical *errors* are reported as `Error` tokens, not a process
+//! failure). For `parse`, the process additionally exits nonzero when the
+//! source contained one or more parse errors.
 
 use std::env;
 use std::fs;
@@ -31,8 +33,7 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use k2_lexer::{tokenize, Token, TokenKind};
-// Linked to keep the AST crate in the dependency graph and demonstrate the
-// span helper the future parser will use; not yet exercised by a real parse.
+use k2_parse::{parse, to_sexpr, Severity};
 use k2_syntax::Span;
 
 /// Program name used in diagnostics and the usage text.
@@ -44,7 +45,7 @@ fn main() -> ExitCode {
     // Skip argv[0] (the executable path) and dispatch on the subcommand.
     let args: Vec<String> = env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             // All diagnostics go to stderr so stdout carries only real output.
             let _ = writeln!(io::stderr(), "{PROG}: error: {err}");
@@ -53,26 +54,29 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parses the subcommand and arguments and runs the requested action. Returns a
-/// human-readable error string on failure.
-fn run(args: &[String]) -> Result<(), String> {
+/// Parses the subcommand and arguments and runs the requested action. Returns
+/// the process exit code on success (a command may report a content failure,
+/// such as parse errors, via a non-success code), or a human-readable error
+/// string on a usage/I/O error.
+fn run(args: &[String]) -> Result<ExitCode, String> {
     let (cmd, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
         None => {
             print_usage();
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
     };
 
     match cmd {
-        "tokenize" | "lex" => cmd_tokenize(rest),
+        "tokenize" | "lex" => cmd_tokenize(rest).map(|()| ExitCode::SUCCESS),
+        "parse" => cmd_parse(rest),
         "help" | "--help" | "-h" => {
             print_usage();
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "version" | "--version" | "-V" => {
             println!("{PROG} {VERSION}");
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         other => Err(format!("unknown subcommand `{other}` (try `{PROG} help`)")),
     }
@@ -98,6 +102,82 @@ fn cmd_tokenize(args: &[String]) -> Result<(), String> {
     let tokens = tokenize(&source);
     print_tokens(&label, &tokens);
     Ok(())
+}
+
+/// The `parse` subcommand: read source from a file path or stdin, parse it,
+/// print the S-expression AST to stdout (unless `--quiet`), and print each
+/// diagnostic to stderr. Exits with a nonzero code if any error-severity
+/// diagnostic was produced.
+fn cmd_parse(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<&str> = None;
+    let mut quiet = false;
+    let mut show_spans = false;
+    for arg in args {
+        match arg.as_str() {
+            "--quiet" => quiet = true,
+            "--sexpr" => {} // the default; accepted for explicitness
+            "--spans" => show_spans = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `parse` flag `{other}`"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!(
+                        "`parse` takes exactly one path; got extra `{other}`"
+                    ));
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| "`parse` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
+
+    let (source, label) = read_source(path)?;
+    let result = parse(&source);
+
+    if !quiet {
+        let tree = if show_spans {
+            k2_parse::to_sexpr_spans(&result.file)
+        } else {
+            to_sexpr(&result.file)
+        };
+        print!("{tree}");
+    }
+
+    // Diagnostics go to stderr, formatted `label:line:col: severity: message`.
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    for diag in &result.diagnostics {
+        let sev = match diag.severity {
+            Severity::Error => {
+                error_count += 1;
+                "error"
+            }
+            Severity::Warning => "warning",
+        };
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {sev}: {}",
+            diag.span.line, diag.span.col, diag.message
+        );
+    }
+
+    if quiet {
+        let _ = writeln!(
+            err,
+            "# {} item(s), {} diagnostic(s)",
+            result.file.items.len(),
+            result.diagnostics.len()
+        );
+    }
+
+    if error_count == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
 }
 
 /// Reads the source either from `-` (standard input) or from a file path.
@@ -190,7 +270,13 @@ fn print_usage() {
          \x20   tokenize <file.k2>   Lex a source file and print its token stream.\n\
          \x20   tokenize -           Lex from standard input.\n\
          \x20   lex <file.k2>        Alias for `tokenize`.\n\
+         \x20   parse <file.k2>      Parse a source file and print its S-expression AST.\n\
+         \x20   parse -              Parse from standard input.\n\
          \x20   help                 Show this help.\n\
-         \x20   version              Print the version.\n"
+         \x20   version              Print the version.\n\
+         \n\
+         PARSE FLAGS:\n\
+         \x20   --quiet              Suppress the tree; print only diagnostics + a summary.\n\
+         \x20   --spans              Annotate each S-expr node with its @start..end span.\n"
     );
 }

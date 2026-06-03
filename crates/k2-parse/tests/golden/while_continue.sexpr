@@ -1,0 +1,33 @@
+(source-file
+  (fn f
+    (params)
+    (ret
+      (ident void)
+    )
+    (block
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 20)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (call
+                (ident step)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

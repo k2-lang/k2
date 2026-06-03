@@ -1,0 +1,559 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn squares
+    (params
+      (param alloc
+        (ident Allocator)
+      )
+      (param count
+        (ident usize)
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (slice
+            (ident u64)
+          )
+        )
+      )
+    )
+    (block
+      (const xs
+        (ty
+          (slice
+            (ident u64)
+          )
+        )
+        (unary try
+          (call
+            (field alloc
+              (ident alloc)
+            )
+            (ident u64)
+            (ident count)
+          )
+        )
+      )
+      (errdefer
+        (expr
+          (call
+            (field free
+              (ident alloc)
+            )
+            (ident xs)
+          )
+        )
+      )
+      (for
+        (operands
+          (ident xs)
+          (range
+            (lo
+              (int 0)
+            )
+            (hi)
+          )
+        )
+        (capture (ref slot) i)
+        (body
+          (block
+            (const v
+              (ty
+                (ident u64)
+              )
+              (builtin @intCast
+                (ident i)
+              )
+            )
+            (assign =
+              (deref
+                (ident slot)
+              )
+              (binary mul
+                (ident v)
+                (ident v)
+              )
+            )
+          )
+        )
+      )
+      (return
+        (ident xs)
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var gpa
+        (call
+          (field init
+            (field GeneralPurposeAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident sys)
+        )
+      )
+      (defer
+        (block
+          (const leaked
+            (call
+              (field deinit
+                (ident gpa)
+              )
+            )
+          )
+          (if
+            (cond
+              (ident leaked)
+            )
+            (then
+              (block
+                (expr
+                  (builtin @panic
+                    (str "\"memory leak detected at shutdown\"")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const alloc
+        (call
+          (field allocator
+            (ident gpa)
+          )
+        )
+      )
+      (const buf
+        (ty
+          (slice
+            (ident u32)
+          )
+        )
+        (unary try
+          (call
+            (field alloc
+              (ident alloc)
+            )
+            (ident u32)
+            (int 16)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field free
+              (ident alloc)
+            )
+            (ident buf)
+          )
+        )
+      )
+      (for
+        (operands
+          (ident buf)
+          (range
+            (lo
+              (int 0)
+            )
+            (hi)
+          )
+        )
+        (capture (ref slot) i)
+        (body
+          (block
+            (assign =
+              (deref
+                (ident slot)
+              )
+              (builtin @intCast
+                (binary mul
+                  (ident i)
+                  (ident i)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"buf[15] = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (index
+                  (ident buf)
+                  (int 15)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var list
+        (call
+          (field init
+            (call
+              (field ArrayList
+                (ident std)
+              )
+              (ident u32)
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident list)
+            )
+          )
+        )
+      )
+      (var i
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 8)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field append
+                    (ident list)
+                  )
+                  (binary mul
+                    (ident i)
+                    (int 10)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"list.len = {d}, list.items[7] = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field len
+                  (field items
+                    (ident list)
+                  )
+                )
+                (index
+                  (field items
+                    (ident list)
+                  )
+                  (int 7)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const data
+        (catch e
+          (call
+            (ident squares)
+            (ident alloc)
+            (int 8)
+          )
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"alloc failed: {s}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (builtin @errorName
+                        (ident e)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+            (return)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field free
+              (ident alloc)
+            )
+            (ident data)
+          )
+        )
+      )
+      (var total
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident data)
+        )
+        (capture x)
+        (body
+          (block
+            (assign +=
+              (ident total)
+              (ident x)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sum of first 8 squares = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident total)
+              )
+            )
+          )
+        )
+      )
+      (var arena
+        (call
+          (field init
+            (field ArenaAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident arena)
+            )
+          )
+        )
+      )
+      (const scratch
+        (call
+          (field allocator
+            (ident arena)
+          )
+        )
+      )
+      (const a
+        (ty
+          (slice
+            (ident u8)
+          )
+        )
+        (unary try
+          (call
+            (field alloc
+              (ident scratch)
+            )
+            (ident u8)
+            (int 32)
+          )
+        )
+      )
+      (const b
+        (ty
+          (slice
+            (ident u8)
+          )
+        )
+        (unary try
+          (call
+            (field alloc
+              (ident scratch)
+            )
+            (ident u8)
+            (int 64)
+          )
+        )
+      )
+      (assign =
+        (index
+          (ident a)
+          (int 0)
+        )
+        (int 1)
+      )
+      (assign =
+        (index
+          (ident b)
+          (int 0)
+        )
+        (int 2)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"arena handed out {d} + {d} bytes\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field len
+                  (ident a)
+                )
+                (field len
+                  (ident b)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"squares computes the first squares and the caller frees them\""
+    (block
+      (const alloc
+        (field allocator
+          (field testing
+            (ident std)
+          )
+        )
+      )
+      (const xs
+        (unary try
+          (call
+            (ident squares)
+            (ident alloc)
+            (int 5)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field free
+              (ident alloc)
+            )
+            (ident xs)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 0)
+            )
+            (index
+              (ident xs)
+              (int 0)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 16)
+            )
+            (index
+              (ident xs)
+              (int 4)
+            )
+          )
+        )
+      )
+    )
+  )
+)

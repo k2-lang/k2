@@ -1,0 +1,14 @@
+(source-file
+  (const x
+    (init
+      (ty
+        (ident Packet)
+      )
+      (fields
+        (field-init magic
+          (int 0xBEEF)
+        )
+      )
+    )
+  )
+)
