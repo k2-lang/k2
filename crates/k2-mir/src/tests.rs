@@ -1101,6 +1101,72 @@ fn verify_catches_unreachable_block() {
 }
 
 #[test]
+fn verify_catches_dangling_make_slice_offset() {
+    // REGRESSION (v0.9-#2): `Rvalue::collect_locals` once walked only the `ptr`
+    // and `len` operands of a `MakeSlice`, discarding `offset` via the `..`
+    // pattern. Because `collect_locals` is the sole feeder for
+    // `Statement::referenced_locals` — which `verify` uses to detect
+    // "references undefined local" — a `MakeSlice` whose OFFSET was a dangling
+    // local slipped past `verify` clean. We now walk all three operands; this test
+    // pins the hole by manually corrupting a real slice's offset operand to point
+    // at an out-of-range local and asserting `verify` flags it.
+    let mut prog = lower(
+        r#"
+            fn slice3(a: []const u32, lo: usize, hi: usize) usize {
+                const s = a[lo..hi];
+                return s.len;
+            }
+            pub fn main(sys: *System) void {
+                return;
+            }
+        "#,
+        BuildMode::Debug,
+    );
+    // A clean program verifies, including its variable-offset MakeSlice.
+    assert!(
+        prog.verify().is_empty(),
+        "the unaltered slice program must verify: {:?}",
+        prog.verify()
+    );
+
+    // Find the `slice3` function and the block/statement holding its MakeSlice,
+    // then repoint the OFFSET operand at a local one past the end of the frame.
+    let f = prog
+        .funcs
+        .iter_mut()
+        .find(|f| f.name == "slice3")
+        .expect("slice3 fn");
+    let dangling = LocalId(f.locals.len() as u32); // out of range by construction
+    let mut patched = false;
+    'outer: for b in &mut f.blocks {
+        for s in &mut b.stmts {
+            if let Statement::Assign {
+                rvalue: Rvalue::MakeSlice { offset, .. },
+                ..
+            } = s
+            {
+                *offset = Operand::Copy(Place::local(dangling));
+                patched = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        patched,
+        "expected a MakeSlice with a variable offset to patch"
+    );
+
+    // verify must now report the dangling OFFSET local (previously it did not).
+    let problems = prog.verify();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.message.contains("references undefined local")),
+        "verify must catch a dangling MakeSlice offset local: {problems:?}"
+    );
+}
+
+#[test]
 fn corpus_lowers_verifies_and_stays_leak_clean() {
     // Every example lowers with zero errors AND every lowered program verifies
     // (every block terminated, no undefined locals, NO unreachable blocks). This

@@ -26,6 +26,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "k2-opt"
+version = "0.1.0"
+dependencies = [
+ "k2-mir",
+ "k2-parse",
+ "k2-resolve",
+ "k2-syntax",
+ "k2-types",
+ "k2-vm",
+]
+
+[[package]]
 name = "k2-parse"
 version = "0.1.0"
 dependencies = [
@@ -74,6 +86,7 @@ dependencies = [
  "k2-fmt",
  "k2-lexer",
  "k2-mir",
+ "k2-opt",
  "k2-parse",
  "k2-resolve",
  "k2-syntax",

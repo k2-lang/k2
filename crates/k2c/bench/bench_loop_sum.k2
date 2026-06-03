@@ -1,0 +1,21 @@
+// bench_loop_sum.k2 — sum of i*i over a counted loop.
+//
+// An integer loop with multiplication and addition: in ReleaseSafe the overflow
+// checks are kept (the operands are runtime values), in ReleaseFast they are
+// absent. Exercises copy-prop/fold of the loop induction and the per-iteration
+// arithmetic.
+
+fn sumSquares(n: u64) u64 {
+    var s: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) {
+        s = s + i * i;
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try out.print("sumSquares(1000) = {d}\n", .{sumSquares(1000)});
+}

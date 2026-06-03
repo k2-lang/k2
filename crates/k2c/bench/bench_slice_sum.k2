@@ -1,0 +1,26 @@
+// bench_slice_sum.k2 — sum a fixed array many times.
+//
+// Exercises slice indexing with bounds checks (kept in ReleaseSafe, since the
+// loop index is a runtime value), and the per-iteration accumulation. The outer
+// repeat loop makes the cost large enough to measure a clear reduction.
+
+fn sumSlice(xs: []const u32) u32 {
+    var total: u32 = 0;
+    for (xs) |x| {
+        total = total + x;
+    }
+    return total;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const arr = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var acc: u64 = 0;
+    var r: u32 = 0;
+    while (r < 500) {
+        const s: u64 = @as(u64, sumSlice(&arr));
+        acc = acc + s;
+        r = r + 1;
+    }
+    try out.print("slice_sum = {d}\n", .{acc});
+}

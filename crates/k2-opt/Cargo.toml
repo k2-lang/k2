@@ -1,0 +1,30 @@
+# k2-opt — the MIR optimizer for the k2 language (milestone v0.9).
+#
+# This crate consumes a verified, monomorphized `MirProgram` (from `k2-mir`) and
+# rewrites it to a *behaviorally identical* but cheaper program: constant
+# folding, constant/copy propagation, dead-code/dead-store elimination, CFG
+# simplification, small-monomorphic-call inlining/devirtualization, and (in
+# ReleaseSafe) sound elimination of provably-redundant safety checks. Every pass
+# preserves `MirProgram::verify` and the program's observable behavior. Like
+# every other front-end crate it depends on the Rust standard library ONLY —
+# zero third-party crates, so the toolchain builds fully offline.
+[package]
+name = "k2-opt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MIR optimizer for the k2 language (folding, propagation, DCE, CFG-simplify, inlining, check-elim)."
+
+[lib]
+name = "k2_opt"
+path = "src/lib.rs"
+
+[dependencies]
+k2-mir = { path = "../k2-mir" }
+k2-types = { path = "../k2-types" }
+k2-syntax = { path = "../k2-syntax" }
+
+[dev-dependencies]
+k2-parse = { path = "../k2-parse" }
+k2-resolve = { path = "../k2-resolve" }
+k2-vm = { path = "../k2-vm" }

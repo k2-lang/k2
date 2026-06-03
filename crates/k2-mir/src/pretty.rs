@@ -254,10 +254,13 @@ fn fmt_rvalue(arena: &TypeArena, rv: &Rvalue) -> String {
                 arena.fmt(*ty)
             )
         }
-        Rvalue::MakeSlice { ptr, len, .. } => {
+        Rvalue::MakeSlice {
+            ptr, offset, len, ..
+        } => {
             format!(
-                "make_slice {{ ptr: {}, len: {} }}",
+                "make_slice {{ ptr: {}, offset: {}, len: {} }}",
                 fmt_operand(ptr),
+                fmt_operand(offset),
                 fmt_operand(len)
             )
         }

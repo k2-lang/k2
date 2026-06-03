@@ -1,0 +1,16 @@
+// bench_fib_rec.k2 — recursive Fibonacci.
+//
+// A call-heavy kernel: exercises the inliner's recursion budget (the recursive
+// call must survive, not unroll into oblivion) and the const-fold/copy-prop that
+// runs inside the still-recursive body. Prints one deterministic line so the
+// differential harness can also use it.
+
+fn fib(n: u32) u32 {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try out.print("fib(24) = {d}\n", .{fib(24)});
+}

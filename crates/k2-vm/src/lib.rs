@@ -127,6 +127,24 @@ pub fn run_captured(prog: &MirProgram, args: RunArgs) -> (RunOutcome, i32, Vec<u
 /// The shared core: builds a VM, runs `main`, and maps the [`Halt`] to an outcome
 /// + exit code. Returns the captured stdout/stderr buffers.
 fn run_inner(prog: &MirProgram, _args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Vec<u8>) {
+    let (outcome, code, out, err, _count) = run_inner_metered(prog);
+    (outcome, code, out, err)
+}
+
+/// Like [`run_captured`], but also returns the number of VM instructions
+/// executed — the deterministic, reproducible metric the benchmark harness uses
+/// to compare Debug vs ReleaseFast. The VM is single-threaded and its dispatch is
+/// data-deterministic, so this count is identical across runs of the same MIR.
+///
+/// The existing `run_captured`/`run_program` signatures are intentionally left
+/// unchanged so no caller breaks; this is an additive entry point.
+pub fn run_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64) {
+    run_inner_metered(prog)
+}
+
+/// The metered shared core: identical to [`run_inner`] but also reports the
+/// executed-instruction count.
+fn run_inner_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64) {
     let mut vm = Vm::new(prog);
     let halt = vm.run_main();
     let (outcome, code) = match halt {
@@ -148,7 +166,8 @@ fn run_inner(prog: &MirProgram, _args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Ve
             }
         }
     };
-    (outcome, code, vm.stdout, vm.stderr)
+    let count = vm.instr_count();
+    (outcome, code, vm.stdout, vm.stderr, count)
 }
 
 /// Maps an `i32` exit code to a process [`ExitCode`], clamping to a `u8`.

@@ -1,0 +1,23 @@
+// bench_fib_iter.k2 — iterative Fibonacci.
+//
+// A tight integer loop with a rolling pair of accumulators: exercises copy
+// propagation and dead-store elimination in the loop body and CFG simplification
+// of the loop scaffold.
+
+fn fibIter(n: u32) u64 {
+    var a: u64 = 0;
+    var b: u64 = 1;
+    var i: u32 = 0;
+    while (i < n) {
+        const t = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try out.print("fibIter(90) = {d}\n", .{fibIter(90)});
+}

@@ -591,8 +591,15 @@ impl Rvalue {
                 lhs.collect_locals(out);
                 rhs.collect_locals(out);
             }
-            Rvalue::MakeSlice { ptr, len, .. } => {
+            Rvalue::MakeSlice {
+                ptr, offset, len, ..
+            } => {
+                // All three operands must be walked so `MirProgram::verify` (which
+                // feeds off `referenced_locals`) catches an undefined/dangling
+                // local in ANY of them — mirroring the dce/inline operand walkers,
+                // which already handle `offset`.
                 ptr.collect_locals(out);
+                offset.collect_locals(out);
                 len.collect_locals(out);
             }
             Rvalue::Aggregate { fields, .. } => {

@@ -46,7 +46,8 @@ use std::path::Path;
 
 use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
-use k2_mir::{dump_mir, lower_program, BuildMode, Severity as MirSeverity};
+use k2_mir::{dump_mir, lower_program, BuildMode, MirProgram, Severity as MirSeverity};
+use k2_opt::{optimize, OptLevel, OptStats};
 use k2_parse::{parse, to_sexpr, Severity};
 use k2_resolve::{
     dump_resolution, dump_scopes, resolve_file, resolve_module, FileLoader, LoadError,
@@ -54,7 +55,7 @@ use k2_resolve::{
 };
 use k2_syntax::{SourceFile, Span};
 use k2_types::{check_file, dump_signatures, dump_types, Severity as TypeSeverity};
-use k2_vm::{run_program, RunArgs};
+use k2_vm::{run_metered, run_program, RunArgs, RunOutcome};
 
 /// Program name used in diagnostics and the usage text.
 const PROG: &str = "k2c";
@@ -96,6 +97,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "check" => cmd_check(rest),
         "mir" => cmd_mir(rest),
         "run" => cmd_run(rest),
+        "bench" => cmd_bench(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -664,15 +666,60 @@ fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
 /// leak diagnostics are printed to stderr; the dump goes to stdout (unless
 /// `--quiet`, which prints only a one-line summary). Exits nonzero if any
 /// error-severity diagnostic (parse/resolve/type/lower/leak) was produced.
+/// Maps a build mode (plus an optional `--opt` override for Debug) to the
+/// optimizer level the driver should apply. ReleaseSafe optimizes but keeps
+/// non-redundant checks; ReleaseFast optimizes with checks already stripped at
+/// lowering; Debug is unoptimized unless `--opt` is passed (which, since Debug
+/// retains its checks, runs the *Safe* pipeline so those checks are preserved).
+fn opt_level_for(mode: BuildMode, opt_flag: bool) -> OptLevel {
+    match mode {
+        BuildMode::Debug => {
+            if opt_flag {
+                OptLevel::Safe
+            } else {
+                OptLevel::None
+            }
+        }
+        BuildMode::ReleaseSafe => OptLevel::Safe,
+        BuildMode::ReleaseFast => OptLevel::Fast,
+    }
+}
+
+/// Applies the optimizer to `prog` under `mode` (+ optional `--opt`), returning
+/// the stats. Verifies the result is still well-formed; a malformed post-opt MIR
+/// is an internal bug surfaced as an error rather than executed.
+fn run_optimizer(
+    prog: &mut MirProgram,
+    mode: BuildMode,
+    opt_flag: bool,
+) -> Result<OptStats, String> {
+    let level = opt_level_for(mode, opt_flag);
+    let stats = optimize(prog, level);
+    let problems = prog.verify();
+    if !problems.is_empty() {
+        let mut msg = String::from("optimizer produced malformed MIR:");
+        for p in &problems {
+            msg.push_str("\n  ");
+            msg.push_str(&p.message);
+        }
+        return Err(msg);
+    }
+    Ok(stats)
+}
+
 fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
     let mut path: Option<&str> = None;
     let mut quiet = false;
     let mut mode = BuildMode::Debug;
+    let mut opt_flag = false;
+    let mut opt_report = false;
     for arg in args {
         match arg.as_str() {
             "--release-fast" => mode = BuildMode::ReleaseFast,
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
+            "--opt" => opt_flag = true,
+            "--opt-report" => opt_report = true,
             "--quiet" => quiet = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown `mir` flag `{other}`"));
@@ -745,7 +792,7 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
     }
 
     // Lower to MIR.
-    let prog = match lower_program(&pres.file, &resolved, typed, mode) {
+    let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
         Ok(p) => p,
         Err(diags) => {
             let stderr = io::stderr();
@@ -782,6 +829,15 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
     }
     drop(err);
 
+    // Apply the optimizer once the front-end is clean. Debug is unoptimized
+    // unless `--opt` is passed; ReleaseSafe/ReleaseFast always optimize.
+    if error_count == 0 {
+        let stats = run_optimizer(&mut prog, mode, opt_flag)?;
+        if opt_report {
+            let _ = writeln!(io::stderr(), "# opt: {stats:?}");
+        }
+    }
+
     if error_count == 0 && !quiet {
         print!("{}", dump_mir(&prog));
     }
@@ -816,6 +872,8 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut path: Option<&str> = None;
     let mut mode = BuildMode::Debug;
+    let mut opt_flag = false;
+    let mut opt_report = false;
     // Arguments after the path are reserved for the program's own argv.
     let mut forwarded: Vec<String> = Vec::new();
     let mut seen_path = false;
@@ -828,6 +886,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             "--release-fast" => mode = BuildMode::ReleaseFast,
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
+            "--opt" => opt_flag = true,
+            "--opt-report" => opt_report = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown `run` flag `{other}`"));
             }
@@ -897,7 +957,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
 
     // Lower to MIR under the chosen build mode.
-    let prog = match lower_program(&pres.file, &resolved, typed, mode) {
+    let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
         Ok(p) => p,
         Err(diags) => {
             let stderr = io::stderr();
@@ -942,6 +1002,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::FAILURE);
     }
 
+    // Apply the optimizer: ReleaseSafe keeps non-redundant checks, ReleaseFast is
+    // pure speed, Debug is unoptimized unless `--opt`. The optimizer must not
+    // change observable behavior — that property is guarded by the differential
+    // test corpus in `k2-opt`.
+    let stats = run_optimizer(&mut prog, mode, opt_flag)?;
+    if opt_report {
+        let _ = writeln!(io::stderr(), "# opt: {stats:?}");
+    }
+
     // Verify well-formedness before execution (debug guard); a malformed MIR is
     // an internal bug, reported rather than executed.
     let problems = prog.verify();
@@ -962,6 +1031,202 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             argv: forwarded,
         },
     ))
+}
+
+/// The result of one benchmark: its executed-instruction counts under each mode.
+struct BenchResult {
+    name: String,
+    debug: u64,
+    fast: u64,
+    safe: u64,
+}
+
+/// The `bench` subcommand: a reproducible benchmark harness over the committed
+/// `bench/*.k2` programs. For each program it lowers under Debug, ReleaseFast,
+/// and ReleaseSafe (optimizing the release modes), runs each on the VM with the
+/// deterministic executed-instruction counter, asserts the optimized output is
+/// byte-identical to the unoptimized Debug output (a divergence is a miscompile
+/// and aborts the bench), and reports the Debug-vs-ReleaseFast reduction.
+///
+/// Usage:
+///   k2c bench                  Run the committed benchmark suite and print a table.
+///   k2c bench <file.k2> ...    Benchmark the given programs instead.
+///   k2c bench --emit-baseline  Print a `name debug=.. fast=.. safe=..` line per bench.
+fn cmd_bench(args: &[String]) -> Result<ExitCode, String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut emit_baseline = false;
+    for arg in args {
+        match arg.as_str() {
+            "--emit-baseline" => emit_baseline = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown `bench` flag `{other}`"));
+            }
+            other => files.push(other.to_string()),
+        }
+    }
+    // Default corpus: the committed bench/*.k2 next to this crate.
+    if files.is_empty() {
+        files = default_bench_files();
+        if files.is_empty() {
+            return Err("no benchmark programs found (looked in crates/k2c/bench)".to_string());
+        }
+    }
+
+    let mut results: Vec<BenchResult> = Vec::new();
+    for file in &files {
+        let result = bench_one(file)?;
+        results.push(result);
+    }
+
+    if emit_baseline {
+        for r in &results {
+            println!(
+                "{} debug={} fast={} safe={}",
+                r.name, r.debug, r.fast, r.safe
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // A readable table plus a total row.
+    println!(
+        "{:<22} {:>14} {:>14} {:>14} {:>10}",
+        "benchmark", "debug", "rel-fast", "rel-safe", "speedup"
+    );
+    println!("{}", "-".repeat(78));
+    let mut tot_debug = 0u64;
+    let mut tot_fast = 0u64;
+    for r in &results {
+        let speedup = if r.fast == 0 {
+            0.0
+        } else {
+            r.debug as f64 / r.fast as f64
+        };
+        println!(
+            "{:<22} {:>14} {:>14} {:>14} {:>9.2}x",
+            r.name, r.debug, r.fast, r.safe, speedup
+        );
+        tot_debug += r.debug;
+        tot_fast += r.fast;
+    }
+    println!("{}", "-".repeat(78));
+    let tot_speedup = if tot_fast == 0 {
+        0.0
+    } else {
+        tot_debug as f64 / tot_fast as f64
+    };
+    let reduction = if tot_debug == 0 {
+        0.0
+    } else {
+        100.0 * (tot_debug - tot_fast) as f64 / tot_debug as f64
+    };
+    println!(
+        "{:<22} {:>14} {:>14} {:>14} {:>9.2}x",
+        "TOTAL", tot_debug, tot_fast, "", tot_speedup
+    );
+    println!(
+        "# ReleaseFast executed {:.1}% fewer instructions than Debug across the suite.",
+        reduction
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Benchmarks a single program: lowers + runs it under all three modes, asserts
+/// the optimized output matches the unoptimized Debug output, and returns the
+/// instruction counts. A behavioral divergence is a miscompile and is returned as
+/// an error (aborting the bench).
+fn bench_one(file: &str) -> Result<BenchResult, String> {
+    let source = fs::read_to_string(file).map_err(|e| format!("reading `{file}`: {e}"))?;
+    let name = bench_name(file);
+
+    let (out_d, code_d, count_d) = lower_run_metered(&source, file, BuildMode::Debug, false)?;
+    let (out_f, code_f, count_f) = lower_run_metered(&source, file, BuildMode::ReleaseFast, false)?;
+    let (out_s, code_s, count_s) = lower_run_metered(&source, file, BuildMode::ReleaseSafe, false)?;
+
+    // The acceptance invariant: the optimized release modes must produce
+    // byte-identical stdout and the same exit code as unoptimized Debug.
+    if out_f != out_d || code_f != code_d {
+        return Err(format!(
+            "MISCOMPILE in {name}: ReleaseFast output/exit differs from Debug\n  \
+             debug=({code_d}) {out_d:?}\n  fast =({code_f}) {out_f:?}"
+        ));
+    }
+    if out_s != out_d || code_s != code_d {
+        return Err(format!(
+            "MISCOMPILE in {name}: ReleaseSafe output/exit differs from Debug\n  \
+             debug=({code_d}) {out_d:?}\n  safe =({code_s}) {out_s:?}"
+        ));
+    }
+
+    Ok(BenchResult {
+        name,
+        debug: count_d,
+        fast: count_f,
+        safe: count_s,
+    })
+}
+
+/// Lowers `source` under `mode`, optimizes per the mode (Debug optionally via
+/// `opt_flag`), runs it metered, and returns `(stdout, exit_code, instr_count)`.
+fn lower_run_metered(
+    source: &str,
+    label: &str,
+    mode: BuildMode,
+    opt_flag: bool,
+) -> Result<(String, i32, u64), String> {
+    let pres = parse(source);
+    if !pres.is_ok() {
+        return Err(format!("{label}: parse errors"));
+    }
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        return Err(format!("{label}: resolution errors"));
+    }
+    let typed = check_file(&pres.file, &resolved);
+    if !typed.is_ok() {
+        return Err(format!("{label}: type errors"));
+    }
+    let mut prog = lower_program(&pres.file, &resolved, typed, mode)
+        .map_err(|_| format!("{label}: lowering failed"))?;
+    if !prog.is_ok() {
+        return Err(format!("{label}: lowering had errors"));
+    }
+    run_optimizer(&mut prog, mode, opt_flag)?;
+    let (outcome, code, out, _err, count) = run_metered(&prog);
+    // Treat a clean error/panic as part of the observable behavior; the bench
+    // programs are written to succeed, but the comparison still holds either way.
+    let _ = matches!(outcome, RunOutcome::Ok);
+    Ok((String::from_utf8_lossy(&out).into_owned(), code, count))
+}
+
+/// The display name of a benchmark file (its file stem).
+fn bench_name(file: &str) -> String {
+    Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file)
+        .to_string()
+}
+
+/// Locates the committed benchmark programs. Tries the path relative to the crate
+/// source (so `cargo run` works from the workspace root) and a couple of common
+/// fallbacks.
+fn default_bench_files() -> Vec<String> {
+    // The directory next to this source file, resolved at compile time.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/bench");
+    let mut files: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("k2") {
+                if let Some(s) = p.to_str() {
+                    files.push(s.to_string());
+                }
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 /// The filesystem [`FileLoader`] used by `resolve --modules`: it reads a `.k2`
@@ -1086,9 +1351,10 @@ fn print_usage() {
          \x20   check <file.k2>      Type-check a file; print per-decl signatures (or diagnostics).\n\
          \x20   check --uses <f>     Also dump the per-occurrence type table.\n\
          \x20   mir <file.k2>        Lower to MIR (Debug mode) and print the dump.\n\
-         \x20   mir --release-fast <f>  Lower with safety checks stripped.\n\
+         \x20   mir --release-fast <f>  Lower + optimize with safety checks stripped.\n\
          \x20   run <file.k2>        Compile to bytecode and execute `main` (Debug mode).\n\
-         \x20   run --release-fast <f>  Execute with safety checks stripped.\n\
+         \x20   run --release-fast <f>  Optimize + execute with safety checks stripped.\n\
+         \x20   bench [file.k2 ...]  Benchmark Debug vs ReleaseFast executed VM instructions.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\
@@ -1109,13 +1375,20 @@ fn print_usage() {
          \n\
          MIR FLAGS:\n\
          \x20   --debug              Lower in Debug mode with safety checks (the default).\n\
-         \x20   --release-safe       Lower in ReleaseSafe mode (safety checks kept).\n\
-         \x20   --release-fast       Lower in ReleaseFast mode (safety checks stripped).\n\
+         \x20   --release-safe       Lower + optimize in ReleaseSafe mode (safety checks kept).\n\
+         \x20   --release-fast       Lower + optimize in ReleaseFast mode (safety checks stripped).\n\
+         \x20   --opt                Optimize even in Debug mode (keeps checks; for testing).\n\
+         \x20   --opt-report         Print the optimizer's pass statistics to stderr.\n\
          \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n\
          \n\
          RUN FLAGS:\n\
          \x20   --debug              Execute with safety checks (the default).\n\
-         \x20   --release-safe       Execute in ReleaseSafe mode (safety checks kept).\n\
-         \x20   --release-fast       Execute in ReleaseFast mode (safety checks stripped).\n"
+         \x20   --release-safe       Optimize + execute in ReleaseSafe mode (safety checks kept).\n\
+         \x20   --release-fast       Optimize + execute in ReleaseFast mode (safety checks stripped).\n\
+         \x20   --opt                Optimize even in Debug mode (keeps checks; for testing).\n\
+         \x20   --opt-report         Print the optimizer's pass statistics to stderr.\n\
+         \n\
+         BENCH FLAGS:\n\
+         \x20   --emit-baseline      Print a machine-readable instruction-count baseline.\n"
     );
 }

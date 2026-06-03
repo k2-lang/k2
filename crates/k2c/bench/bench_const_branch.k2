@@ -1,0 +1,25 @@
+// bench_const_branch.k2 — a comptime-known configuration branch.
+//
+// A loop whose body branches on a compile-time-constant flag. Constant folding
+// proves the branch, jump-threading collapses it, and dead-block removal drops
+// the unreachable arm — turning a per-iteration branch into straight-line code.
+
+fn step(x: u64) u64 {
+    const use_fast: bool = true;
+    if (use_fast) {
+        return x + 3;
+    } else {
+        return x * 2 + 1;
+    }
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var acc: u64 = 0;
+    var i: u64 = 0;
+    while (i < 2000) {
+        acc = step(acc);
+        i = i + 1;
+    }
+    try out.print("const_branch = {d}\n", .{acc});
+}

@@ -1,0 +1,24 @@
+// bench_struct_kernel.k2 — a struct-heavy arithmetic kernel.
+//
+// Builds a Point each iteration and accumulates `x*y + x - y`, exercising
+// aggregate construction, field reads, copy propagation, and dead-store
+// elimination of the per-iteration temporaries. The helper `kernel` is a small
+// monomorphic call the inliner devirtualizes.
+
+const Point = struct { x: i64, y: i64 };
+
+fn kernel(p: Point) i64 {
+    return p.x * p.y + p.x - p.y;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while (i < 1000) {
+        const p = Point{ .x = i, .y = i + 1 };
+        acc = acc + kernel(p);
+        i = i + 1;
+    }
+    try out.print("struct_kernel = {d}\n", .{acc});
+}

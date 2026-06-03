@@ -46,9 +46,53 @@ is being designed in the open and nothing is stable yet.
   - `k2c` — the compiler driver, with a working `tokenize` / `lex` subcommand
     that streams tokens from a file or standard input, plus the `run`
     subcommand that compiles and executes a program (Debug or `--release-fast`).
+  - `k2-opt` — the v0.9 MIR optimizer: a pass pipeline run to a fixpoint
+    (constant folding, constant/copy propagation, dead-code/dead-store
+    elimination, CFG simplification, small-monomorphic-call inlining /
+    devirtualization with size + recursion budgets, and — in ReleaseSafe — sound
+    removal of provably-redundant realized safety checks). The optimizer is
+    sound by construction: it only substitutes provably-equal values, deletes
+    provably-dead effect-free instructions (demoting an impure dead-result store
+    to an `Eval` so its effect and any trap are preserved), rewrites the CFG
+    behavior-preservingly, or removes a check whose success edge is provably
+    always taken. `MirProgram::verify` holds after every pass. Build modes are
+    wired end to end (`run`/`mir --release-safe`/`--release-fast` optimize;
+    Debug stays unoptimized unless `--opt`).
+  - `k2c bench` — a reproducible benchmark harness that measures *executed VM
+    instructions* (deterministic, not wall-clock) under Debug vs ReleaseFast
+    over a committed set of bench programs, asserts the optimized output is
+    byte-identical to the unoptimized output, and reports the reduction
+    (~50% fewer instructions / ~2x across the suite). A differential corpus
+    test asserts opt == unopt behavior in every mode (a single divergence is a
+    blocker) and Debug == ReleaseSafe strictly.
 
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security
   policies, dual MIT / Apache-2.0 licensing, and a development roadmap.
+
+### Fixed
+
+- **`k2-opt` inlining compile-time blow-up on cyclic call graphs.** Inlining
+  accounting is now program-global: the recursion / global / per-caller inline
+  budgets are threaded across every outer pass-manager iteration (previously the
+  per-caller depth map was reborn each outer pass, so a recursive callee could be
+  unrolled `RECURSION_BUDGET × OUTER_BUDGET` times and each copy reintroduced call
+  sites the next pass unrolled again). The per-caller scan now resumes from the
+  last inlined block and densifies once per caller instead of re-scanning the
+  whole growing body and running `gc_unreachable_blocks` after every single
+  inline, and the size gate measures the callee's *current* body (which may have
+  grown on a cycle) rather than a stale summary. An 8-function mutual-recursion
+  cycle that previously took ~10 s and produced ~5790 MIR blocks now compiles in
+  under 0.1 s to ~129 blocks, byte-identical output. Inlining on the normal
+  benchmarks is unaffected except a small, bounded reduction in recursive `fib`
+  unrolling (still ~50% fewer executed instructions than Debug).
+- **`MirProgram::verify` now checks all three `MakeSlice` operands.**
+  `Rvalue::collect_locals` walked only `ptr`/`len`, so a dangling `offset` local
+  in a `make_slice` slipped past the "no undefined local" invariant; it now walks
+  `offset` too (the MIR pretty-printer also renders it).
+- **Constant folding now masks comptime results like the VM.** A folded
+  `Binary`/`Unary` whose result type is an unsized `comptime_int` stored into a
+  sized local is now masked to the destination's width via the VM's `result_repr`
+  fallback, matching the value the VM would compute at runtime exactly.
 
 [Unreleased]: https://github.com/k2-lang/k2/commits/main

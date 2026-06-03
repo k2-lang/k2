@@ -1,0 +1,19 @@
+# k2 v0.9 benchmark baseline — executed VM instruction counts.
+#
+# One line per committed bench program: the deterministic, reproducible count of
+# VM instructions executed (the VM decrements its budget exactly once per
+# dispatched instruction; see k2-vm). Columns:
+#
+#   <name> debug=<n> fast=<n> safe=<n>
+#
+# debug = unoptimized + checks on; fast = ReleaseFast (optimized, checks
+# stripped at lowering); safe = ReleaseSafe (optimized, non-redundant checks
+# kept). Regenerate with `k2c bench --emit-baseline`; the bench_baseline.rs
+# integration test asserts fast <= debug everywhere and a measurable reduction on
+# the loop/fib/slice/struct/branch benches.
+bench_const_branch debug=44014 fast=18014 safe=34014
+bench_fib_iter debug=1459 fast=735 safe=1365
+bench_fib_rec debug=2250736 fast=1125310 safe=1950638
+bench_loop_sum debug=18018 fast=7014 safe=17014
+bench_slice_sum debug=61524 fast=40024 safe=55524
+bench_struct_kernel debug=45014 fast=18014 safe=42014

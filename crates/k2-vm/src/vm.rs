@@ -107,6 +107,13 @@ pub struct Vm<'p> {
     pub stderr: Vec<u8>,
     /// Steps remaining before the budget is exhausted.
     budget: u64,
+    /// The number of instructions executed so far. This is the deterministic,
+    /// reproducible "executed VM instructions" metric the benchmark harness
+    /// reports: it is incremented exactly once per dispatched instruction,
+    /// independent of wall-clock, so it is identical across runs of the same
+    /// program. (`budget` counts *down* and also factors in the wall-clock guard,
+    /// so it is not a usable forward counter on its own.)
+    instr_count: u64,
     /// When the run started, for the wall-clock termination deadline.
     started: std::time::Instant,
 }
@@ -123,8 +130,15 @@ impl<'p> Vm<'p> {
             stdout: Vec::new(),
             stderr: Vec::new(),
             budget: STEP_BUDGET,
+            instr_count: 0,
             started: std::time::Instant::now(),
         }
+    }
+
+    /// The number of instructions executed so far — the deterministic metric the
+    /// benchmark harness reports (Debug vs ReleaseFast).
+    pub fn instr_count(&self) -> u64 {
+        self.instr_count
     }
 
     /// Runs `main(sys)` to completion. On success returns `Ok(())`; otherwise a
@@ -215,6 +229,7 @@ impl<'p> Vm<'p> {
                 }));
             }
             self.budget -= 1;
+            self.instr_count += 1;
 
             let depth = self.frames.len();
             if depth == 0 {
