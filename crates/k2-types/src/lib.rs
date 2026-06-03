@@ -47,13 +47,17 @@ mod arena;
 mod builtins;
 mod check;
 mod coerce;
+mod comptime;
 mod diag;
 mod dump;
 mod eval;
 mod exhaust;
 mod expr;
+mod generic;
 mod member;
+mod reflect;
 mod ty;
+mod value;
 
 use std::collections::HashMap;
 

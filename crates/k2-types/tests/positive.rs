@@ -358,11 +358,19 @@ fn pointer_equality_same_pointee_is_clean() {
 // ---- Deferred-introduction positives -------------------------------------
 
 #[test]
-fn generic_call_is_deferred() {
+fn generic_call_instantiates_to_concrete_type() {
+    // v0.6: a generic *function* call `gen(i32)` with `ret == T` now instantiates
+    // to the concrete return type `i32`, replacing the v0.5 Deferred result.
     let src = "fn gen(comptime T: type) T { return undefined; }\nfn f() void { const x = gen(i32); _ = x; }\n";
     let t = assert_clean(src);
     let ty = type_at(&t, src, "gen(i32)");
-    assert!(matches!(t.arena.get(ty), Type::Deferred));
+    assert!(matches!(
+        t.arena.get(ty),
+        Type::Int {
+            signed: true,
+            bits: k2_types::IntBits::Fixed(32)
+        }
+    ));
 }
 
 #[test]

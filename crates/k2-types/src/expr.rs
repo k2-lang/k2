@@ -210,12 +210,13 @@ impl crate::check::Checker<'_> {
                 else_branch.as_deref(),
             ),
             Expr::For {
+                is_inline,
                 operands,
                 captures,
                 body,
                 else_branch,
                 ..
-            } => self.synth_for(operands, captures, body, else_branch.as_deref()),
+            } => self.synth_for(*is_inline, operands, captures, body, else_branch.as_deref()),
             Expr::Switch {
                 scrutinee,
                 arms,
@@ -370,12 +371,11 @@ impl crate::check::Checker<'_> {
         match self.arena.get(ct).clone() {
             Type::Fn(id) => {
                 let sig = self.arena.fnsigs[id.0 as usize].clone();
-                // A generic instantiation (comptime/anytype param) defers.
+                // A generic instantiation (comptime/anytype param): try to
+                // monomorphize it into a concrete result, falling back to
+                // Deferred when its comptime arguments are not comptime-known.
                 if sig.has_comptime_param || sig.has_anytype_param {
-                    for a in args {
-                        self.synth(a);
-                    }
-                    return self.arena.t_deferred();
+                    return self.instantiate_call(callee, &sig, args, span);
                 }
                 // Method-call sugar: `value.method(args)` passes the receiver as
                 // the implicit first parameter, so the explicit args check
@@ -403,12 +403,32 @@ impl crate::check::Checker<'_> {
     /// declaration on a concrete aggregate — so the call uses method-call sugar
     /// (the receiver is the implicit first argument). Resolved via the member
     /// table the preceding `synth(callee)` populated.
-    fn is_method_call(&self, callee: &Expr) -> bool {
-        if let Expr::Field { span, .. } = callee {
-            return matches!(
+    ///
+    /// An *associated* call `Type.assocFn(...)` (the base denotes a `type`, e.g.
+    /// `List(u32).init(alloc)`) is NOT method-call sugar: there is no implicit
+    /// receiver, so all explicit arguments check against the full parameter list.
+    fn is_method_call(&mut self, callee: &Expr) -> bool {
+        if let Expr::Field { base, span, .. } = callee {
+            let is_decl = matches!(
                 self.members.get(&(span.start, span.end)),
                 Some(crate::ty::MemberRes::Decl(_))
             );
+            if !is_decl {
+                return false;
+            }
+            // A base whose value is a `type` is an associated access, not a
+            // receiver value: either a type-returning generic call
+            // (`List(u32).init`) recorded in `type_valued_spans`, or a bare
+            // type-name namespace (`Point.make`) whose base synths to `type`.
+            let bspan = base.span();
+            if self
+                .type_valued_spans
+                .contains_key(&(bspan.start, bspan.end))
+            {
+                return false;
+            }
+            let bt = self.synth(base);
+            return !matches!(self.arena.get(bt), Type::TypeType);
         }
         false
     }
@@ -534,6 +554,18 @@ impl crate::check::Checker<'_> {
             // `void < void`, `struct < struct`, `[]u8 < []u8`, enum ordering, etc.
             // are all rejected.
             BinOp::Eq | BinOp::Ne => {
+                // Type-value equality (spec §07.4.2 / §08.1: `T == U`). When BOTH
+                // operands denote a `type` — a literal `i32`, a type param `T`, a
+                // type-returning generic call `List(u32)`, a `@Type(...)`, or a
+                // type-denoting `const` — the comparison is type *identity* and
+                // yields `bool`. The comptime evaluator folds the actual result;
+                // here we only avoid the spurious "cannot compare" gate that fired
+                // because a call-result/denoting-const synths to its concrete
+                // denoted type rather than to `type`. Mixing a real value with a
+                // type stays rejected (only one side is type-denoting).
+                if self.is_type_denoting(lhs, lt) && self.is_type_denoting(rhs, rt) {
+                    return self.arena.t_bool();
+                }
                 if self.equatable(lt, rt) {
                     self.arena.t_bool()
                 } else {
@@ -589,9 +621,45 @@ impl crate::check::Checker<'_> {
         }
     }
 
+    /// `true` if `e` (already synth'd to `t`) *denotes a type* for the purpose of
+    /// `==`/`!=`. This is broader than "synths to `TypeType`": a type-returning
+    /// generic call or a `@Type(...)` synths to its concrete denoted type
+    /// (`List(u32)` -> the struct id, `@Type(@typeInfo(u32))` -> `u32`), yet the
+    /// spec treats it as a `type` value. We recognize three witnesses, matching
+    /// the maps `is_method_call`/`synth_field` already consult:
+    ///   * the synth type is literally `type` (a type literal `i32` / param `T`),
+    ///   * the expression's span is recorded in `type_valued_spans` (a
+    ///     type-returning generic call result), or
+    ///   * it is an identifier bound to a type-denoting `const` (`item_types`).
+    fn is_type_denoting(&self, e: &Expr, t: TypeId) -> bool {
+        if matches!(self.arena.get(t), Type::TypeType) {
+            return true;
+        }
+        let s = e.span();
+        if self.type_valued_spans.contains_key(&(s.start, s.end)) {
+            return true;
+        }
+        if let Expr::Ident { span, .. } = e {
+            if let Some(k2_resolve::Resolution::Def(id)) = self.resolution_at(*span) {
+                if let Some(&denoted) = self.item_types.get(&id) {
+                    return !self.arena.is_bottom(denoted);
+                }
+            }
+        }
+        false
+    }
+
     /// Arithmetic result type: both operands must be the same numeric type after
     /// comptime-int/float unification.
     fn arith_result(&mut self, op: BinOp, lt: TypeId, rt: TypeId, span: Span) -> TypeId {
+        if matches!(self.arena.get(lt), Type::Bool) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!(
+                "DEBUG arith bt:
+{}",
+                bt
+            );
+        }
         if self.numeric(lt) && self.numeric(rt) {
             if let Some(common) = self.try_unify_numeric(lt, rt) {
                 return common;
@@ -979,11 +1047,15 @@ impl crate::check::Checker<'_> {
     ) -> TypeId {
         let payload = self.check_condition(cond, capture);
         self.bind_capture(capture, payload);
+        // Both arms are statically conditional: a statement-position
+        // `@compileError` inside them must NOT fire eagerly (the comptime engine
+        // only executes the live branch).
+        self.cond_depth += 1;
         let then_ty = match expected {
             Some(ex) => self.check(then_branch, ex),
             None => self.synth(then_branch),
         };
-        if let Some(eb) = else_branch {
+        let result = if let Some(eb) = else_branch {
             // The else capture (error path) binds to the error set.
             if else_capture.is_some() {
                 let err_ty = self.if_else_err_type(cond);
@@ -997,7 +1069,9 @@ impl crate::check::Checker<'_> {
         } else {
             // Statement `if` with no else: result is void.
             self.arena.t_void()
-        }
+        };
+        self.cond_depth -= 1;
+        result
     }
 
     /// Types the condition of an `if`/`while`, returning the captured payload
@@ -1056,7 +1130,10 @@ impl crate::check::Checker<'_> {
         if let Some(cont) = cont {
             self.check_stmt(cont);
         }
+        // The loop body is conditional (it may execute zero times).
+        self.cond_depth += 1;
         self.synth(body);
+        self.cond_depth -= 1;
         if else_capture.is_some() {
             let err_ty = self.if_else_err_type(cond);
             self.bind_capture(else_capture, err_ty);
@@ -1067,20 +1144,82 @@ impl crate::check::Checker<'_> {
         self.arena.t_void()
     }
 
-    /// A `for` expression/statement.
+    /// A `for` / `inline for` expression/statement.
+    ///
+    /// For an `inline for` whose operand is a comptime-known sequence (e.g.
+    /// `@typeInfo(T).Struct.fields`), the loop var binds to each element as a
+    /// *comptime value*, so `field.name` / `field.type` and `@field(value,
+    /// field.name)` in the body resolve concretely. The body's type is
+    /// iteration-invariant, so checking it once with the first element bound is
+    /// sufficient for the type layer; if the sequence is empty or not
+    /// comptime-known, it degrades to the ordinary runtime-`for` element typing.
     fn synth_for(
         &mut self,
+        is_inline: bool,
         operands: &[ForOperand],
         captures: &[k2_syntax::CaptureName],
         body: &Expr,
         else_branch: Option<&Expr>,
     ) -> TypeId {
-        self.bind_for_captures(operands, captures);
-        self.synth(body);
+        let mut unrolled = false;
+        if is_inline {
+            unrolled = self.unroll_inline_for(operands, captures, body);
+        }
+        if !unrolled {
+            self.bind_for_captures(operands, captures);
+            // A runtime `for` body is conditional (the sequence may be empty).
+            self.cond_depth += 1;
+            self.synth(body);
+            self.cond_depth -= 1;
+        }
         if let Some(eb) = else_branch {
             self.synth(eb);
         }
         self.arena.t_void()
+    }
+
+    /// Attempts to bind an `inline for`'s capture(s) to the comptime values of
+    /// the operand sequence and check the body once per element. Returns `true`
+    /// if it could unroll (the operands were comptime-known), `false` to fall
+    /// back to runtime-`for` typing.
+    fn unroll_inline_for(
+        &mut self,
+        operands: &[ForOperand],
+        captures: &[k2_syntax::CaptureName],
+        body: &Expr,
+    ) -> bool {
+        // Only the single-value-operand form is unrolled (the reflection shape).
+        let [ForOperand::Value(seq_expr)] = operands else {
+            return false;
+        };
+        let Some(crate::value::Value::Array { elems, .. }) = self.comptime_eval_value(seq_expr)
+        else {
+            return false;
+        };
+        let Some(cap) = captures.first() else {
+            return false;
+        };
+        if elems.is_empty() {
+            // Nothing to bind a concrete element type to; still check the body
+            // with the element's *type* via the runtime path so it type-checks.
+            return false;
+        }
+        // Bind the capture to each element value and check the body once per
+        // iteration, so a `@field(value, field.name)` whose name differs per
+        // field is recorded with the right per-field type.
+        if let Some(def) = self.def_of(cap.span) {
+            for elem in &elems {
+                self.comptime_const_values.insert(def, elem.clone());
+                // Also bind a binding_type so a plain `field` reference (not
+                // routed through the engine) still types.
+                let ety = self.value_type(elem);
+                self.binding_types.insert(def, ety);
+                self.synth(body);
+            }
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Joins two branch result types (see [`Self::join`]).

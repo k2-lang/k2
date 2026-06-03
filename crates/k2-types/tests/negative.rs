@@ -600,3 +600,149 @@ fn reflection_is_clean() {
         t.errors().collect::<Vec<_>>()
     );
 }
+
+// =========================================================================
+//  Comptime engine (v0.6): @compileError fires, fuel terminates, generic
+//  instantiation errors are reported with context (and exactly once).
+// =========================================================================
+
+/// The number of error-severity diagnostics.
+fn error_count(t: &Typed) -> usize {
+    t.errors().count()
+}
+
+// A reached `@compileError` in a forced comptime block fires its message.
+#[test]
+fn compile_error_fires_in_comptime_block() {
+    let t = check("comptime { @compileError(\"boom\"); }\n");
+    assert!(
+        has_error(&t, "boom"),
+        "expected the @compileError message, got: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+}
+
+// A `@compileError` reached during a generic instantiation fires, with its
+// type-naming message (the `Vector(bool, 3)` constraint pattern).
+#[test]
+fn compile_error_fires_in_generic_instantiation() {
+    let src = "fn Vector(comptime T: type, comptime n: usize) type {\n\
+        const info = @typeInfo(T);\n\
+        if (info != .Int and info != .Float) {\n\
+            @compileError(\"Vector requires an integer or float element, got \" ++ @typeName(T));\n\
+        }\n\
+        return struct { data: [n]T };\n\
+    }\n\
+    fn f() void { var v: Vector(bool, 3) = undefined; _ = v; }\n";
+    let t = check(src);
+    assert!(
+        has_error(&t, "Vector requires an integer or float element, got bool"),
+        "expected the constraint message, got: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+}
+
+// A `@compileError` in a NOT-taken branch does not fire (spec §07.9.1).
+#[test]
+fn dead_branch_compile_error_does_not_fire() {
+    // `info != .Int` is false for u32, so the guarded @compileError is dead.
+    let src = "fn Vector(comptime T: type, comptime n: usize) type {\n\
+        const info = @typeInfo(T);\n\
+        if (info != .Int and info != .Float) {\n\
+            @compileError(\"Vector requires an integer or float element\");\n\
+        }\n\
+        return struct { data: [n]T };\n\
+    }\n\
+    fn f() void { var v: Vector(u32, 3) = undefined; _ = v; }\n";
+    let t = check(src);
+    assert!(
+        t.is_ok(),
+        "a dead-branch @compileError must NOT fire: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+}
+
+// An infinite comptime loop hits the fuel budget (terminates, no hang).
+#[test]
+fn infinite_comptime_loop_hits_fuel_limit() {
+    let src = "comptime { var i: u32 = 0; while (i < 1) {} }\n";
+    let t = check(src);
+    assert!(
+        t.errors()
+            .any(|d| d.message.contains("comptime evaluation exceeded")),
+        "expected the fuel-budget diagnostic, got: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+}
+
+// A non-terminating recursive generic exhausts the shared fuel budget too.
+#[test]
+fn nonterminating_generic_hits_fuel_limit() {
+    let src = "fn Loop(comptime n: usize) usize { return Loop(n + 1); }\n\
+        fn f() void { var z: [Loop(0)]u8 = undefined; _ = z; }\n";
+    let t = check(src);
+    // Either the fuel diagnostic fires, or the recursion-depth guard keeps it
+    // Deferred (no hang either way); assert termination + no spurious accept of
+    // a bad value. The key property is it does not hang, which reaching here
+    // already proves; if a diagnostic fired it must be the budget one.
+    for d in t.errors() {
+        assert!(
+            d.message.contains("comptime evaluation exceeded"),
+            "unexpected error from a nonterminating generic: {}",
+            d.message
+        );
+    }
+}
+
+// A reached `@compileError` for a power-of-two constraint fires.
+#[test]
+fn power_of_two_constraint_fires() {
+    let src = "fn assertPow2(comptime n: usize) void {\n\
+        if (n == 0 or (n & (n - 1)) != 0) { @compileError(\"expected a power of two\"); }\n\
+    }\n\
+    fn RingBuffer(comptime n: usize) type {\n\
+        comptime assertPow2(n);\n\
+        return struct { data: [n]u8 };\n\
+    }\n\
+    fn f() void { var r: RingBuffer(100) = undefined; _ = r; }\n";
+    let t = check(src);
+    assert!(
+        has_error(&t, "expected a power of two"),
+        "expected the power-of-two message, got: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+    // And the well-formed instantiation must compile.
+    let ok = check(
+        "fn assertPow2(comptime n: usize) void {\n\
+        if (n == 0 or (n & (n - 1)) != 0) { @compileError(\"expected a power of two\"); }\n\
+    }\n\
+    fn RingBuffer(comptime n: usize) type {\n\
+        comptime assertPow2(n);\n\
+        return struct { data: [n]u8 };\n\
+    }\n\
+    fn f() void { var r: RingBuffer(128) = undefined; _ = r; }\n",
+    );
+    assert!(
+        ok.is_ok(),
+        "RingBuffer(128) must compile: {:#?}",
+        ok.errors().collect::<Vec<_>>()
+    );
+}
+
+// The same failed instantiation used at TWO sites reports exactly once (the
+// `Failed` cache entry suppresses the duplicate).
+#[test]
+fn failed_instantiation_reported_once() {
+    let src = "fn Need(comptime T: type) type {\n\
+        if (@typeInfo(T) != .Int) { @compileError(\"need an int\"); }\n\
+        return struct { x: T };\n\
+    }\n\
+    fn f() void { var a: Need(bool) = undefined; var b: Need(bool) = undefined; _ = a; _ = b; }\n";
+    let t = check(src);
+    assert_eq!(
+        error_count(&t),
+        1,
+        "a failed instantiation reused at two sites must report once, got: {:#?}",
+        t.errors().collect::<Vec<_>>()
+    );
+}

@@ -84,19 +84,25 @@ impl crate::check::Checker<'_> {
             // ---- Type-via-builtin / call -------------------------------
             Expr::Builtin { name, args, span } => self.eval_type_builtin(name, args, *span),
             Expr::Call { .. } => {
-                // A type produced by a call (generic instantiation) is comptime;
-                // still synth the call to catch concrete errors in its args.
-                let _ = self.synth(e);
-                self.arena.t_deferred()
+                // A type produced by a call (generic instantiation): synth it
+                // (which now monomorphizes and may yield a concrete struct/type).
+                let t = self.synth(e);
+                if !self.arena.is_bottom(t) && !matches!(self.arena.get(t), Type::TypeType) {
+                    // The call already produced a concrete instantiation type.
+                    return t;
+                }
+                // Otherwise try the comptime engine for a `type`-valued result.
+                self.comptime_eval_type(e)
+                    .unwrap_or_else(|| self.arena.t_deferred())
             }
             Expr::Field { .. } => {
                 // `std.X` / `info.Struct.fields` as a type: synth the member; on a
                 // module/deferred base it is Deferred.
                 let t = self.synth(e);
-                // If the member synthed to `type`, we still cannot denote the
-                // concrete type without comptime; treat as Deferred.
                 if matches!(self.arena.get(t), Type::TypeType) {
-                    self.arena.t_deferred()
+                    // A type-valued member: try to resolve it concretely.
+                    self.comptime_eval_type(e)
+                        .unwrap_or_else(|| self.arena.t_deferred())
                 } else {
                     t
                 }
@@ -199,17 +205,39 @@ impl crate::check::Checker<'_> {
     }
 
     /// Evaluates an array length expression into an [`ArrayLen`].
+    ///
+    /// A comptime-known length is converted with a *checked* `u64::try_from`: a
+    /// value exceeding `u64::MAX` (e.g. `[(1 << 64) + 7]u8`) is reported as
+    /// "array length too large" and deferred, never silently truncated into a
+    /// different, smaller array size.
     fn eval_array_len(&mut self, len: &Expr) -> ArrayLen {
         match len {
             Expr::Ident { name, .. } if name == "_" => ArrayLen::Inferred,
             Expr::Int { text, base, .. } => match parse_int_literal(text, *base) {
-                Some(v) if v >= 0 => ArrayLen::Known(v as u64),
+                Some(v) if v >= 0 => self.array_len_from(v, len.span()),
                 _ => ArrayLen::Deferred,
             },
-            // A comptime-computed length (a call, a const, an expression).
+            // A comptime-computed length (a call, a const, an expression). Try
+            // the comptime engine; a known non-negative result is a concrete
+            // length, otherwise it stays Deferred.
             _ => {
                 // Still synth it to catch concrete errors.
                 let _ = self.synth(len);
+                match self.comptime_eval_value(len).and_then(|v| v.as_int()) {
+                    Some(v) if v >= 0 => self.array_len_from(v, len.span()),
+                    _ => ArrayLen::Deferred,
+                }
+            }
+        }
+    }
+
+    /// Converts a known non-negative comptime length into an [`ArrayLen`],
+    /// rejecting (and deferring) a value too large for `u64` with a diagnostic.
+    fn array_len_from(&mut self, v: i128, span: k2_syntax::Span) -> ArrayLen {
+        match u64::try_from(v) {
+            Ok(n) => ArrayLen::Known(n),
+            Err(_) => {
+                self.error(span, "array length too large");
                 ArrayLen::Deferred
             }
         }
@@ -264,8 +292,22 @@ impl crate::check::Checker<'_> {
                 .last()
                 .copied()
                 .unwrap_or_else(|| self.arena.t_deferred()),
-            // Reflection / type-producing builtins are deferred; still synth args.
-            "@typeInfo" | "@Type" | "@import" | "@field" | "@hasField" => {
+            // `@Type(info)` in a type position reconstructs a concrete type when
+            // the descriptor is comptime-known (`UnsignedOf(F)`); `@typeInfo`/
+            // `@field` likewise. Falls back to Deferred for opaque bases.
+            "@Type" | "@typeInfo" | "@field" => {
+                for a in args {
+                    let _ = self.synth(a);
+                }
+                let call = Expr::Builtin {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                    span: _span,
+                };
+                self.comptime_eval_type(&call)
+                    .unwrap_or_else(|| self.arena.t_deferred())
+            }
+            "@import" | "@hasField" => {
                 for a in args {
                     let _ = self.synth(a);
                 }

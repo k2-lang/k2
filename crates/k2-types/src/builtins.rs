@@ -50,9 +50,21 @@ impl crate::check::Checker<'_> {
                     self.arena.t_deferred()
                 }
             }
-            // Layout builtins -> usize.
+            // Layout builtins -> usize. The concrete value is computed by the
+            // comptime engine and recorded so a `const n = @sizeOf(T)` is itself
+            // comptime-known (it drives `[serializedSize(Packet)]u8`).
             "@sizeOf" | "@alignOf" | "@offsetOf" | "@bitSizeOf" => {
                 self.synth_all(args);
+                if matches!(name, "@sizeOf" | "@alignOf" | "@bitSizeOf") {
+                    let call = Expr::Builtin {
+                        name: name.to_string(),
+                        args: args.to_vec(),
+                        span,
+                    };
+                    if let Some(crate::value::Value::Int(ci)) = self.comptime_eval_value(&call) {
+                        self.comptime_span_ints.insert((span.start, span.end), ci.v);
+                    }
+                }
                 self.arena.t_usize()
             }
             // `@TypeOf(e, ...)` -> the value is a type; record operand types.
@@ -76,10 +88,18 @@ impl crate::check::Checker<'_> {
                 self.synth_all(args);
                 self.arena.t_str()
             }
-            // Diverging builtins.
+            // Diverging builtins. `@compileError`/`@compileLog` fire only when
+            // the comptime ENGINE reaches them (an executed branch of a comptime
+            // block or an instantiated generic body) — never eagerly here, so a
+            // `@compileError` guarded by an `if` that is not taken for a given
+            // instantiation does not fire (spec §07.9.1).
             "@compileError" | "@panic" => {
                 self.synth_all(args);
                 self.arena.t_noreturn()
+            }
+            "@compileLog" => {
+                self.synth_all(args);
+                self.arena.t_void()
             }
             // `@This()` -> the enclosing container type (or Deferred at file scope).
             "@This" => self
@@ -87,10 +107,20 @@ impl crate::check::Checker<'_> {
                 .last()
                 .copied()
                 .unwrap_or_else(|| self.arena.t_type()),
-            // Reflection boundary -> Deferred; still synth args for inner errors.
+            // Reflection boundary: try the comptime engine; the result's *type*
+            // replaces the v0.5 Deferred when known. Falls back to Deferred when
+            // the base is itself comptime-unknown (a module/anytype/std member).
             "@typeInfo" | "@Type" | "@field" | "@hasField" | "@hasDecl" | "@FieldType" => {
                 self.synth_all(args);
-                self.arena.t_deferred()
+                let call = Expr::Builtin {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                    span,
+                };
+                match self.comptime_eval_value(&call) {
+                    Some(v) => self.value_type(&v),
+                    None => self.arena.t_deferred(),
+                }
             }
             // `@min`/`@max`: every concrete operand must be numeric, and they must
             // mutually unify; the result is that common numeric type. A bottom

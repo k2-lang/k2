@@ -25,7 +25,7 @@ use k2_syntax::{
 use crate::arena::TypeArena;
 use crate::diag::Diagnostic;
 use crate::ty::{
-    EnumInfo, EnumVariant, ErrSetRef, FieldInfo, FnSig, MemberDecl, MemberRes, ParamInfo,
+    EnumInfo, EnumVariant, ErrSetRef, FieldInfo, FnSig, IntBits, MemberDecl, MemberRes, ParamInfo,
     StructInfo, Type, TypeId, UnionInfo, UnionTagKind, UnionVariant,
 };
 use crate::Typed;
@@ -86,14 +86,65 @@ pub struct Checker<'a> {
     /// Recursion-depth guard.
     depth: u32,
     depth_exceeded: bool,
+
+    // ---- comptime engine state (v0.6) ----------------------------------
+    /// The remaining comptime fuel for the in-progress evaluation. Reset per
+    /// top-level boundary; decremented on every evaluation step / loop back-edge
+    /// / call, guaranteeing termination.
+    pub(crate) comptime_fuel: u64,
+    /// Whether the fuel-exhaustion diagnostic has already been emitted for the
+    /// current evaluation (so it is reported once, not once per step).
+    pub(crate) comptime_fuel_reported: bool,
+    /// The fully comptime-known [`Value`] of a binding, where the engine folded
+    /// it (a `@typeInfo` const, an `inline for` loop var, a `@sizeOf` result).
+    pub(crate) comptime_const_values: HashMap<DefId, crate::value::Value>,
+    /// The comptime-known integer value at an expression span (e.g. a `@sizeOf`
+    /// or `serializedSize(T)` occurrence), used to resolve a comptime array
+    /// length to a concrete count.
+    pub(crate) comptime_span_ints: HashMap<(u32, u32), i128>,
+    /// Index from a fn's [`DefId`] to its AST item, built once in [`Self::run`],
+    /// so the generic-instantiation engine can fetch a body without re-walking.
+    pub(crate) fn_items: HashMap<DefId, k2_syntax::Item>,
+    /// The generic-instantiation cache: `(fn, arg tuple) -> result`.
+    pub(crate) inst_cache: crate::generic::InstCache,
+    /// The in-progress instantiation stack (recursion guard + error context).
+    pub(crate) inst_stack: Vec<(DefId, Span)>,
+    /// The synthesized reflection descriptor types (`TypeInfo`, `StructField`, …).
+    pub(crate) reflect: crate::reflect::ReflectTypes,
+    /// Content-keyed cache for `@Type`-of-struct, so a round-trip
+    /// `@Type(@typeInfo(S))` yields one stable nominal type.
+    pub(crate) reify_struct_cache: crate::reflect::ReifyStructCache,
+    /// A monotonically increasing counter for fresh synthetic spans, used so
+    /// each distinct generic instantiation / `@Type` struct interns a distinct
+    /// nominal type.
+    pub(crate) synthetic_span_counter: u32,
+    /// Spans whose expression *value is a `type`* (a type-returning generic call
+    /// `List(u32)`), mapping to the denoted aggregate. An access `List(u32).init`
+    /// against such a base is an *associated* call (no implicit receiver), not
+    /// method-call sugar.
+    pub(crate) type_valued_spans: HashMap<(u32, u32), TypeId>,
+    /// Nesting depth inside a *statically-conditional* branch (an `if`/`while`/
+    /// `for`/`switch` arm). A statement-position `@compileError`/`@panic` is only
+    /// fired eagerly at conditional depth 0 (an unconditionally-reached fn-body
+    /// statement); inside a branch the engine's own live-branch evaluation
+    /// decides, so a dead-branch `@compileError` stays silent (spec §07.9.1).
+    pub(crate) cond_depth: u32,
+    /// Instantiated container types whose method bodies have already been
+    /// re-type-checked, keyed by the instantiation's nominal [`TypeId`] (unique
+    /// per distinct argument tuple). Guarantees each distinct instantiation's
+    /// bodies are checked exactly once (spec §07.4: per-instantiation soundness),
+    /// not per use site.
+    pub(crate) rechecked_insts: HashSet<TypeId>,
 }
 
 impl<'a> Checker<'a> {
     /// Builds a checker over an already-resolved file.
     pub fn new(resolved: &'a Resolved) -> Checker<'a> {
+        let mut arena = TypeArena::new();
+        let reflect = Checker::install_reflection_types(&mut arena);
         Checker {
             resolved,
-            arena: TypeArena::new(),
+            arena,
             types: HashMap::new(),
             members: HashMap::new(),
             binding_types: HashMap::new(),
@@ -105,11 +156,41 @@ impl<'a> Checker<'a> {
             const_defs: HashSet::new(),
             depth: 0,
             depth_exceeded: false,
+            comptime_fuel: crate::comptime::COMPTIME_FUEL,
+            comptime_fuel_reported: false,
+            comptime_const_values: HashMap::new(),
+            comptime_span_ints: HashMap::new(),
+            fn_items: HashMap::new(),
+            inst_cache: HashMap::new(),
+            inst_stack: Vec::new(),
+            reflect,
+            reify_struct_cache: HashMap::new(),
+            synthetic_span_counter: 0,
+            type_valued_spans: HashMap::new(),
+            cond_depth: 0,
+            rechecked_insts: HashSet::new(),
         }
+    }
+
+    /// Allocates a fresh synthetic span in the compiler-reserved high range, so
+    /// each distinct generic instantiation / `@Type` struct interns a distinct
+    /// nominal type (the arena keys structs/enums/unions by span).
+    pub(crate) fn fresh_synthetic_span(&mut self) -> Span {
+        // Reserve the high half of the span space for synthesized nodes; real
+        // source spans live below it. The counter steps by 2 so start != end.
+        let base = 0xC000_0000u32;
+        let off = base + self.synthetic_span_counter.wrapping_mul(2);
+        self.synthetic_span_counter = self.synthetic_span_counter.wrapping_add(1);
+        Span::new(off, off + 1, 0, 0)
     }
 
     /// Type-checks a whole file and consumes the checker into a [`Typed`].
     pub fn run(mut self, file: &SourceFile) -> Typed {
+        // Index every `fn` item (top-level and nested) by its DefId so the
+        // comptime engine can fetch a generic body for instantiation.
+        for item in &file.items {
+            self.index_fn_items(item);
+        }
         // Pre-bind every top-level item's type so forward references between
         // items type-check (a fn may call a fn declared later). Consts/vars first
         // so a fn signature that names a const type (e.g. a `const E = error{...}`
@@ -133,6 +214,31 @@ impl<'a> Checker<'a> {
             members: self.members,
             binding_types: self.binding_types,
             diagnostics: self.diags,
+        }
+    }
+
+    /// Recursively indexes `fn` items (and fns nested in container values) by
+    /// their [`DefId`], so generic instantiation can fetch a body. Fns inside a
+    /// generic's returned `struct {...}` are not indexed here (they live in the
+    /// instantiated nominal type), but the top-level generic functions are.
+    fn index_fn_items(&mut self, item: &Item) {
+        match item {
+            Item::Fn { span, .. } => {
+                if let Some(def) = self.def_of(*span) {
+                    self.fn_items.insert(def, item.clone());
+                }
+            }
+            Item::Const {
+                value: Expr::Container(c),
+                ..
+            } => {
+                for m in &c.members {
+                    if let Member::Decl(inner) = m {
+                        self.index_fn_items(inner);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -355,9 +461,29 @@ impl<'a> Checker<'a> {
                     self.check_stmt(s);
                 }
                 self.fn_stack.pop();
+                // A top-level forced `comptime { ... }` block is EXECUTED by the
+                // engine, so a reached `@compileError`/`@panic`, an infinite loop
+                // (fuel), or a div-by-zero fires here (spec §07.3.2).
+                self.run_comptime_block(body);
             }
         }
         self.leave();
+    }
+
+    /// Executes a forced `comptime { ... }` block through the comptime engine so
+    /// any reached `@compileError`/`@panic`/overflow/fuel-exhaustion is reported.
+    /// Pure deferrals (`Diverge::NotComptime`) are silent: a forced block that
+    /// merely touches a runtime-only value is left to the ordinary checker.
+    fn run_comptime_block(&mut self, body: &[Stmt]) {
+        self.reset_fuel();
+        let mut env = crate::comptime::Env::new();
+        for s in body {
+            match self.eval_stmt(&mut env, s) {
+                Ok(()) => {}
+                // A reached diagnostic was already queued by the engine.
+                Err(_) => break,
+            }
+        }
     }
 
     /// Pushes a synthetic `!void` frame (inferred error union of void), used for
@@ -417,6 +543,62 @@ impl<'a> Checker<'a> {
                     self.comptime_int_values.insert(def, v);
                 }
             }
+            // v0.6: fold a comptime const value (a `@typeInfo`/`@Type`/`@sizeOf`
+            // result, an `inline for` loop var's field type, a generic-call
+            // result) so later member access / type uses are concrete instead of
+            // Deferred. Only attempt this where the bound is itself deferred or a
+            // reflection/comptime type, to avoid re-evaluating already-concrete
+            // initializers. The engine emits a diagnostic only for a genuinely
+            // executed `@compileError`/fuel/div-by-zero, never for a deferral.
+            if is_const {
+                if let Some(v) = value {
+                    if Self::is_comptime_value_expr(v) {
+                        if let Some(cv) = self.comptime_eval_value(v) {
+                            if let Some(t) = cv.as_type() {
+                                self.item_types.insert(def, t);
+                            }
+                            self.comptime_const_values.insert(def, cv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `true` if `v` is an expression worth attempting comptime folding for in a
+    /// `const` binding: a reflection/type builtin, a `comptime`-forced
+    /// expression, or a generic/ordinary call (whose result may be a concrete
+    /// type or comptime value).
+    fn is_comptime_value_expr(v: &Expr) -> bool {
+        match v {
+            Expr::Builtin { name, .. } => matches!(
+                name.as_str(),
+                "@typeInfo"
+                    | "@Type"
+                    | "@field"
+                    | "@hasField"
+                    | "@sizeOf"
+                    | "@alignOf"
+                    | "@bitSizeOf"
+                    | "@typeName"
+                    | "@TypeOf"
+                    | "@This"
+                    // A top-level `const x = @compileError("m");` is an
+                    // unconditionally-reached position, so the engine must run it
+                    // and fire the message (spec §07.9.1) — a dead-branch
+                    // `@compileError` still stays silent because the engine only
+                    // evaluates the live branch.
+                    | "@compileError"
+                    | "@panic"
+            ),
+            Expr::Comptime { .. } => true,
+            Expr::Call { .. } => true,
+            Expr::Field { .. } => true,
+            // Arithmetic/logic over comptime-known operands (e.g.
+            // `const n = 1 << 10;`) so the binding's value is comptime-known and
+            // can size an array. A runtime operand simply yields NotComptime.
+            Expr::Binary { .. } | Expr::Unary { .. } | Expr::Index { .. } => true,
+            _ => false,
         }
     }
 
@@ -479,8 +661,24 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Pushes a fn frame for a (re-)checked body with the given return parts.
+    pub(crate) fn push_fn_frame(&mut self, ret: TypeId, is_eu: bool, ok: TypeId, err: ErrSetRef) {
+        self.fn_stack.push(FnFrame {
+            ret,
+            ret_is_error_union: is_eu,
+            ret_ok: ok,
+            ret_err: err,
+            saw_value_return: false,
+        });
+    }
+
+    /// Pops the current fn frame (the partner of [`Self::push_fn_frame`]).
+    pub(crate) fn pop_fn_frame(&mut self) {
+        self.fn_stack.pop();
+    }
+
     /// Splits a return type into `(is_error_union, ok, err)`.
-    fn error_union_parts(&self, ret: TypeId) -> (bool, TypeId, ErrSetRef) {
+    pub(crate) fn error_union_parts(&self, ret: TypeId) -> (bool, TypeId, ErrSetRef) {
         match self.arena.get(ret) {
             Type::ErrorUnion { err, ok } => (true, *ok, *err),
             _ => (false, ret, ErrSetRef::Inferred),
@@ -575,6 +773,8 @@ impl<'a> Checker<'a> {
                 for s in body {
                     self.check_stmt(s);
                 }
+                // Execute the forced comptime block (fires reached diagnostics).
+                self.run_comptime_block(body);
             }
             Stmt::Block { body, .. } => {
                 for s in body {
@@ -601,7 +801,21 @@ impl<'a> Checker<'a> {
 
     /// Checks a bare expression statement. An *unhandled* concrete error union
     /// used for its effect is an error (spec §06.2: use `try`/`catch`/`_ =`).
+    ///
+    /// A statement-position `@compileError("m");` / `@panic("m");` is in a
+    /// normally-reached fn body, so the comptime engine is run for it and the
+    /// message fires (spec §07.9.1). The synth path alone only yields `noreturn`
+    /// without executing, so a dedicated run is needed here. (A `@compileError`
+    /// guarded by an untaken `if` is not an expression statement of this shape,
+    /// and the engine evaluates only live branches, so dead branches stay silent.)
     fn check_expr_stmt(&mut self, expr: &Expr) {
+        if self.cond_depth == 0 && Self::is_diverging_builtin_stmt(expr) {
+            self.reset_fuel();
+            let mut env = crate::comptime::Env::new();
+            // A queued diagnostic (the verbatim message / `@panic`) is all we
+            // need; a non-comptime operand simply defers silently.
+            let _ = self.eval_expr(&mut env, expr);
+        }
         let t = self.synth(expr);
         if let Type::ErrorUnion { .. } = self.arena.get(t) {
             self.error(
@@ -609,6 +823,13 @@ impl<'a> Checker<'a> {
                 "error union must be handled with `try`, `catch`, or `_ =`",
             );
         }
+    }
+
+    /// `true` if `expr` is exactly a `@compileError(...)` / `@panic(...)` call —
+    /// the unconditional, statement-position diverging builtins the comptime
+    /// engine must execute so their message fires at the point reached.
+    fn is_diverging_builtin_stmt(expr: &Expr) -> bool {
+        matches!(expr, Expr::Builtin { name, .. } if name == "@compileError" || name == "@panic")
     }
 
     /// Checks a `return [value];` against the enclosing function's return type.
@@ -841,7 +1062,10 @@ impl<'a> Checker<'a> {
         }
         let tag_ty = match tag {
             Some(t) => self.eval_type(t),
-            None => self.arena.t_usize(), // inferred backing; width unused in v0.5.
+            // Inferred backing: the smallest unsigned int that holds the variant
+            // count, so `@sizeOf(enum{a,b,c})` is the minimal 1 byte (and
+            // `@typeInfo(E).tag_type` matches) rather than an 8-byte `usize`.
+            None => self.inferred_enum_tag(variants.len()),
         };
         let info = EnumInfo {
             def: self.def_of(c.span),
@@ -854,6 +1078,19 @@ impl<'a> Checker<'a> {
         let ty = self.arena.intern_enum(info);
         self.eval_container_decls(c, ty);
         ty
+    }
+
+    /// The interned tag type for an inferred-tag enum with `n` variants: the
+    /// smallest unsigned integer that distinguishes the variants, `bits =
+    /// max(1, ceil(log2(n)))`. So a 1..=2-variant enum gets `u1`, 3..=4 -> `u2`,
+    /// …, giving a minimal-fit layout (`@sizeOf == 1` for a 3-variant enum)
+    /// instead of an 8-byte `usize`.
+    pub(crate) fn inferred_enum_tag(&mut self, n: usize) -> TypeId {
+        let bits = enum_tag_bits(n);
+        self.arena.intern(Type::Int {
+            signed: false,
+            bits: IntBits::Fixed(bits),
+        })
     }
 
     /// Evaluates a `union {...}` body into a [`Type::Union`].
@@ -979,6 +1216,12 @@ impl<'a> Checker<'a> {
         self.self_stack.pop();
     }
 
+    /// Records the collected member declarations into a nominal Info (public to
+    /// the comptime engine, which builds instantiated containers).
+    pub(crate) fn store_decls_pub(&mut self, container_ty: TypeId, decls: Vec<MemberDecl>) {
+        self.store_decls(container_ty, decls);
+    }
+
     /// Records the collected member declarations into a nominal Info.
     fn store_decls(&mut self, container_ty: TypeId, decls: Vec<MemberDecl>) {
         match self.arena.get(container_ty).clone() {
@@ -1068,4 +1311,16 @@ impl<'a> Checker<'a> {
             }
         }
     }
+}
+
+/// The minimal unsigned tag width for an inferred-tag enum of `n` variants:
+/// `max(1, ceil(log2(n)))` bits (so 0..=2 variants -> 1 bit, 3..=4 -> 2, …). A
+/// zero-variant enum still gets a 1-bit tag (a legal, minimal placeholder).
+fn enum_tag_bits(n: usize) -> u16 {
+    if n <= 2 {
+        return 1;
+    }
+    // ceil(log2(n)): bits needed to index `n` distinct variants.
+    let bits = (usize::BITS - (n - 1).leading_zeros()) as u16;
+    bits.max(1)
 }

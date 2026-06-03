@@ -35,10 +35,14 @@ impl crate::check::Checker<'_> {
             self.bind_switch_arm_capture(arm, st);
             // Resolve `.Variant`/`error.Name` pattern items against the scrutinee.
             self.type_arm_items(arm, st);
+            // A switch arm body is conditional: a statement-position
+            // `@compileError` in it must not fire eagerly.
+            self.cond_depth += 1;
             let body_ty = match expected {
                 Some(ex) => self.check(&arm.body, ex),
                 None => self.synth(&arm.body),
             };
+            self.cond_depth -= 1;
             result = Some(match result {
                 None => body_ty,
                 Some(prev) => self.join(prev, body_ty, arm.span, expected),
