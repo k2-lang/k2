@@ -217,7 +217,7 @@ especially for anything touching the language design.
 
 ---
 
-## Code of conduct & licensing
+## Licensing
 
 Be respectful and constructive; assume good faith.
 
