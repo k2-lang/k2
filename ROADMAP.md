@@ -2,215 +2,202 @@
 
 > **k2** — *Kardashev Type II.* Total control over the machine, with zero waste.
 
-This roadmap is **honest about where k2 is today**: the language is fully
-*designed* — the locked charter, the EBNF grammar, and ten normative spec
-chapters all exist under [`docs/`](docs/) — but the *implementation* has only
-just begun. The compiler is a Rust workspace, and exactly one phase of the
-front-end is working: the **lexer**.
+This roadmap drives k2 from a designed language with a working lexer to a
+**complete, self-contained toolchain that actually runs k2 programs** — parser,
+name resolution, type system, the comptime engine, an optimizing IR, and a
+bytecode virtual machine — plus a standard library, a build system written in
+k2, and developer tooling (formatter + language server).
 
-We build front-to-back from a locked design, so each milestone is a vertical
-slice that turns more of the spec into running code. Nothing below is shipped
-until its spec chapter and its tests agree.
+## Implementation constraint: pure `std`, fully offline
+
+The whole toolchain is built on the Rust **standard library only** — no
+third-party crates — so it builds, tests, and runs with no network access and a
+single `cargo` invocation. This is a hard project rule, and it shapes the
+backend strategy:
+
+- The execution engine for the `v0.x` series is a **k2 bytecode compiler + a
+  register-based virtual machine**, written in pure `std`. This is what makes
+  k2 programs *run*, and it is where the "fast" pillar is proven (via an
+  optimizing pass and a benchmark harness).
+- **Native code generation** through Cranelift/LLVM is real and desirable, but
+  it requires external crates, so it is deliberately **post-0.13 future work**
+  (see *Beyond 0.13*). Nothing in the `v0.x` line depends on it.
+
+We build front-to-back from the locked design in [`docs/`](docs/); each
+milestone is a vertical slice that turns more of the spec into running,
+tested code. A version ships only when it builds clean (`fmt` + `clippy -D
+warnings`), its tests pass, and CI is green — then it is tagged and pushed.
 
 Legend: ✅ done · 🚧 in progress · ⬜ not started.
 
 ---
 
-## Where we are now
+## Status overview
 
-| Component | State | Notes |
+| Version | Milestone | State |
 | --- | --- | --- |
-| Language design (charter, grammar, spec §01–§10) | ✅ | Locked; co-normative with the implementation. |
-| `k2-lexer` | ✅ | Spec-faithful tokenizer with error recovery and a real test suite. |
-| `k2-syntax` (AST + spans) | 🚧 | Node definitions and span helpers exist; not yet produced by a parser. |
-| `k2c` driver | 🚧 | Hand-rolled CLI; only the `tokenize`/`lex` subcommand is wired up. |
-| Parser | ⬜ | Next up (see v0.2). |
-| Everything below the parser | ⬜ | Specified, not implemented. |
+| v0.1 | Lexer + driver | ✅ |
+| v0.2 | Parser → AST | ⬜ |
+| v0.3 | Canonical formatter + AST tooling | ⬜ |
+| v0.4 | Name resolution, scopes & module graph (HIR) | ⬜ |
+| v0.5 | Type system & checker | ⬜ |
+| v0.6 | The comptime engine & generics | ⬜ |
+| v0.7 | MIR, monomorphization & safety checks | ⬜ |
+| v0.8 | Bytecode VM — **programs run** | ⬜ |
+| v0.9 | Optimizer & release mode — **proven fast** | ⬜ |
+| v0.10 | Standard library & the `*System` capabilities | ⬜ |
+| v0.11 | Concurrency: threads, sync & async | ⬜ |
+| v0.12 | `build.k2` & the package/module system | ⬜ |
+| v0.13 | Tooling: formatter polish & language server | ⬜ |
 
 ---
 
-## v0 — Front-end skeleton (current)
+## v0.1 — Lexer + driver ✅
 
-The goal of v0 is a working **source → typed AST** front-end with great
-diagnostics, all in pure stable Rust with no third-party crates.
-
-### v0.1 — Lexer ✅ (shipped)
-
-- ✅ Complete tokenizer for the locked 35-keyword set, `@builtins`, escaped
-  identifiers, all literal forms (int radixes, decimal/hex floats, char,
-  string, multiline string), and the full operator/punctuation table with
+- ✅ Complete tokenizer for the locked keyword set, `@builtins`, escaped
+  identifiers, every literal form, and the full operator/punctuation table with
   maximal munch.
 - ✅ `!` lexes strictly as the error-union constructor; `and`/`or`/`not` are
-  keywords (never a symbolic boolean not).
-- ✅ Non-panicking error recovery: lexical errors become `Error` tokens so later
-  phases can report precisely.
-- ✅ `k2c lex <file>` / `k2c tokenize -` driver subcommand.
+  keywords. Non-panicking error recovery via `Error` tokens.
+- ✅ `k2c lex`/`tokenize` driver subcommand. Extensive unit tests.
 
-### v0.2 — Parser 🚧 (current focus)
+## v0.2 — Parser → AST ⬜
 
-- ⬜ Recursive-descent parser producing the `k2-syntax` AST for the whole
-  grammar in `docs/grammar.ebnf`.
-- ⬜ Postfix-modifier type grammar (`?T`, `!T`, `E!T`, `*T`, `*const T`, `[]T`,
-  `[N]T`).
-- ⬜ Error-recovering parse with source-spanned diagnostics.
-- ⬜ `k2c parse <file>` (AST dump) and a round-trip / pretty-print check.
+- Recursive-descent parser (`k2-parse`) covering the whole grammar in
+  [`docs/grammar.ebnf`](docs/grammar.ebnf): items, statements, the full
+  expression grammar with correct precedence, blocks-as-expressions, `if` /
+  `while` / `for` / `switch`, `struct` / `enum` / `union` / `error` type
+  declarations, and the postfix-modifier type grammar (`?T`, `!T`, `E!T`, `*T`,
+  `*const T`, `[]T`, `[N]T`).
+- Error-recovering parse with precise, source-spanned diagnostics.
+- `k2c parse <file>` dumps the AST; an S-expression form supports round-trip
+  testing.
 
-### v0.3 — HIR, name resolution, module graph ⬜
+## v0.3 — Canonical formatter + AST tooling ⬜
 
-- ⬜ Lower the AST to a typed HIR.
-- ⬜ Resolve `@import`, build the module/namespace graph, resolve names and
-  predeclared types.
+- `k2c fmt` — the one canonical layout for k2 source, built on the AST.
+- Idempotence and parse-print-parse round-trip tests across every example.
+- `k2c ast` structured dump for tooling and golden tests.
 
-**Exit criteria for v0:** every program under `examples/` parses and lowers to
-HIR with no errors, and the diagnostics are clear and well-spanned.
+## v0.4 — Name resolution, scopes & module graph (HIR) ⬜
 
----
+- Lower the AST to a resolved **HIR**: every identifier bound to a declaration,
+  every scope and shadowing rule enforced.
+- `@import` resolution and a project module/namespace graph.
+- Predeclared types and builtins in scope; clear "unresolved name" diagnostics.
 
-## v0.4 — Semantic analysis & type system ⬜
+## v0.5 — Type system & checker ⬜
 
-- ⬜ Bidirectional type inference; `@TypeOf` resolution.
-- ⬜ Optionals (`?T`), error unions (`E!T` / `!T`), slices, arrays, pointers.
-- ⬜ Capability types resolved (`*System`, `Allocator`, and the `sys.*` handles).
-- ⬜ Exhaustiveness checking for `switch` (including over error sets and enums).
+- A real type representation and a bidirectional checker with local inference;
+  `@TypeOf` resolution.
+- Optionals (`?T`), error unions (`E!T` / `!T`), pointers, slices, arrays,
+  structs, enums, and the capability types (`*System`, `Allocator`, `sys.*`).
+- `switch` exhaustiveness over enums and error sets. `k2c check <file>`.
 
----
-
-## v0.5 — The comptime engine ⬜
+## v0.6 — The comptime engine & generics ⬜
 
 The single metaprogramming mechanism, and the heart of generics.
 
-- ⬜ Sandboxed comptime interpreter over ordinary k2 (no I/O, no runtime
-  allocation, guaranteed to terminate).
-- ⬜ `type` as a first-class comptime value; generics as `fn(comptime T: type) type`,
-  instantiated and cached per distinct argument.
-- ⬜ Reflection: `@typeInfo` / `@Type` round-trip, `@hasField`, `@field`,
-  `@sizeOf`, `@alignOf`.
-- ⬜ `@compileError` / `@compileLog` with precise, source-located diagnostics.
-- ⬜ `inline for` / `inline` over comptime-known sequences.
+- A sandboxed comptime interpreter over ordinary k2 — no I/O, no runtime
+  allocation, guaranteed to terminate.
+- `type` as a first-class comptime value; generics as
+  `fn(comptime T: type) type`, instantiated and cached per distinct argument.
+- Reflection: `@typeInfo` / `@Type` round-trip, `@hasField`, `@field`,
+  `@sizeOf`, `@alignOf`; `@compileError` / `@compileLog`; `inline for`.
 
----
+## v0.7 — MIR, monomorphization & safety checks ⬜
 
-## v0.6 — MIR, monomorphization & safety checks ⬜
+- A backend-agnostic **MIR**: monomorphized and comptime-folded.
+- Safety-check insertion for Debug/ReleaseSafe: bounds, integer overflow,
+  narrowing-cast (`@intCast`), and `unreachable`.
+- First pass of comptime **leak/escape analysis** flagging obvious allocator
+  misuse as a compile-time diagnostic.
 
-- ⬜ A k2-native **MIR**: monomorphized, comptime-folded, backend-agnostic.
-- ⬜ Safety-check insertion for Debug/ReleaseSafe: bounds, integer overflow,
-  narrowing-cast (`@intCast`), and `unreachable` checks.
-- ⬜ First pass of **comptime leak/escape analysis** — flag obvious allocator
-  misuse (a value allocated and returned without ownership transfer, a missing
-  paired free in a simple scope) as a compile-time diagnostic.
+## v0.8 — Bytecode VM — programs run ⬜
 
----
+- A bytecode compiler lowering MIR to a compact instruction set, and a
+  register-based **virtual machine** that executes it — all pure `std`.
+- The runtime shim that constructs the root `*System` and dispatches `main`.
+- `k2c run <file>` compiles and executes real programs.
 
-## v0.7 — Cranelift debug backend ⬜
+**This is the milestone where `examples/hello.k2` actually runs and prints.**
 
-- ⬜ Lower MIR to native code via `cranelift-codegen` for near-instant Debug
-  builds.
-- ⬜ `k2 run <file>` and `k2 build` (Debug) compile and execute real programs.
-- ⬜ Full safety toolkit live: bounds/overflow checks plus the runtime-checked
+## v0.9 — Optimizer & release mode — proven fast ⬜
+
+- An optimizing pass over MIR/bytecode: constant folding, dead-code
+  elimination, copy propagation, and devirtualization/inlining of monomorphic
+  capability calls.
+- Build modes: **Debug** (checks on), **ReleaseSafe** (optimized + checks),
+  **ReleaseFast** (checks stripped).
+- A reproducible **benchmark harness** demonstrating the speedups — the "zero
+  waste / fast" pillar, made measurable.
+
+## v0.10 — Standard library & the `*System` capabilities ⬜
+
+Tracked against [`docs/spec/10-standard-library.md`](docs/spec/10-standard-library.md);
+the stdlib that *never allocates on your behalf*.
+
+- Allocators: `FixedBufferAllocator`, `ArenaAllocator`, and a runtime-checked
   `GeneralPurposeAllocator` (leak / double-free / use-after-free detection).
-- ⬜ The minimum runtime shim that constructs `*System` and dispatches to `main`.
+- Core containers: `ArrayList`, hash map, and friends — all allocator-taking.
+- The capability surfaces behind `*System`: `io`, `heap`, `clock`, `random`,
+  `env`. Formatting and `testing` helpers (`expectError`, testing allocator).
 
-**This is the first milestone where `examples/hello.k2` actually runs.**
-
----
-
-## v0.8 — LLVM release backend ⬜
-
-- ⬜ Lower the *same* MIR to LLVM IR (via `inkwell`/`llvm-sys`) for optimized
-  native code.
-- ⬜ Build modes complete: **Debug** (Cranelift), **ReleaseSafe** (LLVM + checks),
-  **ReleaseFast** (LLVM, checks stripped).
-- ⬜ Verify zero-cost abstractions: capability indirections devirtualize when
-  monomorphic; generated code matches hand-written equivalents.
-- ⬜ First-class **cross-compilation**: `-Dtarget=<triple>`, bundled libc
-  headers/stubs for common targets.
-
----
-
-## v0.9 — C interop & FFI ⬜
-
-- ⬜ `extern` / `export` function and variable interop.
-- ⬜ Integrated C-translation path so C headers are usable directly.
-- ⬜ ABI-correct struct layout validated against `@sizeOf` / `@alignOf`.
-
----
-
-## v0.10 — Standard library ⬜
-
-The stdlib that *never allocates on your behalf*. Tracked against
-[`docs/spec/10-standard-library.md`](docs/spec/10-standard-library.md).
-
-- ⬜ Allocators: `GeneralPurposeAllocator`, `FixedBufferAllocator`,
-  `ArenaAllocator`, page allocator.
-- ⬜ Core containers: `ArrayList`, hash map, and friends — all allocator-taking.
-- ⬜ The capability surfaces behind `*System`: `io`, `heap`, `clock`, `random`,
-  `env`, `net`.
-- ⬜ Formatting, `testing` helpers (`expectError`, the testing allocator), and
-  string/slice utilities.
-
----
-
-## v0.11 — Concurrency ⬜
+## v0.11 — Concurrency: threads, sync & async ⬜
 
 Library-provided over OS threads; no built-in runtime. See
 [`docs/spec/09-concurrency.md`](docs/spec/09-concurrency.md).
 
-- ⬜ `ThreadPool` / `Executor` capabilities (passed, never global).
-- ⬜ `Mutex`, atomics, and other explicit synchronization primitives.
-- ⬜ Colorless, stackless `async`/`await` lowered at compile time, with
+- `ThreadPool` / `Executor` capabilities (passed, never global), `Mutex`, and
+  atomics — explicit synchronization primitives.
+- Colorless, stackless `async`/`await` lowered at compile time, with
   caller-owned `Frame` storage and an event loop obtained from `*System`.
 
----
+## v0.12 — `build.k2` & the package/module system ⬜
 
-## v0.12 — Package manager & `build.k2` ⬜
+- `build.k2` executed by the comptime engine — the build system *is* k2 itself,
+  with no second configuration language. `k2c build`.
+- A multi-file module/package graph, lockfile, and reproducible builds.
+- Build options surfaced to programs via `@import("build_options")`.
 
-- ⬜ `build.k2` executed by the comptime engine — the build system *is* k2
-  itself, with no second configuration language.
-- ⬜ Dependency fetching, lockfiles, and reproducible builds.
-- ⬜ Build options surfaced to programs via `@import("build_options")`.
+## v0.13 — Tooling: formatter polish & language server ⬜
 
----
-
-## v0.13 — Tooling: LSP & formatter ⬜
-
-- ⬜ `k2 fmt` — a canonical formatter (one obvious way to lay out code).
-- ⬜ A language server: diagnostics, go-to-definition, hover, and completion,
-  reusing the front-end crates.
-- ⬜ Editor integrations.
+- `k2 fmt` finalized as the canonical formatter.
+- A **language server** (`k2c lsp`) over the LSP base protocol: diagnostics,
+  hover, go-to-definition, and completion — reusing the front-end crates, in
+  pure `std`.
+- Editor-integration notes. Final integration pass: every example runs, the
+  whole suite is green, and the optimizer's wins are re-verified.
 
 ---
 
-## Self-hosting? — an open question, deliberately
+## Beyond 0.13 — native codegen, FFI, self-hosting
 
-k2's compiler is implemented in **Rust** today, and that is a stated design
-choice (memory- and data-race-safe compiler, mature Cranelift/LLVM crates,
-clean ADTs for the IRs). Unlike Zig, **k2 does not commit to self-hosting.**
+Deferred precisely because it breaks the pure-`std` rule or is better done once
+the language is complete:
 
-Once the language is capable enough (post-v0.10), we will evaluate a self-hosted
-front-end as an experiment and a proof of expressiveness — but the Rust
-implementation remains the reference unless and until a self-hosted compiler
-clearly wins on robustness and maintainability. No promises here; correctness of
-the compiler outranks the romance of self-hosting.
-
----
+- **Native backends.** Lower the *same* MIR to native code via Cranelift (fast
+  debug builds) and LLVM (optimized release) — first-class cross-compilation
+  with `-Dtarget=<triple>`. Requires external crates.
+- **C interop & FFI.** `extern` / `export`, direct use of C headers, and
+  ABI-correct layout validated against `@sizeOf` / `@alignOf`.
+- **Self-hosting — an open question, deliberately.** k2's compiler is in Rust
+  by choice (a memory- and data-race-safe compiler, clean ADTs for the IRs).
+  Unlike Zig, **k2 does not commit to self-hosting.** We will evaluate a
+  self-hosted front-end as a proof of expressiveness, but the Rust
+  implementation stays the reference unless a self-hosted one clearly wins on
+  robustness. Correctness of the compiler outranks the romance of self-hosting.
 
 ## 1.0 goals
 
-k2 reaches **1.0** when:
+k2 reaches **1.0** when the whole language in `docs/spec/§01–§10` is implemented
+and co-normative with the compiler; the standard library, build system,
+formatter, and language server are usable for real projects; the optimizer's
+zero-cost-abstraction claims are verified; and the language surface is stable —
+a `1.0` program keeps compiling, with breaking changes gated behind a
+deprecation policy.
 
-- ⬜ The whole language in `docs/spec/§01–§10` is implemented, with the spec and
-  the compiler co-normative and tested against each other.
-- ⬜ All three build modes (Debug/Cranelift, ReleaseSafe/LLVM, ReleaseFast/LLVM)
-  are solid, and cross-compilation works for the common target triples.
-- ⬜ Zero-cost abstractions are verified: capability indirection and generics
-  compile to hand-written-equivalent machine code.
-- ⬜ The standard library, package manager, formatter, and LSP are usable for
-  real projects.
-- ⬜ The language surface is **stable** — a `1.0` program keeps compiling. After
-  1.0, breaking changes follow a deprecation policy.
-
-Until then, **expect breakage**: k2 is pre-alpha, the surface may shift, and the
-only guarantee is that the lexer turns your `.k2` files into tokens.
+Until then, **expect breakage**: k2 is pre-alpha and the surface may shift.
 
 ---
 
