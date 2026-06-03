@@ -1,0 +1,25 @@
+[package]
+name = "k2-vm"
+version = "0.1.0"
+edition = "2021"
+description = "The k2 bytecode compiler + register VM + runtime shim (v0.8)."
+license = "MIT OR Apache-2.0"
+
+# The library produced by this crate.
+[lib]
+name = "k2_vm"
+path = "src/lib.rs"
+
+# Standard library only, plus the MIR and type crates by path. The VM executes
+# the monomorphized MIR directly — there are no third-party crates, so the
+# toolchain builds and runs fully offline.
+[dependencies]
+k2-mir = { path = "../k2-mir" }
+k2-types = { path = "../k2-types" }
+
+# The integration tests lower k2 source strings to MIR before executing them, so
+# they need the front-end crates. These are test-only (std-only, offline).
+[dev-dependencies]
+k2-parse = { path = "../k2-parse" }
+k2-resolve = { path = "../k2-resolve" }
+k2-types = { path = "../k2-types" }

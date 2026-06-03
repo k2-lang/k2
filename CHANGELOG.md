@@ -35,8 +35,17 @@ is being designed in the open and nothing is stable yet.
   - `k2-lexer` — a complete, recovering lexer for the surface syntax, with an
     extensive unit-test suite.
   - `k2-syntax` — the AST type definitions and source-span machinery.
+  - `k2-vm` — the v0.8 bytecode compiler + register VM + runtime shim: it
+    compiles the monomorphized MIR to a compact register ISA and executes
+    `main(sys)` on a managed heap, with the minimal io/heap capability
+    intrinsics (`sys.io.stdout`/`stderr`, `Writer.print`, `sys.heap` with
+    `create`/`destroy`/`alloc`/`free`). A failed safety check / `Trap` /
+    `unreachable` becomes a clean runtime panic (a `panic:` line on stderr and
+    a nonzero exit), never an uncontrolled Rust panic; `defer`/`errdefer`
+    ordering and `try` error-propagation execute straight from the CFG.
   - `k2c` — the compiler driver, with a working `tokenize` / `lex` subcommand
-    that streams tokens from a file or standard input.
+    that streams tokens from a file or standard input, plus the `run`
+    subcommand that compiles and executes a program (Debug or `--release-fast`).
 
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security

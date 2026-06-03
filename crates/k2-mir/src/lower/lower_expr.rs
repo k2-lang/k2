@@ -254,7 +254,7 @@ impl FnBuilder<'_, '_> {
             Rvalue::Binary {
                 op: BinOp::Sub,
                 lhs: hi_op,
-                rhs: lo_op,
+                rhs: lo_op.clone(),
                 ty: usize_ty,
             },
             span,
@@ -263,6 +263,8 @@ impl FnBuilder<'_, '_> {
             dst,
             Rvalue::MakeSlice {
                 ptr: Operand::Copy(ptr_meta),
+                // The sub-slice starts at element `lo` of the base.
+                offset: lo_op,
                 len: Operand::local(new_len_tmp),
                 ty: slice_ty,
             },
@@ -383,10 +385,16 @@ impl FnBuilder<'_, '_> {
                             ty: ptr_ty,
                         });
                         self.mark_address_taken(place.base);
+                        let usize_ty = self.lo.typed.arena.t_usize();
                         self.assign(
                             dst,
                             Rvalue::MakeSlice {
                                 ptr: Operand::Copy(ptr),
+                                // A whole-array view starts at element 0.
+                                offset: Operand::Const(Const::Int {
+                                    value: 0,
+                                    ty: usize_ty,
+                                }),
                                 len,
                                 ty,
                             },
@@ -488,6 +496,18 @@ impl FnBuilder<'_, '_> {
                         kind: CheckKind::DivByZero { b: rhs.clone(), ty },
                         span,
                     }));
+                    // Signed `/`/`%` also trap on `type-MIN op -1`, whose true
+                    // result (`-MIN`) does not fit the type.
+                    if self.is_signed_int(ty) {
+                        self.emit(Statement::Check(SafetyCheck {
+                            kind: CheckKind::DivOverflow {
+                                a: lhs.clone(),
+                                b: rhs.clone(),
+                                ty,
+                            },
+                            span,
+                        }));
+                    }
                 }
                 _ => {}
             }
@@ -1096,7 +1116,9 @@ impl FnBuilder<'_, '_> {
                     self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
                 }
             }
-            "@ptrCast" | "@bitCast" => {
+            "@ptrCast" | "@bitCast" | "@ptrFromInt" | "@intFromPtr" => {
+                // Pointer/representation reinterpretations: the bits are carried
+                // through unchanged.
                 if let [e] = args {
                     let ety = self.type_at(e.span());
                     let op = self.lower_operand(e, ety);
@@ -1104,6 +1126,65 @@ impl FnBuilder<'_, '_> {
                         dst,
                         Rvalue::Cast {
                             kind: CastKind::PtrReinterpret,
+                            operand: op,
+                            ty,
+                        },
+                        span,
+                    );
+                } else {
+                    self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
+                }
+            }
+            // `@truncate(e)` narrows by *wrapping* to the result width — unlike
+            // `@intCast` it is defined to discard high bits, so it gets NO
+            // `NarrowFits` check. `@intFromEnum`/`@enumFromInt`/`@floatCast` are
+            // likewise width/representation changes the VM's `IntNarrow`/`Widen`
+            // path handles (reading an enum tag / re-masking an int / re-rounding
+            // a float).
+            "@truncate" | "@floatCast" | "@intFromEnum" | "@enumFromInt" => {
+                if let [e] = args {
+                    let ety = self.type_at(e.span());
+                    let op = self.lower_operand(e, ety);
+                    self.assign(
+                        dst,
+                        Rvalue::Cast {
+                            kind: CastKind::IntNarrow,
+                            operand: op,
+                            ty,
+                        },
+                        span,
+                    );
+                } else {
+                    self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
+                }
+            }
+            // `@intFromFloat(e)`: truncating float -> int.
+            "@intFromFloat" => {
+                if let [e] = args {
+                    let ety = self.type_at(e.span());
+                    let op = self.lower_operand(e, ety);
+                    self.assign(
+                        dst,
+                        Rvalue::Cast {
+                            kind: CastKind::FloatToInt,
+                            operand: op,
+                            ty,
+                        },
+                        span,
+                    );
+                } else {
+                    self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
+                }
+            }
+            // `@floatFromInt(e)`: lossless int -> float.
+            "@floatFromInt" => {
+                if let [e] = args {
+                    let ety = self.type_at(e.span());
+                    let op = self.lower_operand(e, ety);
+                    self.assign(
+                        dst,
+                        Rvalue::Cast {
+                            kind: CastKind::IntToFloat,
                             operand: op,
                             ty,
                         },

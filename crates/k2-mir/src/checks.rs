@@ -183,6 +183,28 @@ fn emit_check_condition(func: &mut MirFunction, bi: usize, check: &SafetyCheck) 
                 },
             );
         }
+        CheckKind::DivOverflow { a, b, ty } => {
+            // ok unless `a == type-MIN && b == -1`. The width-dependent `type-MIN`
+            // is left to the VM (which knows the operand widths), mirroring the
+            // arithmetic-overflow predicates; we emit it as a first-class,
+            // dumpable boolean intrinsic.
+            stmt(
+                func,
+                Rvalue::Intrinsic {
+                    path: IntrinsicPath {
+                        root: IntrinsicRoot::Builtin("no_div_overflow".to_string()),
+                        members: Vec::new(),
+                        is_call: true,
+                    },
+                    args: vec![
+                        a.clone(),
+                        b.clone(),
+                        Operand::Const(Const::Undef { ty: *ty }),
+                    ],
+                    ty: bool_ty(func),
+                },
+            );
+        }
         CheckKind::LenEq { a, b } => {
             // ok = a == b.
             stmt(
@@ -271,6 +293,7 @@ fn check_note(check: &SafetyCheck, panic_bb: BlockId) -> String {
         CheckKind::Bounds { .. } | CheckKind::SliceRange { .. } => "bounds_check",
         CheckKind::AddOverflow { .. } | CheckKind::NegOverflow { .. } => "overflow_check",
         CheckKind::DivByZero { .. } => "divzero_check",
+        CheckKind::DivOverflow { .. } => "divoverflow_check",
         CheckKind::NarrowFits { .. } => "narrow_check",
         CheckKind::LenEq { .. } => "len_eq_check",
         CheckKind::Unreachable => "unreachable_check",
@@ -284,6 +307,7 @@ fn trap_reason(kind: &CheckKind) -> TrapReason {
         CheckKind::Bounds { .. } | CheckKind::SliceRange { .. } => TrapReason::Bounds,
         CheckKind::AddOverflow { .. } => TrapReason::Overflow,
         CheckKind::DivByZero { .. } => TrapReason::DivByZero,
+        CheckKind::DivOverflow { .. } => TrapReason::Overflow,
         CheckKind::NegOverflow { .. } => TrapReason::NegOverflow,
         CheckKind::NarrowFits { .. } => TrapReason::NarrowLoss,
         CheckKind::LenEq { .. } => TrapReason::LenMismatch,

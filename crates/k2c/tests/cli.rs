@@ -394,3 +394,82 @@ fn check_resolve_error_gates_check() {
         "stderr should carry the resolution diagnostic, got: {stderr}"
     );
 }
+
+// =========================================================================
+//  `run` — compile to bytecode and execute `main` on the VM.
+// =========================================================================
+
+/// Runs `k2c` with `args` and `input` on stdin, returning
+/// `(exit_code, stdout, stderr)`. Unlike [`run_with_stdin`], this surfaces the
+/// numeric exit code so the safety-trap tests can assert it is nonzero.
+fn run_with_code(args: &[&str], input: &[u8]) -> (i32, String, String) {
+    let mut child = k2c()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn run_hello_exact_stdout_and_stderr_separation() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    assert!(out.status.success(), "hello.k2 should exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        stdout,
+        "Hello, k2!\nk2 directs every joule of Sol: ~384600000000000000000000000 W.\n"
+    );
+    assert!(
+        stderr.contains("(this line went to stderr)"),
+        "the diagnostic line must go to stderr, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("this line went to stderr"),
+        "stderr content must NOT leak into stdout"
+    );
+}
+
+#[test]
+fn run_errors_example_exits_zero() {
+    let path = examples_dir().join("errors.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "errors.k2 should run to completion, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("doubled(\"21\") = 42"), "got: {stdout}");
+}
+
+#[test]
+fn run_bounds_trap_exits_nonzero_with_message() {
+    let src = b"pub fn main(sys: *System) !void { const a = [_]u8{1,2,3}; const i: usize = 9; _ = a[i]; }";
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_ne!(code, 0, "an OOB index must exit nonzero");
+    assert!(stdout.is_empty(), "no stdout on the trap, got: {stdout}");
+    assert!(
+        stderr.contains("panic:") && stderr.contains("index out of bounds"),
+        "stderr should carry the panic message, got: {stderr}"
+    );
+}
+
+#[test]
+fn run_release_fast_skips_the_trap() {
+    // The same overflowing add wraps instead of trapping under --release-fast.
+    let src = b"pub fn main(sys: *System) !void { const out = sys.io.stdout(); var x: u8 = 250; const y: u8 = 10; x += y; try out.print(\"x = {d}\\n\", .{x}); }";
+    let (code, stdout, _stderr) = run_with_code(&["run", "--release-fast", "-"], src);
+    assert_eq!(code, 0, "ReleaseFast must not trap on the overflow");
+    assert_eq!(stdout, "x = 4\n");
+}

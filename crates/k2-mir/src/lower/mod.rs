@@ -228,6 +228,13 @@ impl<'a> Lowerer<'a> {
     /// Finalizes the program (runs the check-splitting post-pass on each fn) and
     /// moves the type arena out of `typed` into the shipped program.
     fn finish(self) -> MirProgram {
+        // Build the tag -> name reverse map so the VM can implement `@errorName`
+        // and print an error that escapes `main`.
+        let err_names: HashMap<ErrTag, String> = self
+            .err_tags
+            .iter()
+            .map(|(name, &tag)| (tag, name.clone()))
+            .collect();
         let mut funcs = self.funcs;
         for f in &mut funcs {
             // Drop unreachable join blocks left by lowering (e.g. a labeled block
@@ -244,6 +251,7 @@ impl<'a> Lowerer<'a> {
             consts: self.consts,
             diagnostics: self.diagnostics,
             mode: self.mode,
+            err_names,
         }
     }
 

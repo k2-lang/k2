@@ -26,6 +26,8 @@
 //! k2c check <file.k2>        # type-check and print per-declaration signatures
 //! k2c mir <file.k2>          # lower to MIR and print the dump (Debug mode)
 //! k2c mir --release-fast <f> # lower with safety checks stripped
+//! k2c run <file.k2>          # compile to bytecode and execute `main` (Debug mode)
+//! k2c run --release-fast <f> # execute with safety checks stripped
 //! k2c help                   # print usage
 //! k2c version                # print the version
 //! ```
@@ -52,6 +54,7 @@ use k2_resolve::{
 };
 use k2_syntax::{SourceFile, Span};
 use k2_types::{check_file, dump_signatures, dump_types, Severity as TypeSeverity};
+use k2_vm::{run_program, RunArgs};
 
 /// Program name used in diagnostics and the usage text.
 const PROG: &str = "k2c";
@@ -92,6 +95,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "resolve" => cmd_resolve(rest),
         "check" => cmd_check(rest),
         "mir" => cmd_mir(rest),
+        "run" => cmd_run(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -799,6 +803,167 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// The `run` subcommand: parse, resolve, type-check, lower to MIR, compile, and
+/// execute `main(sys)` on the bytecode VM. The front-end gating mirrors `mir`
+/// (parse/resolve/type/lower errors are printed to stderr and gate execution),
+/// then the program runs and its exit code is propagated to the process.
+///
+/// Build mode is selected with `--release-fast` (drop safety checks),
+/// `--release-safe`, or `--debug` (the default, checks on). The default `Debug`
+/// mode means a runtime safety violation (index OOB, integer overflow,
+/// division by zero) traps as a clean panic — a `panic:` line on stderr and a
+/// nonzero exit — never an uncontrolled Rust panic.
+fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<&str> = None;
+    let mut mode = BuildMode::Debug;
+    // Arguments after the path are reserved for the program's own argv.
+    let mut forwarded: Vec<String> = Vec::new();
+    let mut seen_path = false;
+    for arg in args {
+        if seen_path {
+            forwarded.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--release-fast" => mode = BuildMode::ReleaseFast,
+            "--release-safe" => mode = BuildMode::ReleaseSafe,
+            "--debug" => mode = BuildMode::Debug,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `run` flag `{other}`"));
+            }
+            other => {
+                path = Some(other);
+                seen_path = true;
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| "`run` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
+
+    let (source, label) = read_source(path)?;
+    let pres = parse(&source);
+
+    // Parse errors gate execution: report them and stop, like `mir`.
+    if !pres.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &pres.diagnostics {
+            if diag.severity == Severity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot run {label}: it has parse errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Resolution errors gate execution.
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &resolved.diagnostics {
+            if diag.severity == ResolveSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot run {label}: it has resolution errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Type errors gate execution.
+    let typed = check_file(&pres.file, &resolved);
+    if !typed.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &typed.diagnostics {
+            if diag.severity == TypeSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot run {label}: it has type errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Lower to MIR under the chosen build mode.
+    let prog = match lower_program(&pres.file, &resolved, typed, mode) {
+        Ok(p) => p,
+        Err(diags) => {
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            for diag in &diags {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+            let _ = writeln!(err, "error: cannot run {label}: lowering failed");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    // Error-severity lowering/leak diagnostics gate execution; warnings are
+    // printed but do not stop the run.
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    for diag in &prog.diagnostics {
+        if diag.severity == MirSeverity::Error {
+            error_count += 1;
+        }
+        let sev = match diag.severity {
+            MirSeverity::Error => "error",
+            MirSeverity::Warning => "warning",
+        };
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {sev}: {}",
+            diag.span.line, diag.span.col, diag.message
+        );
+    }
+    drop(err);
+    if error_count > 0 {
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot run {label}: lowering had errors"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Verify well-formedness before execution (debug guard); a malformed MIR is
+    // an internal bug, reported rather than executed.
+    let problems = prog.verify();
+    if !problems.is_empty() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for p in &problems {
+            let _ = writeln!(err, "error: malformed MIR: {}", p.message);
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Execute `main`; the VM streams program output and propagates the exit code.
+    Ok(run_program(
+        &prog,
+        RunArgs {
+            mode,
+            argv: forwarded,
+        },
+    ))
+}
+
 /// The filesystem [`FileLoader`] used by `resolve --modules`: it reads a `.k2`
 /// file from disk and parses it, mapping I/O and parse failures to the loader's
 /// error type. The driver is the only crate that performs filesystem I/O for
@@ -922,6 +1087,8 @@ fn print_usage() {
          \x20   check --uses <f>     Also dump the per-occurrence type table.\n\
          \x20   mir <file.k2>        Lower to MIR (Debug mode) and print the dump.\n\
          \x20   mir --release-fast <f>  Lower with safety checks stripped.\n\
+         \x20   run <file.k2>        Compile to bytecode and execute `main` (Debug mode).\n\
+         \x20   run --release-fast <f>  Execute with safety checks stripped.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\
@@ -944,6 +1111,11 @@ fn print_usage() {
          \x20   --debug              Lower in Debug mode with safety checks (the default).\n\
          \x20   --release-safe       Lower in ReleaseSafe mode (safety checks kept).\n\
          \x20   --release-fast       Lower in ReleaseFast mode (safety checks stripped).\n\
-         \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n"
+         \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n\
+         \n\
+         RUN FLAGS:\n\
+         \x20   --debug              Execute with safety checks (the default).\n\
+         \x20   --release-safe       Execute in ReleaseSafe mode (safety checks kept).\n\
+         \x20   --release-fast       Execute in ReleaseFast mode (safety checks stripped).\n"
     );
 }

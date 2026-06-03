@@ -753,6 +753,15 @@ impl FnBuilder<'_, '_> {
                 Some(MemberRes::Variant(idx)) => Some(idx as i128),
                 _ => None,
             },
+            // A negative literal parses as `-(<literal>)`; recurse on the operand
+            // and negate. Without this a label like `-5` (and a range endpoint
+            // like `-100...-1`) yields `None` and the whole arm/range is silently
+            // dropped from the generated `Switch`, never matching.
+            Expr::Unary {
+                op: AstUnOp::Neg,
+                operand,
+                ..
+            } => self.switch_item_value(operand, scrut_ty).map(|v| -v),
             _ => {
                 let _ = scrut_ty;
                 None

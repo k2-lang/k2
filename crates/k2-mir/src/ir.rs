@@ -206,6 +206,10 @@ pub struct MirProgram {
     pub diagnostics: Vec<Diagnostic>,
     /// The build mode this program was lowered under (drives check presence).
     pub mode: BuildMode,
+    /// The error-tag -> name map, interned during lowering. The v0.8 VM uses it
+    /// to implement `@errorName` and to print the name of an error that escapes
+    /// `main` (per the hello.k2 docs). Empty for a program with no error values.
+    pub err_names: HashMap<ErrTag, String>,
 }
 
 impl MirProgram {
@@ -835,6 +839,11 @@ pub enum Rvalue {
     MakeSlice {
         /// The data pointer.
         ptr: Operand,
+        /// The element offset to add to `ptr` (the sub-slice low bound `lo`; `0`
+        /// for a whole-array/whole-slice view). Carried explicitly because the IR
+        /// has no pointer-arithmetic rvalue, and a `base[lo..hi]` slice must start
+        /// at element `lo`, not at the base.
+        offset: Operand,
         /// The length.
         len: Operand,
         /// The slice type.
@@ -1024,6 +1033,17 @@ pub enum CheckKind {
         /// The divisor.
         b: Operand,
         /// The divisor's integer type (for the `b != 0` comparison).
+        ty: TypeId,
+    },
+    /// Signed `/` and `%` do not overflow: the result of `type-MIN / -1`
+    /// (mathematically `-MIN`, which does not fit the type) is rejected. The
+    /// failure case is exactly `a == type-MIN && b == -1`.
+    DivOverflow {
+        /// The dividend.
+        a: Operand,
+        /// The divisor.
+        b: Operand,
+        /// The operands' signed integer type.
         ty: TypeId,
     },
     /// Negating `MIN` of a signed type does not overflow.

@@ -190,6 +190,14 @@ fn fmt_check(arena: &TypeArena, c: &SafetyCheck) -> String {
         CheckKind::DivByZero { b, .. } => {
             format!("divzero_check {} != 0 else -> panic", fmt_operand(b))
         }
+        CheckKind::DivOverflow { a, b, ty } => {
+            format!(
+                "divoverflow_check {} / {} : {} else -> panic",
+                fmt_operand(a),
+                fmt_operand(b),
+                arena.fmt(*ty)
+            )
+        }
         CheckKind::NegOverflow { a, ty } => {
             format!(
                 "overflow_check neg {} : {} else -> panic",
