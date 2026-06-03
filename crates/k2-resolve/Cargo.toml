@@ -1,0 +1,17 @@
+[package]
+name = "k2-resolve"
+version = "0.1.0"
+edition = "2021"
+description = "Name resolution, scopes, and the module graph for k2 (the resolved HIR side-table)."
+license = "MIT OR Apache-2.0"
+
+# Standard library only, plus the sibling syntax crate by path. The resolver
+# defines its OWN diagnostic type (mirroring k2-parse) so it does not depend on
+# the parser — only the driver (k2c) wires parse -> resolve together. No
+# third-party dependencies, so the front-end builds fully offline.
+[dependencies]
+k2-syntax = { path = "../k2-syntax" }
+
+[dev-dependencies]
+# The corpus / integration tests parse real `.k2` sources before resolving them.
+k2-parse = { path = "../k2-parse" }

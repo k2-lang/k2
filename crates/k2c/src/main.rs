@@ -22,6 +22,7 @@
 //! k2c fmt --check <file.k2>  # exit nonzero if the file is not canonical
 //! k2c fmt --write <file.k2>  # rewrite the file in place in canonical form
 //! k2c ast <file.k2>          # dump the structured AST (S-expression)
+//! k2c resolve <file.k2>      # resolve names/scopes and print the scope tree
 //! k2c help                   # print usage
 //! k2c version                # print the version
 //! ```
@@ -36,10 +37,16 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+use std::path::Path;
+
 use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
 use k2_parse::{parse, to_sexpr, Severity};
-use k2_syntax::Span;
+use k2_resolve::{
+    dump_resolution, dump_scopes, resolve_file, resolve_module, FileLoader, LoadError,
+    ResolvedModule, Severity as ResolveSeverity,
+};
+use k2_syntax::{SourceFile, Span};
 
 /// Program name used in diagnostics and the usage text.
 const PROG: &str = "k2c";
@@ -77,6 +84,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "parse" => cmd_parse(rest),
         "fmt" => cmd_fmt(rest),
         "ast" => cmd_ast(rest),
+        "resolve" => cmd_resolve(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -323,6 +331,221 @@ fn cmd_ast(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// The `resolve` subcommand: parse the source, run name resolution, print each
+/// resolution diagnostic to stderr, and on success print a resolution summary
+/// (the scope tree by default, or the full uses table with `--uses`) to stdout.
+///
+/// Resolution requires a well-formed tree, so any *parse* error gates it: the
+/// parse diagnostics are printed and the process exits nonzero without resolving
+/// (mirroring `fmt`). With `--modules`, the multi-file module graph is built from
+/// the file on disk via a real filesystem loader, reporting import cycles and
+/// missing files across the project; `--modules` cannot read from stdin.
+///
+/// Exits `SUCCESS` iff there were zero resolution (and parse) errors.
+fn cmd_resolve(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<&str> = None;
+    let mut show_uses = false;
+    let mut quiet = false;
+    let mut modules = false;
+    for arg in args {
+        match arg.as_str() {
+            "--uses" => show_uses = true,
+            "--scopes" => {} // the default; accepted for explicitness
+            "--quiet" => quiet = true,
+            "--modules" => modules = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `resolve` flag `{other}`"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!(
+                        "`resolve` takes exactly one path; got extra `{other}`"
+                    ));
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| "`resolve` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
+    if modules && path == "-" {
+        return Err("cannot `resolve --modules` standard input".to_string());
+    }
+
+    let (source, label) = read_source(path)?;
+    let pres = parse(&source);
+
+    // Parse errors gate resolution: report them and stop, like `fmt`.
+    if !pres.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &pres.diagnostics {
+            if diag.severity == Severity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot resolve {label}: it has parse errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Resolve, either single-file or across the module graph.
+    if modules {
+        let rm = resolve_module(Path::new(path), &FsFileLoader);
+        finish_modules(&label, &rm, show_uses, quiet)
+    } else {
+        let r = resolve_file(&pres.file);
+        finish_single(&label, &r, show_uses, quiet)
+    }
+}
+
+/// Prints diagnostics + summary for a single-file resolution and returns the
+/// exit code.
+fn finish_single(
+    label: &str,
+    r: &k2_resolve::Resolved,
+    show_uses: bool,
+    quiet: bool,
+) -> Result<ExitCode, String> {
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    for diag in &r.diagnostics {
+        if diag.severity == ResolveSeverity::Error {
+            error_count += 1;
+        }
+        let sev = sev_word(diag.severity);
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {sev}: {}",
+            diag.span.line, diag.span.col, diag.message
+        );
+    }
+    drop(err);
+
+    if error_count == 0 && !quiet {
+        let dump = if show_uses {
+            dump_resolution(r)
+        } else {
+            dump_scopes(r)
+        };
+        print!("{dump}");
+    }
+    if quiet {
+        let _ = writeln!(
+            io::stderr(),
+            "# {} def(s), {} scope(s), {} diagnostic(s)",
+            r.defs.len(),
+            r.scopes.len(),
+            r.diagnostics.len()
+        );
+    }
+
+    if error_count == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// Prints diagnostics + summary for a multi-file module resolution.
+fn finish_modules(
+    label: &str,
+    rm: &ResolvedModule,
+    show_uses: bool,
+    quiet: bool,
+) -> Result<ExitCode, String> {
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    // Graph-level diagnostics first, then each module's own.
+    for diag in &rm.diagnostics {
+        if diag.severity == ResolveSeverity::Error {
+            error_count += 1;
+        }
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {}: {}",
+            diag.span.line,
+            diag.span.col,
+            sev_word(diag.severity),
+            diag.message
+        );
+    }
+    for m in &rm.modules {
+        for diag in &m.resolved.diagnostics {
+            if diag.severity == ResolveSeverity::Error {
+                error_count += 1;
+            }
+            let _ = writeln!(
+                err,
+                "{}:{}:{}: {}: {}",
+                m.path.display(),
+                diag.span.line,
+                diag.span.col,
+                sev_word(diag.severity),
+                diag.message
+            );
+        }
+    }
+    drop(err);
+
+    if error_count == 0 && !quiet {
+        if let Some(root) = rm.root() {
+            let dump = if show_uses {
+                dump_resolution(root)
+            } else {
+                dump_scopes(root)
+            };
+            print!("{dump}");
+        }
+    }
+    if quiet {
+        let _ = writeln!(
+            io::stderr(),
+            "# {} module(s), {} graph diagnostic(s)",
+            rm.modules.len(),
+            rm.diagnostics.len()
+        );
+    }
+
+    if error_count == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// The lowercase severity word used in the `label:line:col: sev: msg` format,
+/// for resolution diagnostics.
+fn sev_word(sev: ResolveSeverity) -> &'static str {
+    match sev {
+        ResolveSeverity::Error => "error",
+        ResolveSeverity::Warning => "warning",
+    }
+}
+
+/// The filesystem [`FileLoader`] used by `resolve --modules`: it reads a `.k2`
+/// file from disk and parses it, mapping I/O and parse failures to the loader's
+/// error type. The driver is the only crate that performs filesystem I/O for
+/// resolution.
+struct FsFileLoader;
+
+impl FileLoader for FsFileLoader {
+    fn load(&self, path: &Path) -> Result<SourceFile, LoadError> {
+        let src = std::fs::read_to_string(path).map_err(|_| LoadError::Missing)?;
+        let pres = parse(&src);
+        if pres.is_ok() {
+            Ok(pres.file)
+        } else {
+            Err(LoadError::ParseFailed)
+        }
+    }
+}
+
 /// Reads the source either from `-` (standard input) or from a file path.
 /// Returns the source text together with a human-readable label for headers.
 fn read_source(path: &str) -> Result<(String, String), String> {
@@ -421,11 +644,20 @@ fn print_usage() {
          \x20   fmt --write <file>   Rewrite the file in place in canonical form.\n\
          \x20   ast <file.k2>        Dump the structured AST (S-expression).\n\
          \x20   ast --spans <file>   Annotate AST nodes with @start..end spans.\n\
+         \x20   resolve <file.k2>    Resolve names/scopes; print the scope tree (or diagnostics).\n\
+         \x20   resolve --uses <f>   Also dump the per-occurrence resolution table.\n\
+         \x20   resolve --modules <f>  Build the module graph across path imports; report cycles.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\
          PARSE FLAGS:\n\
          \x20   --quiet              Suppress the tree; print only diagnostics + a summary.\n\
-         \x20   --spans              Annotate each S-expr node with its @start..end span.\n"
+         \x20   --spans              Annotate each S-expr node with its @start..end span.\n\
+         \n\
+         RESOLVE FLAGS:\n\
+         \x20   --scopes             Print the scope/definition tree (the default).\n\
+         \x20   --uses               Also print the resolution of every identifier occurrence.\n\
+         \x20   --modules            Resolve across `.k2` path imports; report cycles/missing files.\n\
+         \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n"
     );
 }

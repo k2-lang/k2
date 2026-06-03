@@ -220,3 +220,78 @@ fn ast_stdin_dash() {
     assert!(ok);
     assert!(stdout.contains("(const x"), "got: {stdout}");
 }
+
+// ---- `resolve` subcommand --------------------------------------------------
+
+#[test]
+fn resolve_example_exits_zero_and_dumps_scopes() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c().arg("resolve").arg(&path).output().unwrap();
+    assert!(out.status.success(), "expected success exit for hello.k2");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("(scope #0"),
+        "dump should start with `(scope #0`, got: {}",
+        &stdout[..stdout.len().min(40)]
+    );
+}
+
+#[test]
+fn resolve_all_examples_exit_zero() {
+    for entry in std::fs::read_dir(examples_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("k2") {
+            continue;
+        }
+        let out = k2c().arg("resolve").arg(&path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "`k2c resolve {}` exited nonzero; stderr:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn resolve_uses_flag_dumps_uses_table() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c()
+        .arg("resolve")
+        .arg("--uses")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("(uses"),
+        "expected a uses block, got: {stdout}"
+    );
+    assert!(stdout.contains("(modules"), "expected a modules block");
+}
+
+#[test]
+fn resolve_undeclared_exits_nonzero() {
+    let (ok, stdout, stderr) = run_with_stdin(&["resolve", "-"], b"fn f() i32 { return zzz; }\n");
+    assert!(!ok, "an undeclared identifier must fail resolution");
+    assert!(
+        stderr.contains("use of undeclared identifier `zzz`"),
+        "stderr should name the undeclared identifier, got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no scope dump should be printed on error, got: {stdout}"
+    );
+}
+
+#[test]
+fn resolve_parse_error_exits_nonzero_no_stdout() {
+    let (ok, stdout, stderr) = run_with_stdin(&["resolve", "-"], b"fn f( {\n");
+    assert!(!ok, "a parse error must gate resolution");
+    assert!(stdout.is_empty(), "no dump on parse error, got: {stdout}");
+    assert!(
+        stderr.contains("it has parse errors"),
+        "stderr should explain the parse-error gate, got: {stderr}"
+    );
+}
