@@ -295,3 +295,102 @@ fn resolve_parse_error_exits_nonzero_no_stdout() {
         "stderr should explain the parse-error gate, got: {stderr}"
     );
 }
+
+// ---- `check` subcommand ----------------------------------------------------
+
+#[test]
+fn check_example_exits_zero_and_prints_signatures() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c().arg("check").arg(&path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "expected success exit for hello.k2; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("`main` : fn(*System) !void"),
+        "expected a signature for main, got: {stdout}"
+    );
+}
+
+#[test]
+fn check_all_examples_exit_zero() {
+    for entry in std::fs::read_dir(examples_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("k2") {
+            continue;
+        }
+        let out = k2c().arg("check").arg(&path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "`k2c check {}` exited nonzero; stderr:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn check_uses_flag_dumps_type_table() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c()
+        .arg("check")
+        .arg("--uses")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("(types"),
+        "expected a types block, got: {stdout}"
+    );
+}
+
+#[test]
+fn check_type_error_exits_nonzero() {
+    let (ok, stdout, stderr) =
+        run_with_stdin(&["check", "-"], b"fn f() void { const x: u8 = true; }\n");
+    assert!(!ok, "a type error must make check exit nonzero");
+    assert!(
+        stderr.contains("error:") && stderr.contains("expected `u8`, found `bool`"),
+        "stderr should carry the type diagnostic, got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no signature dump should be printed on error, got: {stdout}"
+    );
+}
+
+#[test]
+fn check_bad_assign_is_rejected() {
+    // The milestone's sanity check: a deliberately wrong program is rejected.
+    let (ok, _stdout, _stderr) = run_with_stdin(
+        &["check", "-"],
+        b"fn f() void { const x: u8 = true; _ = x; }\n",
+    );
+    assert!(!ok, "the bad assignment must be rejected");
+}
+
+#[test]
+fn check_parse_error_gates_check() {
+    let (ok, stdout, stderr) = run_with_stdin(&["check", "-"], b"fn f( {\n");
+    assert!(!ok, "a parse error must gate type-checking");
+    assert!(stdout.is_empty(), "no dump on parse error, got: {stdout}");
+    assert!(
+        stderr.contains("it has parse errors"),
+        "stderr should explain the parse-error gate, got: {stderr}"
+    );
+}
+
+#[test]
+fn check_resolve_error_gates_check() {
+    let (ok, stdout, stderr) = run_with_stdin(&["check", "-"], b"fn f() i32 { return zzz; }\n");
+    assert!(!ok, "a resolution error must gate type-checking");
+    assert!(stdout.is_empty(), "no dump on resolve error, got: {stdout}");
+    assert!(
+        stderr.contains("use of undeclared identifier `zzz`"),
+        "stderr should carry the resolution diagnostic, got: {stderr}"
+    );
+}

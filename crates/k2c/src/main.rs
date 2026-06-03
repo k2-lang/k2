@@ -23,6 +23,7 @@
 //! k2c fmt --write <file.k2>  # rewrite the file in place in canonical form
 //! k2c ast <file.k2>          # dump the structured AST (S-expression)
 //! k2c resolve <file.k2>      # resolve names/scopes and print the scope tree
+//! k2c check <file.k2>        # type-check and print per-declaration signatures
 //! k2c help                   # print usage
 //! k2c version                # print the version
 //! ```
@@ -47,6 +48,7 @@ use k2_resolve::{
     ResolvedModule, Severity as ResolveSeverity,
 };
 use k2_syntax::{SourceFile, Span};
+use k2_types::{check_file, dump_signatures, dump_types, Severity as TypeSeverity};
 
 /// Program name used in diagnostics and the usage text.
 const PROG: &str = "k2c";
@@ -85,6 +87,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "fmt" => cmd_fmt(rest),
         "ast" => cmd_ast(rest),
         "resolve" => cmd_resolve(rest),
+        "check" => cmd_check(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -528,6 +531,123 @@ fn sev_word(sev: ResolveSeverity) -> &'static str {
     }
 }
 
+/// The `check` subcommand: parse the source, resolve names, type-check, print
+/// each type diagnostic to stderr, and on success print a per-decl signature
+/// dump (the default), the full per-occurrence type dump (`--uses`), or only a
+/// one-line summary (`--quiet`) to stdout.
+///
+/// Both parse errors and resolution errors gate type-checking: they are printed
+/// and the process exits nonzero without checking (mirroring `resolve`). Exits
+/// `SUCCESS` iff there were zero parse, resolution, and type errors.
+fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
+    let mut path: Option<&str> = None;
+    let mut show_uses = false;
+    let mut quiet = false;
+    for arg in args {
+        match arg.as_str() {
+            "--uses" => show_uses = true,
+            "--signatures" => {} // the default; accepted for explicitness
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `check` flag `{other}`"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!(
+                        "`check` takes exactly one path; got extra `{other}`"
+                    ));
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| "`check` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
+
+    let (source, label) = read_source(path)?;
+    let pres = parse(&source);
+
+    // Parse errors gate type-checking: report them and stop, like `resolve`.
+    if !pres.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &pres.diagnostics {
+            if diag.severity == Severity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot check {label}: it has parse errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Resolution errors also gate type-checking.
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &resolved.diagnostics {
+            if diag.severity == ResolveSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot check {label}: it has resolution errors");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let typed = check_file(&pres.file, &resolved);
+
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut error_count = 0usize;
+    for diag in &typed.diagnostics {
+        if diag.severity == TypeSeverity::Error {
+            error_count += 1;
+        }
+        let sev = match diag.severity {
+            TypeSeverity::Error => "error",
+            TypeSeverity::Warning => "warning",
+        };
+        let _ = writeln!(
+            err,
+            "{label}:{}:{}: {sev}: {}",
+            diag.span.line, diag.span.col, diag.message
+        );
+    }
+    drop(err);
+
+    if error_count == 0 && !quiet {
+        let dump = if show_uses {
+            dump_types(&typed, &resolved)
+        } else {
+            dump_signatures(&typed, &resolved)
+        };
+        print!("{dump}");
+    }
+    if quiet {
+        let _ = writeln!(
+            io::stderr(),
+            "# {} decl(s), {} type(s), {} diagnostic(s)",
+            typed.binding_types.len(),
+            typed.types.len(),
+            typed.diagnostics.len()
+        );
+    }
+
+    if error_count == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
+}
+
 /// The filesystem [`FileLoader`] used by `resolve --modules`: it reads a `.k2`
 /// file from disk and parses it, mapping I/O and parse failures to the loader's
 /// error type. The driver is the only crate that performs filesystem I/O for
@@ -647,6 +767,8 @@ fn print_usage() {
          \x20   resolve <file.k2>    Resolve names/scopes; print the scope tree (or diagnostics).\n\
          \x20   resolve --uses <f>   Also dump the per-occurrence resolution table.\n\
          \x20   resolve --modules <f>  Build the module graph across path imports; report cycles.\n\
+         \x20   check <file.k2>      Type-check a file; print per-decl signatures (or diagnostics).\n\
+         \x20   check --uses <f>     Also dump the per-occurrence type table.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\
@@ -658,6 +780,11 @@ fn print_usage() {
          \x20   --scopes             Print the scope/definition tree (the default).\n\
          \x20   --uses               Also print the resolution of every identifier occurrence.\n\
          \x20   --modules            Resolve across `.k2` path imports; report cycles/missing files.\n\
+         \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n\
+         \n\
+         CHECK FLAGS:\n\
+         \x20   --signatures         Print one signature/type per declaration (the default).\n\
+         \x20   --uses               Also print the inferred type of every expression occurrence.\n\
          \x20   --quiet              Suppress the dump; print only diagnostics + a summary.\n"
     );
 }

@@ -15,6 +15,7 @@ members = [
     "crates/k2-syntax",
     "crates/k2-parse",
     "crates/k2-resolve",
+    "crates/k2-types",
     "crates/k2-fmt",
     "crates/k2c",
 ]

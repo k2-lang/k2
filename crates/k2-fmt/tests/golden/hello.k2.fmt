@@ -28,7 +28,7 @@ pub fn main(sys: *System) !void {
 
     // Format placeholders, illustrated. The tuple positionally fills each `{}`.
     const star = "Sol";
-    const joules: u64 = 384_600_000_000_000_000_000_000_000;
+    const joules: u128 = 384_600_000_000_000_000_000_000_000;
     try out.print("k2 directs every joule of {s}: ~{d} W.\n", .{ star, joules });
 
     // stderr is a separate writer on the same capability — also explicit,

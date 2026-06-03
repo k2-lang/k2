@@ -18,4 +18,5 @@ k2-lexer = { path = "../k2-lexer" }
 k2-syntax = { path = "../k2-syntax" }
 k2-parse = { path = "../k2-parse" }
 k2-resolve = { path = "../k2-resolve" }
+k2-types = { path = "../k2-types" }
 k2-fmt = { path = "../k2-fmt" }

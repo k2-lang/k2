@@ -1,0 +1,24 @@
+# k2-types — the type system and bidirectional checker (milestone v0.5).
+#
+# A leaf crate over `k2-syntax` (the AST) and `k2-resolve` (the resolved
+# side-table). It consumes a parsed-and-resolved file and produces a `Typed`
+# result: a type per occurrence, function signatures, resolved members, and
+# diagnostics. Like every other front-end crate it depends on the Rust standard
+# library ONLY — zero third-party crates, so the toolchain builds fully offline.
+[package]
+name = "k2-types"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Type representation and bidirectional type checker for the k2 language"
+
+[lib]
+name = "k2_types"
+path = "src/lib.rs"
+
+[dependencies]
+k2-syntax = { path = "../k2-syntax" }
+k2-resolve = { path = "../k2-resolve" }
+
+[dev-dependencies]
+k2-parse = { path = "../k2-parse" }
