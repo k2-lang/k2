@@ -319,6 +319,46 @@ impl fmt::Display for Token {
     }
 }
 
+/// The kind of a retained [`Trivia`] token: a `//`/`////…` line comment, or a
+/// `///` doc comment.
+///
+/// Both are recovered verbatim by [`tokenize_with_trivia`]; the distinction lets
+/// tooling (notably the formatter) treat doc comments — which the parser also
+/// attaches to AST nodes — separately from ordinary line comments, which are
+/// invisible to the parser and must be re-attached from this side channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriviaKind {
+    /// A `//` or `////…` line comment (everything that is *not* exactly `///`).
+    LineComment,
+    /// A `///` doc comment (exactly three slashes).
+    DocComment,
+}
+
+/// A retained comment, recovered with absolute scalar offsets by
+/// [`tokenize_with_trivia`].
+///
+/// Unlike [`Token`], a `Trivia` is never produced by the parser-facing
+/// [`tokenize`] path: it exists purely so comment-preserving tooling can recover
+/// the `//` line comments that the normal lexer discards (and to see doc
+/// comments through the same uniform lens). Its `start`/`end` are scalar indices
+/// directly comparable with a parsed node's [`Span`](crate::Token) offsets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trivia {
+    /// Whether this is a line comment or a doc comment.
+    pub kind: TriviaKind,
+    /// The verbatim comment text, including the leading `//`/`///`, with the
+    /// trailing newline excluded.
+    pub text: String,
+    /// Scalar offset of the comment's first character.
+    pub start: u32,
+    /// Scalar offset just past the comment's last character.
+    pub end: u32,
+    /// 1-based line of `start`.
+    pub line: u32,
+    /// 1-based column of `start`.
+    pub col: u32,
+}
+
 /// The lexer state machine over a decoded `.k2` source string.
 ///
 /// Construct one with [`Lexer::new`] and drive it either by calling
@@ -339,6 +379,12 @@ pub struct Lexer {
     /// Set once the final `Eof` token has been emitted, so the `Iterator`
     /// terminates rather than yielding `Eof` forever.
     done: bool,
+    /// Optional side channel for retained trivia. `None` on the fast
+    /// parser-facing path ([`tokenize`]); `Some` only when driven by
+    /// [`tokenize_with_trivia`], in which case every `//`/`///` comment is
+    /// recorded here. Keeping it `None` by default guarantees [`tokenize`] is
+    /// byte-for-byte unchanged.
+    trivia: Option<Vec<Trivia>>,
 }
 
 impl Lexer {
@@ -355,6 +401,7 @@ impl Lexer {
             line: 1,
             col: 1,
             done: false,
+            trivia: None,
         }
     }
 
@@ -421,17 +468,30 @@ impl Lexer {
     }
 
     /// Consumes a `//` (or `////…`) line comment to end of line; produces no
-    /// token.
+    /// token. When a trivia sink is active (the [`tokenize_with_trivia`] path),
+    /// the comment is recorded there with absolute scalar offsets so it is not
+    /// lost; on the fast [`tokenize`] path the sink is `None` and the comment is
+    /// simply discarded as before.
     fn consume_line_comment(&mut self) {
+        let (line, col) = (self.line, self.col);
+        let start = self.pos;
         while let Some(c) = self.peek() {
             if c == '\n' {
                 break;
             }
             self.bump();
         }
+        if self.trivia.is_some() {
+            let text = self.slice(start, self.pos);
+            self.record_trivia(TriviaKind::LineComment, text, start, line, col);
+        }
     }
 
-    /// Lexes a `///` doc comment (retained) to end of line.
+    /// Lexes a `///` doc comment (retained as a [`Token`]) to end of line. When
+    /// a trivia sink is active it ALSO records the doc comment as [`Trivia`], so
+    /// comment-preserving tooling sees doc and line comments through one lens;
+    /// the returned token is identical regardless of the sink, keeping
+    /// [`tokenize`] and the parser undisturbed.
     fn lex_doc_comment(&mut self) -> Token {
         let (line, col) = (self.line, self.col);
         let start = self.pos;
@@ -441,12 +501,28 @@ impl Lexer {
             }
             self.bump();
         }
-        Token::new(
-            TokenKind::DocComment,
-            self.slice(start, self.pos),
-            line,
-            col,
-        )
+        let text = self.slice(start, self.pos);
+        if self.trivia.is_some() {
+            self.record_trivia(TriviaKind::DocComment, text.clone(), start, line, col);
+        }
+        Token::new(TokenKind::DocComment, text, line, col)
+    }
+
+    /// Pushes one retained comment into the trivia sink. Only called when the
+    /// sink is `Some` (see [`consume_line_comment`]/[`lex_doc_comment`]); the
+    /// `end` offset is the current cursor position (end of the comment line, the
+    /// newline excluded).
+    fn record_trivia(&mut self, kind: TriviaKind, text: String, start: usize, line: u32, col: u32) {
+        if let Some(sink) = self.trivia.as_mut() {
+            sink.push(Trivia {
+                kind,
+                text,
+                start: start as u32,
+                end: self.pos as u32,
+                line,
+                col,
+            });
+        }
     }
 
     // ---- public driver ---------------------------------------------------
@@ -925,6 +1001,48 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     Lexer::new(src).collect()
 }
 
+/// Tokenizes `src` exactly like [`tokenize`] *and* returns every retained
+/// comment — both `//`/`////…` line comments and `///` doc comments — as
+/// positioned [`Trivia`], with absolute scalar offsets.
+///
+/// The returned `Vec<Token>` is **byte-for-byte identical** to `tokenize(src)`:
+/// doc comments still appear as `DocComment` tokens and line comments still
+/// produce no token, so the parser (which consumes the token vector) is wholly
+/// undisturbed. The `Vec<Trivia>` is the new, additive output, sorted by
+/// `start`, that comment-preserving tooling (the formatter) uses to recover the
+/// line comments the AST never sees.
+///
+/// ```
+/// use k2_lexer::{tokenize, tokenize_with_trivia, TriviaKind};
+///
+/// let src = "// lead\nconst a = 1; // trail\n/// doc\nconst b = 2;\n";
+/// let (toks, trivia) = tokenize_with_trivia(src);
+/// // The token stream is unchanged from the parser-facing path.
+/// assert_eq!(toks, tokenize(src));
+/// // Every comment is recovered, in source order.
+/// assert_eq!(trivia.len(), 3);
+/// assert_eq!(trivia[0].kind, TriviaKind::LineComment);
+/// assert_eq!(trivia[0].text, "// lead");
+/// assert_eq!(trivia[2].kind, TriviaKind::DocComment);
+/// assert_eq!(trivia[2].text, "/// doc");
+/// ```
+pub fn tokenize_with_trivia(src: &str) -> (Vec<Token>, Vec<Trivia>) {
+    let mut lexer = Lexer::new(src);
+    lexer.trivia = Some(Vec::new());
+    let mut tokens = Vec::new();
+    loop {
+        let tok = lexer.next_token();
+        let is_eof = tok.kind == TokenKind::Eof;
+        tokens.push(tok);
+        if is_eof {
+            break;
+        }
+    }
+    // The sink was installed above, so this `unwrap` is infallible.
+    let trivia = lexer.trivia.take().unwrap_or_default();
+    (tokens, trivia)
+}
+
 // =========================================================================
 //  Tests
 // =========================================================================
@@ -1162,6 +1280,68 @@ mod tests {
         assert!(ks.contains(&TokenKind::KwFn));
         assert!(ks.contains(&TokenKind::Bang)); // the `!` of `!void`
         assert!(!ks.contains(&TokenKind::DotStar)); // none in this src
+    }
+
+    #[test]
+    fn tokenize_with_trivia_matches_tokenize_and_recovers_comments() {
+        // The token vector must be byte-for-byte identical to the parser-facing
+        // `tokenize`, and every comment (line + doc, including `////`) recovered.
+        let src = "// banner\n\
+                   //// also a line comment\n\
+                   /// doc for a\n\
+                   const a = 1; // trailing\n";
+        let (toks, trivia) = tokenize_with_trivia(src);
+        assert_eq!(toks, tokenize(src), "token streams must be identical");
+
+        let texts: Vec<&str> = trivia.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "// banner",
+                "//// also a line comment",
+                "/// doc for a",
+                "// trailing"
+            ]
+        );
+        let kinds: Vec<TriviaKind> = trivia.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TriviaKind::LineComment,
+                TriviaKind::LineComment,
+                TriviaKind::DocComment,
+                TriviaKind::LineComment,
+            ]
+        );
+        // Offsets are scalar indices: the first comment starts at 0 and ends just
+        // before its newline.
+        assert_eq!((trivia[0].start, trivia[0].end), (0, 9));
+        assert_eq!((trivia[0].line, trivia[0].col), (1, 1));
+        // The trailing comment is on the `const a = 1;` line, after the code.
+        let trailing = trivia.last().unwrap();
+        assert_eq!(trailing.text, "// trailing");
+        assert_eq!(trailing.line, 4);
+        assert!(trailing.col > 1, "trailing comment is not at column 1");
+    }
+
+    #[test]
+    fn tokenize_with_trivia_offsets_round_trip_through_source() {
+        // Each recovered comment's [start, end) slice of the source equals its
+        // text, proving the offsets are correct scalar indices.
+        let src = "const x = 1;\nconst y = 2; // why\n/// doc\nconst z = 3;\n";
+        let (_toks, trivia) = tokenize_with_trivia(src);
+        let chars: Vec<char> = src.chars().collect();
+        for t in &trivia {
+            let slice: String = chars[t.start as usize..t.end as usize].iter().collect();
+            assert_eq!(slice, t.text, "trivia text must match its source slice");
+        }
+    }
+
+    #[test]
+    fn tokenize_with_trivia_empty_when_no_comments() {
+        let (toks, trivia) = tokenize_with_trivia("const a = 1;\n");
+        assert_eq!(toks, tokenize("const a = 1;\n"));
+        assert!(trivia.is_empty());
     }
 
     #[test]

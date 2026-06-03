@@ -1,0 +1,133 @@
+// generic_list.k2 — A generic container via comptime.
+//
+// k2 has no separate generics grammar, no template syntax, and no macros.
+// Generics are ORDINARY FUNCTIONS that take `type` values at compile time and
+// return a `type`. `List(T)` below is exactly that: a function from a type to a
+// struct type, evaluated by the compiler and cached once per distinct `T`.
+//
+// This file demonstrates:
+//   * a generic type written as `fn List(comptime T: type) type`,
+//   * `@This()` to name the struct under construction,
+//   * the explicit-allocator / init+deinit discipline,
+//   * `realloc`-based growth with no hidden allocation,
+//   * monomorphization: List(u32) and List([]const u8) are distinct types.
+//
+// Run it:
+//   k2 run examples/generic_list.k2
+
+const std = @import("std");
+
+/// A growable list of `T`. `List` is a function from a type to a type, run at
+/// comptime — there is no special generics syntax, just a function that returns
+/// `type`. Two calls with the same `T` yield the SAME cached type, so two
+/// `List(u32)` values interoperate.
+pub fn List(comptime T: type) type {
+    return struct {
+        // `@This()` names the very struct being defined, so methods can refer
+        // to their own type before it has a name.
+        const Self = @This();
+
+        items: []T,
+        len: usize,
+        alloc: Allocator,
+
+        /// Create an empty list bound to `alloc`. The list stores its allocator
+        /// and will free with THAT SAME allocator in `deinit`. `&.{}` is the
+        /// canonical empty slice: zero length, no backing storage yet.
+        pub fn init(alloc: Allocator) Self {
+            return Self{ .items = &.{}, .len = 0, .alloc = alloc };
+        }
+
+        /// Release the backing storage. After `deinit` the list is dead; using
+        /// it is use-after-free (caught by the safety allocator in Debug).
+        pub fn deinit(self: *Self) void {
+            self.alloc.free(self.items);
+        }
+
+        /// Append `value`, growing the backing storage if needed. May fail with
+        /// OutOfMemory, which `try` propagates as a visible value — no hidden
+        /// allocation, no exception.
+        pub fn push(self: *Self, value: T) !void {
+            if (self.len == self.items.len) {
+                const new_cap = if (self.items.len == 0) 8 else self.items.len * 2;
+                // `realloc` returns a new slice; after it succeeds the old
+                // slice is invalid and only the returned one may be used.
+                self.items = try self.alloc.realloc(self.items, new_cap);
+            }
+            self.items[self.len] = value;
+            self.len += 1;
+        }
+
+        /// Bounds-checked random access. Absence is an optional (`?T`),
+        /// unwrapped with `orelse` or capture — never an accidental null.
+        pub fn get(self: *const Self, index: usize) ?T {
+            if (index >= self.len) return null;
+            return self.items[index];
+        }
+
+        /// A read-only view of the live elements. The slice is borrowed: the
+        /// caller may read it but must not free it — the list owns the storage.
+        pub fn slice(self: *const Self) []const T {
+            return self.items[0..self.len];
+        }
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // --- List of integers ----------------------------------------------------
+    // `List(u32)` is an ordinary call evaluated at comptime; it yields a
+    // concrete struct type used exactly like a hand-written one.
+    var nums = List(u32).init(sys.heap);
+    defer nums.deinit();
+
+    try nums.push(40);
+    try nums.push(2);
+    try nums.push(100);
+
+    var sum: u32 = 0;
+    for (nums.slice()) |n| sum += n;
+    try out.print("nums.len = {d}, sum = {d}\n", .{ nums.len, sum });
+
+    // `get` returns an optional; unwrap with `orelse` to supply a default.
+    const third = nums.get(2) orelse 0;
+    const missing = nums.get(99) orelse 0;
+    try out.print("nums[2] = {d}, nums[99] = {d}\n", .{ third, missing });
+
+    // --- The SAME List, instantiated over a different element type -----------
+    // `List([]const u8)` is a DISTINCT, separately-cached type. One generic
+    // definition, two monomorphized specializations, zero runtime cost.
+    var words = List([]const u8).init(sys.heap);
+    defer words.deinit();
+
+    try words.push("total");
+    try words.push("control,");
+    try words.push("zero waste");
+
+    for (words.slice(), 0..) |w, i| {
+        try out.print("words[{d}] = {s}\n", .{ i, w });
+    }
+}
+
+// Unit tests. `std.testing.allocator` detects leaks, so the paired `deinit`
+// below is checked for real: drop it and the test fails.
+test "push grows and get returns the right elements" {
+    var list = List(i32).init(std.testing.allocator);
+    defer list.deinit();
+
+    var i: i32 = 0;
+    while (i < 20) : (i += 1) {
+        try list.push(i * i);
+    }
+    try std.testing.expectEqual(@as(usize, 20), list.len);
+    try std.testing.expectEqual(@as(i32, 0), list.get(0).?);
+    try std.testing.expectEqual(@as(i32, 361), list.get(19).?);
+}
+
+test "get past the end yields null, not a panic" {
+    var list = List(u8).init(std.testing.allocator);
+    defer list.deinit();
+    try list.push(7);
+    try std.testing.expectEqual(@as(?u8, null), list.get(1));
+}

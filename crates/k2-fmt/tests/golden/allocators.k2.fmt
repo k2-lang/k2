@@ -1,0 +1,120 @@
+// allocators.k2 — Explicit allocation, defer cleanup, and leak detection.
+//
+// k2 never allocates heap memory on your behalf. Any code that touches the heap
+// takes an `Allocator` capability as a parameter, so a function's signature is
+// an honest account of whether it can allocate. This file demonstrates:
+//
+//   * obtaining the heap capability from `*System`,
+//   * a leak-checking GeneralPurposeAllocator as the program-wide root,
+//   * std.ArrayList, the canonical growable container, with init/deinit,
+//   * the `defer`/`errdefer` cleanup discipline (nothing runs implicitly),
+//   * ownership transfer across a function boundary.
+//
+// Run it:
+//   k2 run examples/allocators.k2
+
+const std = @import("std");
+
+/// Read `count` squares into a freshly allocated slice.
+///
+/// OWNERSHIP: the caller owns the returned slice and must free it with the SAME
+/// `alloc` that is passed here. The `Allocator` parameter is the visible proof
+/// that this function can allocate; without it, it could not.
+fn squares(alloc: Allocator, count: usize) ![]u64 {
+    const xs: []u64 = try alloc.alloc(u64, count);
+    // If any step below could fail AFTER this allocation, unwind it. On the
+    // success path the `errdefer` does NOT run and ownership passes to the
+    // caller. (Here nothing else fails, but writing the errdefer is the habit
+    // that keeps half-built resources from leaking when code later grows.)
+    errdefer alloc.free(xs);
+
+    for (xs, 0..) |*slot, i| {
+        const v: u64 = @intCast(i);
+        slot.* = v * v;
+    }
+    return xs; // success: ownership transfers, errdefer is skipped.
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // --- The program-wide allocator: a leak-checking GPA ---------------------
+    // In safe builds (Debug, ReleaseSafe) the GeneralPurposeAllocator tracks
+    // every allocation and reports leaks, double-frees, and use-after-free.
+    // In ReleaseFast those checks are stripped for raw speed.
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    // On shutdown the GPA reports any allocation that was never freed. We turn
+    // that into a loud, deterministic failure. Remove a `free`/`deinit` below
+    // and this panics in Debug — that is the leak detector at work.
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected at shutdown");
+    }
+    const alloc = gpa.allocator();
+
+    // --- Pattern 1: a raw slice, paired with its release ---------------------
+    // The idiom is to write the `defer` on the line immediately after the
+    // allocation, so the lifetime is obvious and local.
+    const buf: []u32 = try alloc.alloc(u32, 16);
+    defer alloc.free(buf);
+
+    for (buf, 0..) |*slot, i| {
+        slot.* = @intCast(i * i);
+    }
+    try out.print("buf[15] = {d}\n", .{buf[15]});
+
+    // --- Pattern 2: std.ArrayList, the growable container --------------------
+    // ArrayList stores the allocator it was handed and frees with that same
+    // allocator on deinit. init/deinit are paired with `defer` at creation.
+    var list = std.ArrayList(u32).init(alloc);
+    defer list.deinit();
+
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        // `append` may need to grow the backing storage, so it can fail with
+        // OutOfMemory; `try` propagates that error value (it is not an
+        // exception — it is a visible early return).
+        try list.append(i * 10);
+    }
+    try out.print("list.len = {d}, list.items[7] = {d}\n", .{ list.items.len, list.items[7] });
+
+    // --- Pattern 3: ownership transfer across a call -------------------------
+    // `squares` allocates and hands ownership back; we honor the contract with
+    // our own `defer`. Exactly one free runs for `data` on any path: never
+    // zero (a leak), never two (a double-free).
+    const data = squares(alloc, 8) catch |e| {
+        try out.print("alloc failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer alloc.free(data);
+
+    var total: u64 = 0;
+    for (data) |x| total += x;
+    try out.print("sum of first 8 squares = {d}\n", .{total});
+
+    // --- Pattern 4: an arena for bulk, single-shot cleanup -------------------
+    // An arena allocates from a backing allocator (here the GPA) and frees
+    // EVERYTHING at once on deinit — no per-object frees. Ideal for phase- or
+    // request-scoped work where many objects share one lifetime.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit(); // one defer reclaims the whole region.
+    const scratch = arena.allocator();
+
+    const a: []u8 = try scratch.alloc(u8, 32);
+    const b: []u8 = try scratch.alloc(u8, 64);
+    // No individual frees here: that is precisely the arena's contract.
+    a[0] = 1;
+    b[0] = 2;
+    try out.print("arena handed out {d} + {d} bytes\n", .{ a.len, b.len });
+}
+
+// A unit test exercising the same code. The test runner hands each test a
+// leak-detecting testing allocator, so a forgotten `free` fails the test
+// deterministically — the testing payoff of "no ambient authority".
+test "squares computes the first squares and the caller frees them" {
+    const alloc = std.testing.allocator;
+    const xs = try squares(alloc, 5);
+    defer alloc.free(xs);
+    try std.testing.expectEqual(@as(u64, 0), xs[0]);
+    try std.testing.expectEqual(@as(u64, 16), xs[4]);
+}

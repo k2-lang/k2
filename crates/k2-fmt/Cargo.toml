@@ -1,0 +1,20 @@
+# k2-fmt — the canonical source formatter for the k2 programming language.
+#
+# k2 — "Kardashev Type II": total control over the machine, with zero waste.
+#
+# This crate is the single source of truth for k2's canonical code style. It
+# parses `.k2` source through `k2-parse`, recovers every comment through the
+# additive `k2-lexer::tokenize_with_trivia` side channel, and re-emits the file
+# in one obvious, deterministic form. Like the rest of the front-end it depends
+# on the standard library ONLY, so the whole toolchain builds and runs offline.
+[package]
+name = "k2-fmt"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical source formatter for the k2 programming language."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+k2-lexer = { path = "../k2-lexer" }
+k2-syntax = { path = "../k2-syntax" }
+k2-parse = { path = "../k2-parse" }
