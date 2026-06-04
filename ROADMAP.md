@@ -213,22 +213,88 @@ Library-provided over OS threads; no built-in runtime. See
 
 ---
 
-## Beyond 0.13 — native codegen, FFI, self-hosting
+## v0.14 – v0.30 — native code, depth & maturity
 
-Deferred precisely because it breaks the pure-`std` rule or is better done once
-the language is complete:
+The `v0.x` line through v0.13 delivered a complete toolchain over a bytecode
+VM. The v0.14–v0.30 line takes k2 to a **native, production-grade** language —
+*still pure `std`, still offline*. The key realization: native code generation
+does **not** require Cranelift/LLVM. We emit our **own** machine code (x86-64
+then aarch64) and our **own** ELF object/executable writer, in pure Rust `std`,
+and the `*System` capabilities become raw Linux **syscalls** (no libc). Because
+CI runs on x86-64 Linux, every native milestone is verified by *actually
+running the emitted binary*.
 
-- **Native backends.** Lower the *same* MIR to native code via Cranelift (fast
-  debug builds) and LLVM (optimized release) — first-class cross-compilation
-  with `-Dtarget=<triple>`. Requires external crates.
-- **C interop & FFI.** `extern` / `export`, direct use of C headers, and
-  ABI-correct layout validated against `@sizeOf` / `@alignOf`.
-- **Self-hosting — an open question, deliberately.** k2's compiler is in Rust
-  by choice (a memory- and data-race-safe compiler, clean ADTs for the IRs).
-  Unlike Zig, **k2 does not commit to self-hosting.** We will evaluate a
-  self-hosted front-end as a proof of expressiveness, but the Rust
-  implementation stays the reference unless a self-hosted one clearly wins on
-  robustness. Correctness of the compiler outranks the romance of self-hosting.
+Legend: ✅ done · 🚧 in progress · ⬜ not started.
+
+| Version | Milestone | Track |
+| --- | --- | --- |
+| v0.14 | Native backend foundation (x86-64 encoder + ELF writer) | native |
+| v0.15 | Native backend: full language + register allocator + SysV ABI | native |
+| v0.16 | Native runtime: `*System` via raw Linux syscalls (no libc) | native |
+| v0.17 | Native optimization & ReleaseFast — native ≫ VM (benchmarked) | native |
+| v0.18 | aarch64 backend + cross-compilation (`-Dtarget`) | native |
+| v0.19 | C interop & FFI: `extern`/`export`, SysV calls, system linker | interop |
+| v0.20 | Diagnostics polish & error-return traces | quality |
+| v0.21 | Language depth: packed structs, bit-fields, `align`, `@Vector`/SIMD | language |
+| v0.22 | Stdlib data structures: HashMap, sort, bignum, allocators, Unicode | stdlib |
+| v0.23 | Stdlib OS/IO/net: `std.fs`, `std.os`, `std.time`, `std.net` (syscalls) | stdlib |
+| v0.24 | Test runner & coverage: `k2c test`, coverage, fuzz helpers | tooling |
+| v0.25 | Package manager: deps, lockfile, semver, offline-reproducible | tooling |
+| v0.26 | LSP completeness: references/rename/signature-help/semantic-tokens | tooling |
+| v0.27 | Debug info: DWARF in the native backend; gdb-debuggable | tooling |
+| v0.28 | Doc generator (`k2c doc`) + doc-tests | tooling |
+| v0.29 | Self-hosting groundwork: a k2-written front-end, run by the toolchain | self-host |
+| v0.30 | 1.0 readiness: conformance suite, stability pass, full integration | maturity |
+
+### Native track (v0.14–v0.18)
+
+- **v0.14** — Lower MIR → a low-level codegen IR; a hand-written **x86-64
+  instruction encoder** (machine-code bytes) and an **ELF64 writer**, all pure
+  `std`. `k2c run-native` / `k2c build-native` produce and run a real
+  Linux/x86-64 executable for a working subset (hello world prints via a
+  `write` syscall).
+- **v0.15** — Full language coverage to native (functions, calls, structs,
+  slices, optionals/error-unions, all control flow, the safety checks), a
+  **register allocator**, and the **System V AMD64** calling convention. The
+  examples compile to native and run.
+- **v0.16** — The `*System` capabilities as raw syscalls — `write`/`read`,
+  `mmap`-backed heap, `clock_gettime`, `getrandom`, `exit` — so native binaries
+  do real I/O with **no libc**. Differential: native output ≡ VM output.
+- **v0.17** — Machine-level optimization (peephole, better register allocation,
+  instruction selection) and a native **ReleaseFast**; a benchmark proving the
+  native binary is dramatically faster than the VM.
+- **v0.18** — A second backend (**aarch64**) sharing the codegen IR, and
+  first-class **cross-compilation** via `-Dtarget=<triple>`.
+
+### Breadth (v0.19–v0.28)
+
+C **FFI** (`extern`/`export`, ABI-correct layout, calling libc via the system
+linker); **rich diagnostics** with caret underlines, multi-span notes,
+suggestions, and `@errorReturnTrace`; **language depth** (packed structs,
+bit-fields, `align`, `@Vector`/SIMD); a **deeper stdlib** (HashMap, sort,
+bignum, page/stack allocators, Unicode, `std.fs`/`std.os`/`std.time`/`std.net`
+over syscalls); a project **test runner** with coverage; an offline-reproducible
+**package manager**; **LSP completeness** (references, rename, signature help,
+inlay hints, semantic tokens, code actions, cross-file); **DWARF** debug info;
+and a **documentation generator**.
+
+### Maturity (v0.29–v0.30)
+
+- **v0.29 — Self-hosting groundwork.** A k2-written lexer (and parser) compiled
+  and run by the toolchain and **differentially tested against the Rust
+  front-end** — a proof of expressiveness. (k2 still does not *commit* to full
+  self-hosting; the Rust implementation stays the reference until a self-hosted
+  one clearly wins on robustness.)
+- **v0.30 — 1.0 readiness.** A spec-**conformance** test suite, a stability
+  pass over the language surface, and a full integration sweep: every example
+  runs on **both** the VM and the native backend, the whole suite is green, and
+  the optimizer's wins are re-verified. This closes the extended roadmap.
+
+## Beyond 0.30
+
+Full multi-platform self-hosting, an LLVM-grade optimizing middle-end,
+Windows/macOS targets, an incremental/cached compilation cache, and a richer
+package ecosystem — pursued once the language surface is stable at 1.0.
 
 ## 1.0 goals
 
