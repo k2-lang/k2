@@ -21,6 +21,19 @@
 //! Returning `*T`/`[]T` that points at a stack local is a guaranteed dangling
 //! reference. A `&items[0]` whose root is a slice *parameter* (heap-backed view)
 //! is NOT flagged — only genuinely stack-rooted escapes are.
+//!
+//! ## Bulk-free allocators are exempt from Pattern A
+//!
+//! Not every allocator requires a per-allocation `free`. An [`ArenaAllocator`]
+//! frees everything at once on `deinit`, and a [`FixedBufferAllocator`] hands out
+//! windows of a *caller-owned* buffer that must never be freed individually — for
+//! both, omitting per-item frees is the documented, correct contract. Pattern A
+//! therefore exempts an allocation whose allocator value traces back to one of
+//! these bulk/no-op-free allocators (recognised by the allocator's struct type
+//! name, the `.allocator()`/`.init()` method the handle came through, or an arena
+//! handle that is later `deinit`'d in scope). The GPA / testing / page allocators
+//! — which *do* require explicit frees — are unaffected, so a genuine GPA leak is
+//! still flagged. See [`alloc_is_bulk_freed`].
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -28,6 +41,7 @@ use std::collections::HashSet;
 use crate::ir::*;
 use crate::lower::FnAllocInfo;
 use k2_syntax::Span;
+use k2_types::TypeId;
 
 /// Runs the conservative leak/escape analysis over the whole program, returning
 /// diagnostics (each an error). `alloc_info` carries the per-fn defer-release and
@@ -39,15 +53,20 @@ pub(crate) fn analyze(
     let mut diags = Vec::new();
     for func in &prog.funcs {
         let info = alloc_info.get(&func.id).cloned().unwrap_or_default();
-        analyze_fn(func, &info, &mut diags);
+        analyze_fn(prog, func, &info, &mut diags);
     }
     diags
 }
 
 /// Analyzes one function for the two flagged patterns.
-fn analyze_fn(func: &MirFunction, info: &FnAllocInfo, diags: &mut Vec<Diagnostic>) {
+fn analyze_fn(
+    prog: &MirProgram,
+    func: &MirFunction,
+    info: &FnAllocInfo,
+    diags: &mut Vec<Diagnostic>,
+) {
     pattern_b_escape(func, diags);
-    pattern_a_missing_free(func, info, diags);
+    pattern_a_missing_free(prog, func, info, diags);
 }
 
 // =========================================================================
@@ -190,7 +209,12 @@ fn collect_rvalue_locals(rv: &Rvalue, set: &mut HashSet<LocalId>) {
 
 /// Flags a local assigned from an allocating intrinsic that is never released
 /// and never transferred, in a loop-free function.
-fn pattern_a_missing_free(func: &MirFunction, info: &FnAllocInfo, diags: &mut Vec<Diagnostic>) {
+fn pattern_a_missing_free(
+    prog: &MirProgram,
+    func: &MirFunction,
+    info: &FnAllocInfo,
+    diags: &mut Vec<Diagnostic>,
+) {
     // Conservative bail: any loop in the function means a free could cross
     // iterations — do not analyze missing frees here.
     if info.has_loop {
@@ -213,6 +237,13 @@ fn pattern_a_missing_free(func: &MirFunction, info: &FnAllocInfo, diags: &mut Ve
             } = s
             {
                 if place.is_local() && is_allocating(path) {
+                    // An allocation from a bulk/no-op-free allocator (an arena or
+                    // a fixed-buffer allocator) is NOT required to be freed
+                    // individually — that is the documented contract — so it is
+                    // never a leak. Skip it before the ownership trace.
+                    if alloc_is_bulk_freed(prog, func, path) {
+                        continue;
+                    }
                     // The allocating intrinsic's result usually lands in a temp
                     // (an error union); the owned resource is its PAYLOAD, bound
                     // via an unwrap (`x = t.payload`). Compute the set of locals
@@ -320,6 +351,112 @@ fn owning_locals(func: &MirFunction, alloc_temp: LocalId) -> HashSet<LocalId> {
 /// owned resource (final member ∈ the small allocator set).
 fn is_allocating(path: &IntrinsicPath) -> bool {
     matches!(path.last(), Some("alloc" | "create" | "dupe"))
+}
+
+/// The struct type names of the std allocators whose `free` is a documented
+/// no-op: an arena (bulk free at `deinit`) and a fixed-buffer allocator
+/// (caller-owned backing buffer). An allocation made through one of these never
+/// needs an individual `free`, so Pattern A must not flag it.
+const BULK_FREE_ALLOCATORS: &[&str] = &["ArenaAllocator", "FixedBufferAllocator"];
+
+/// `true` if the allocation made by `path` flows from a bulk/no-op-free allocator
+/// (an arena or fixed-buffer allocator), so omitting a per-item `free` is the
+/// correct contract rather than a leak.
+///
+/// The allocator's concrete kind is not on the intrinsic itself (the receiver is
+/// an erased `Allocator` handle), so we recover it by tracing the receiver local
+/// backwards through the function's straight-line copies/refs/calls and asking,
+/// at each step, whether we have reached a value that is *manifestly* an arena or
+/// fixed-buffer allocator:
+///
+/// * a local whose **struct type** is `ArenaAllocator`/`FixedBufferAllocator`
+///   (the `var fba = FixedBufferAllocator.init(...)` slot), or
+/// * a value produced by a **call** whose callee is one of those types' methods
+///   (`allocator[FixedBufferAllocator]`, `init[ArenaAllocator]`, …) — this is how
+///   `const al = fba.allocator()` hands back the erased handle.
+///
+/// The trace is intentionally conservative: it only follows ownership-preserving
+/// data flow (`Use`/`Cast` copies, `&x` refs, and call results) and bails to
+/// `false` for anything it cannot positively classify, so a GPA/testing/page
+/// allocation — which *does* require an explicit free — is never mistaken for a
+/// bulk-free one and a genuine leak stays flagged.
+fn alloc_is_bulk_freed(prog: &MirProgram, func: &MirFunction, path: &IntrinsicPath) -> bool {
+    // The allocator value is the intrinsic's receiver (`value(recv).alloc(...)`).
+    let IntrinsicRoot::Value(op) = &path.root else {
+        return false;
+    };
+    let Operand::Copy(p) = op.as_ref() else {
+        return false;
+    };
+    let mut worklist = vec![p.base];
+    let mut seen: HashSet<LocalId> = HashSet::new();
+    while let Some(local) = worklist.pop() {
+        if !seen.insert(local) {
+            continue;
+        }
+        // A local whose own type is a bulk-free allocator struct settles it.
+        if type_is_bulk_free_allocator(prog, func.locals[local.index()].ty) {
+            return true;
+        }
+        // Otherwise follow the (single) assignment that defines this local.
+        for b in &func.blocks {
+            for s in &b.stmts {
+                let Statement::Assign { place, rvalue, .. } = s else {
+                    continue;
+                };
+                if !place.is_local() || place.base != local {
+                    continue;
+                }
+                match rvalue {
+                    // A call result: classify by the callee's name (the method's
+                    // owning type), and also chase the receiver argument so a
+                    // `&fba` -> `.allocator()` chain reaches the FBA slot.
+                    Rvalue::Call {
+                        func: callee, args, ..
+                    } => {
+                        if callee_is_bulk_free_allocator(prog, *callee) {
+                            return true;
+                        }
+                        for a in args {
+                            if let Operand::Copy(ap) = a {
+                                worklist.push(ap.base);
+                            }
+                        }
+                    }
+                    // Ownership-preserving copies / address-of: keep tracing the
+                    // underlying value (e.g. `_7 = &_4`, `_6 = _7`).
+                    Rvalue::Use(Operand::Copy(src))
+                    | Rvalue::Cast {
+                        operand: Operand::Copy(src),
+                        ..
+                    }
+                    | Rvalue::Ref { place: src, .. } => {
+                        worklist.push(src.base);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `true` if `ty` is one of the bulk-free allocator structs (by name).
+fn type_is_bulk_free_allocator(prog: &MirProgram, ty: TypeId) -> bool {
+    let name = prog.arena.fmt(ty);
+    // `fmt` renders a pointer-to-struct as `*Name`; strip a leading `*`/`*const`
+    // so `&fba: *FixedBufferAllocator` is recognised too.
+    let bare = name.trim_start_matches('*').trim_start_matches("const ");
+    BULK_FREE_ALLOCATORS.contains(&bare)
+}
+
+/// `true` if `callee`'s display name is a method of a bulk-free allocator type,
+/// e.g. `allocator[FixedBufferAllocator]` or `init[ArenaAllocator]`.
+fn callee_is_bulk_free_allocator(prog: &MirProgram, callee: FnId) -> bool {
+    let Some(f) = prog.funcs.get(callee.index()) else {
+        return false;
+    };
+    BULK_FREE_ALLOCATORS.iter().any(|a| f.name.contains(a))
 }
 
 /// `true` if an intrinsic path *releases* a resource.

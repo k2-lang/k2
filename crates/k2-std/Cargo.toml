@@ -1,0 +1,21 @@
+# k2-std — the bundled k2 standard library, embedded as source.
+#
+# k2's standard library is written in k2 itself (see `std/*.k2`) and embedded
+# into the compiler via `include_str!`. The driver prepends it into the user's
+# `SourceFile` as a single synthetic `const std = struct { ... }` namespace, so
+# `@import("std")` resolves to a REAL compiled module: it is parsed, resolved,
+# type-checked, monomorphized, lowered, and executed exactly like user code, not
+# treated as an opaque/Deferred namespace. The allocator floor and the *System
+# capabilities bottom out in a handful of `@builtin` leaf intrinsics the VM
+# implements over its managed heap (no fn-pointer vtables). Like every other
+# front-end crate it depends on the Rust standard library ONLY.
+[package]
+name = "k2-std"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The bundled k2 standard library, embedded as k2 source"
+
+[lib]
+name = "k2_std"
+path = "src/lib.rs"

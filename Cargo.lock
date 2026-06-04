@@ -54,6 +54,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "k2-std"
+version = "0.1.0"
+
+[[package]]
 name = "k2-syntax"
 version = "0.1.0"
 dependencies = [
@@ -89,6 +93,7 @@ dependencies = [
  "k2-opt",
  "k2-parse",
  "k2-resolve",
+ "k2-std",
  "k2-syntax",
  "k2-types",
  "k2-vm",

@@ -80,6 +80,32 @@ fn null_pointer_load_is_a_fault() {
 }
 
 #[test]
+fn one_array_cell_honors_offset_for_indexed_access() {
+    // FINDING #3: a `CellData::One(Value::Array)` cell (a boxed `&storage` array,
+    // the FBA backing shape) must index *into the inner array* via `ptr.offset` so
+    // two sub-views into the same cell do not alias. `load`/`store` (whole-cell)
+    // still see the whole array.
+    let mut h = Heap::new(false);
+    let arr = Value::Array(std::rc::Rc::new(vec![Value::int(0, u8r()); 6]));
+    let base = h.alloc_one(arr);
+    // Sub-view `a` = base[0..3], sub-view `b` = base[3..6].
+    let a = base;
+    let b = Ptr {
+        cell: base.cell,
+        offset: 3,
+    };
+    h.store_index(a, 0, Value::int(11, u8r())).unwrap();
+    h.store_index(b, 0, Value::int(22, u8r())).unwrap();
+    // Disjoint windows: a[0] is 11, b[0] is 22 (not aliased).
+    assert_eq!(h.load_index(a, 0).unwrap().as_i128(), Some(11));
+    assert_eq!(h.load_index(b, 0).unwrap().as_i128(), Some(22));
+    // Whole-cell `load` still returns the whole array (length 6).
+    assert!(matches!(h.load(base).unwrap(), Value::Array(a) if a.len() == 6));
+    // Out-of-range interior access is a clean fault, not a panic.
+    assert!(h.load_index(base, 6).is_err());
+}
+
+#[test]
 fn oversized_alloc_is_a_clean_out_of_memory_fault() {
     // A request beyond the element cap must be rejected *before* any backing
     // `Vec` is touched, so the Rust global allocator never aborts the process.

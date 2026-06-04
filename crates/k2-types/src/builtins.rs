@@ -9,7 +9,7 @@
 
 use k2_syntax::{Expr, Span};
 
-use crate::ty::TypeId;
+use crate::ty::{IntBits, Type, TypeId};
 
 impl crate::check::Checker<'_> {
     /// Synthesizes a builtin call by name.
@@ -127,6 +127,41 @@ impl crate::check::Checker<'_> {
             // (Deferred/anytype/error) operand stays conservative. A non-numeric or
             // mutually-incompatible operand is a real error.
             "@min" | "@max" => self.synth_min_max(name, args, span),
+            // The std capability/allocator floor builtins (implemented by the VM
+            // over the managed heap + *System capabilities). Their result types are
+            // fixed so the std source type-checks precisely rather than leaning on
+            // Deferred: `@allocId`/`@randomInt`/`@clockNow` yield integers,
+            // `@gpaDeinit` a bool, the heap ops a `Deferred` payload (the element
+            // type is recovered at run time from the live operand). `@allocHandle`
+            // yields the predeclared opaque `Allocator` so a `.allocator()` method
+            // returns a value of the same type user signatures spell.
+            "@allocId" => {
+                self.synth_all(args);
+                self.arena.intern(Type::Int {
+                    signed: false,
+                    bits: IntBits::Fixed(32),
+                })
+            }
+            "@randomInt" | "@clockNow" => {
+                self.synth_all(args);
+                self.arena.intern(Type::Int {
+                    signed: false,
+                    bits: IntBits::Fixed(64),
+                })
+            }
+            "@gpaDeinit" => {
+                self.synth_all(args);
+                self.arena.t_bool()
+            }
+            "@allocHandle" => {
+                self.synth_all(args);
+                self.arena.intern_opaque("Allocator")
+            }
+            // The remaining floor builtins (`@allocRaw`/`@reallocRaw`/`@freeRaw`/
+            // `@createRaw`/`@destroyRaw`/`@arenaDeinit`/`@clockSleep`/
+            // `@randomBytes`/`@envGet`/`@bufPrint`) carry their result type from
+            // context (the `![]T`/`!*T`/`void`/`?[]const u8` the method annotates),
+            // so they synth to Deferred and let the `check` direction supply it.
             // Unknown builtin: conservative Deferred, still synth args.
             _ => {
                 self.synth_all(args);

@@ -161,8 +161,18 @@ pub enum Capability {
     StdoutWriter,
     /// A `Writer` over standard error.
     StderrWriter,
-    /// The `sys.heap` allocator capability.
-    Allocator,
+    /// An `Allocator` capability, carrying its **handle id**: the index of an
+    /// allocator instance in the VM's per-run registry. Id `0` is the
+    /// program-wide default (`sys.heap`); the `std.heap.*` allocators mint
+    /// further ids (GPA, arena, fixed-buffer) so different kinds dispatch
+    /// differently — all without fn-pointer vtables.
+    Allocator(u32),
+    /// The `sys.clock` monotonic/wall reader capability.
+    Clock,
+    /// The `sys.random` PRNG capability.
+    Random,
+    /// The `sys.env` environment-lookup capability.
+    Env,
 }
 
 impl Value {

@@ -188,6 +188,15 @@ impl FnBuilder<'_, '_> {
                     span,
                 );
             }
+            Some(MemberRes::Decl(d)) if self.lo.value_const_inits.contains_key(&d) => {
+                // A namespaced *value* const (`std.testing.allocator`): inline its
+                // initializer expression instead of emitting an `@std.<member>`
+                // intrinsic the VM cannot dispatch. The initializer is itself a
+                // value-producing expression (e.g. `@allocHandle(@allocId(5, 0))`),
+                // so lowering it yields the right runtime value directly.
+                let init = self.lo.value_const_inits[&d].clone();
+                self.lower_into(dst, &init);
+            }
             Some(MemberRes::Decl(_)) | Some(MemberRes::Deferred) | None => {
                 // A member constant inline, or a Deferred member read (a field
                 // access on std/sys whose value is opaque) -> emit an intrinsic
@@ -858,7 +867,7 @@ impl FnBuilder<'_, '_> {
                                 InstId::plain(method_def)
                             };
                             let fid = self.lo.enqueue(inst);
-                            let recv = self.build_receiver_operand(base, fid);
+                            let recv = self.build_receiver_operand(base, method_def, fid);
                             Some((fid, vec![recv], 1))
                         }
                     }
@@ -889,22 +898,46 @@ impl FnBuilder<'_, '_> {
 
     /// Builds the receiver operand for a method call, auto-`&`-ing to a pointer
     /// receiver when the callee's first param is a pointer.
-    fn build_receiver_operand(&mut self, base: &Expr, fid: FnId) -> Operand {
+    ///
+    /// The callee may have just been *enqueued* and not yet lowered, so its
+    /// lowered `funcs` entry can be absent; we therefore decide `wants_ptr` from
+    /// the method's AST signature (its first parameter's type expression, `*Self`
+    /// / `*const Self` vs `Self`), which is always available. This is what makes a
+    /// `self.field = ...` mutation through a `*Self` receiver actually persist:
+    /// the receiver must be passed as the *address* of the base, not a by-value
+    /// copy.
+    fn build_receiver_operand(&mut self, base: &Expr, method_def: DefId, fid: FnId) -> Operand {
         let recv_ty = self.type_at(base.span());
+        let wants_ptr = self
+            .method_param0_is_ptr(method_def)
+            .or_else(|| {
+                // Fallback: the lowered fn (if already present) tells us directly.
+                self.lo.funcs.get(fid.index()).and_then(|f| {
+                    f.params.first().map(|p| {
+                        matches!(
+                            self.lo.typed.arena.get(f.locals[p.index()].ty),
+                            Type::Pointer { .. }
+                        )
+                    })
+                })
+            })
+            .unwrap_or(false);
         let param0 = self
             .lo
             .funcs
             .get(fid.index())
             .and_then(|f| f.params.first().map(|p| f.locals[p.index()].ty));
-        let wants_ptr = param0
-            .map(|t| matches!(self.lo.typed.arena.get(t), Type::Pointer { .. }))
-            .unwrap_or(false);
         let base_is_ptr = matches!(self.lo.typed.arena.get(recv_ty), Type::Pointer { .. });
         if wants_ptr && !base_is_ptr {
             // Auto-&: take the address of the receiver place.
             let place = self.lower_place(base);
             self.mark_address_taken(place.base);
-            let ptr_ty = param0.unwrap_or(recv_ty);
+            // The receiver pointer type: the callee's first param type if its
+            // lowered fn is available, else a pointer to the receiver's own type
+            // with the const-ness read from the method's AST signature (so a
+            // `*const Self` receiver stays a read-only borrow).
+            let is_const = self.method_param0_is_const_ptr(method_def);
+            let ptr_ty = param0.unwrap_or_else(|| self.lo.typed.arena.ptr(is_const, recv_ty));
             let tmp = self.new_temp(ptr_ty, base.span());
             self.assign(
                 Place::local(tmp),
@@ -926,6 +959,33 @@ impl FnBuilder<'_, '_> {
         } else {
             self.lower_operand(base, recv_ty)
         }
+    }
+
+    /// `Some(true)` if the method's AST first parameter is a pointer receiver
+    /// (`*Self` / `*const Self` / `*T`), `Some(false)` if it is a by-value
+    /// receiver, `None` if the method body / signature is unavailable. Read from
+    /// the method's own AST so it is valid even before the callee is lowered.
+    fn method_param0_is_ptr(&self, method_def: DefId) -> Option<bool> {
+        let item = self.lo.fn_items.get(&method_def)?;
+        if let Item::Fn { params, .. } = item {
+            let p0 = params.first()?;
+            return Some(matches!(p0.ty, Expr::Pointer { .. }));
+        }
+        None
+    }
+
+    /// `true` if the method's AST first parameter is a `*const` pointer receiver
+    /// (so the auto-`&` borrow is read-only). A by-value or non-const receiver is
+    /// `false`.
+    fn method_param0_is_const_ptr(&self, method_def: DefId) -> bool {
+        if let Some(Item::Fn { params, .. }) = self.lo.fn_items.get(&method_def) {
+            if let Some(p0) = params.first() {
+                if let Expr::Pointer { is_const, .. } = &p0.ty {
+                    return *is_const;
+                }
+            }
+        }
+        false
     }
 
     // ===================================================================
@@ -1199,7 +1259,18 @@ impl FnBuilder<'_, '_> {
                     reason: TrapReason::Panic,
                 });
             }
-            "@errorName" | "@typeName" => {
+            "@errorName" | "@typeName"
+            // The std capability/allocator floor: thin `@builtin` leaf intrinsics
+            // the VM implements over the managed heap and the *System capabilities.
+            // The std allocator structs (`std.heap.*`) and `std.mem.Allocator`'s
+            // methods call these, passing a `u32` handle id the VM dispatches on,
+            // so different allocator kinds behave differently without fn-pointer
+            // vtables. See `crates/k2-vm/src/vm.rs::dispatch_intrinsic`.
+            | "@allocId" | "@allocHandle"
+            | "@allocRaw" | "@reallocRaw" | "@freeRaw" | "@createRaw" | "@destroyRaw"
+            | "@arenaDeinit" | "@gpaDeinit"
+            | "@clockNow" | "@clockSleep" | "@randomBytes" | "@randomInt"
+            | "@envGet" | "@bufPrint" => {
                 // Runtime ops on opaque data -> intrinsic.
                 let mut arg_ops = Vec::new();
                 for a in args {

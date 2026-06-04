@@ -16,6 +16,7 @@ members = [
     "crates/k2-parse",
     "crates/k2-resolve",
     "crates/k2-types",
+    "crates/k2-std",
     "crates/k2-mir",
     "crates/k2-opt",
     "crates/k2-vm",

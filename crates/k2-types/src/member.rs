@@ -9,6 +9,7 @@
 //! (where `out: anytype`), and `info.Struct.fields` type-check without a false
 //! positive.
 
+use k2_resolve::Resolution;
 use k2_syntax::{Expr, Span};
 
 use crate::ty::{MemberRes, Type, TypeId};
@@ -23,6 +24,31 @@ impl crate::check::Checker<'_> {
             Type::Pointer { pointee, .. } => pointee,
             _ => bt,
         };
+
+        // Namespace access on a *type-valued* base (`std.heap`, `std.ArrayList`,
+        // `std.heap.GeneralPurposeAllocator`): the base denotes a `struct`/`enum`/
+        // `union` *type* (an embedded `std` module, a nested const namespace),
+        // even though the base expression's *value* type is `type`. Resolve the
+        // member against that denoted aggregate's decls so `std.heap.X.init`
+        // monomorphizes as a real associated call, not an opaque intrinsic. This
+        // is what makes the bundled std a real, compiled module rather than an
+        // opaque namespace.
+        if matches!(self.arena.get(base_ty), Type::TypeType) {
+            if let Some(denoted) = self.denoted_aggregate_of(base) {
+                if let Some(ty) = self.member_of_aggregate(denoted, field, span) {
+                    // If this member is *itself* a type-valued decl (a nested
+                    // namespace or a non-generic nested struct type), record this
+                    // access span as type-valued so a further `.member` or an
+                    // associated `.init(...)` call resolves against it too.
+                    if let Some(def) = self.member_decl_def(denoted, field) {
+                        if let Some(&inner) = self.item_types.get(&def) {
+                            self.type_valued_spans.insert((span.start, span.end), inner);
+                        }
+                    }
+                    return ty;
+                }
+            }
+        }
 
         match self.arena.get(base_ty).clone() {
             Type::Struct(id) => {
@@ -142,6 +168,69 @@ impl crate::check::Checker<'_> {
                 self.arena.t_error()
             }
         }
+    }
+
+    /// Recovers the denoted aggregate (`struct`/`enum`/`union`) type of a
+    /// *type-valued* base expression — a reference to a type-valued item or a
+    /// chain of namespace accesses into nested type-valued decls. Returns `None`
+    /// for a base that does not denote a known aggregate (so the caller falls
+    /// back to the ordinary, value-typed member path / Deferred).
+    ///
+    /// This drives namespace member resolution for the bundled std module:
+    /// `std` denotes the std `struct`; `std.heap` a nested namespace `struct`;
+    /// `std.heap.GeneralPurposeAllocator` a leaf `struct` whose `init`/`deinit`/
+    /// `allocator` decls are then resolvable as real associated calls.
+    fn denoted_aggregate_of(&self, base: &Expr) -> Option<TypeId> {
+        match base {
+            // A bare ident referring to a type-valued item: its denoted type is
+            // recorded in `item_types` (a `const X = struct{...}` / `@import`).
+            Expr::Ident { span, .. } => {
+                let res = self.resolution_at(*span)?;
+                let def = match res {
+                    Resolution::Def(d) | Resolution::Predeclared(d) => d,
+                    _ => return None,
+                };
+                self.item_types.get(&def).copied()
+            }
+            // A nested namespace access: this very field-access span was recorded
+            // as type-valued when its parent was resolved (see `synth_field`).
+            Expr::Field { span, .. } => {
+                self.type_valued_spans.get(&(span.start, span.end)).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves `field` against an aggregate (`struct`/`enum`/`union`) type used
+    /// as a *namespace* (the base denotes the type itself). Records the
+    /// [`MemberRes`] for the access span and returns the member's type, or `None`
+    /// if the aggregate has no such member (the caller reports / defers).
+    fn member_of_aggregate(&mut self, agg: TypeId, field: &str, span: Span) -> Option<TypeId> {
+        let decls = match self.arena.get(agg) {
+            Type::Struct(id) => &self.arena.structs[id.0 as usize].decls,
+            Type::Enum(id) => &self.arena.enums[id.0 as usize].decls,
+            Type::Union(id) => &self.arena.unions[id.0 as usize].decls,
+            _ => return None,
+        };
+        if let Some(d) = decls.iter().find(|d| d.name == field) {
+            let ty = d.ty;
+            let def = d.def;
+            self.record_member(span, MemberRes::Decl(def));
+            return Some(ty);
+        }
+        None
+    }
+
+    /// The [`DefId`] of the named decl on an aggregate namespace type (used to
+    /// look up the member's own denoted type in `item_types`).
+    fn member_decl_def(&self, agg: TypeId, field: &str) -> Option<k2_resolve::DefId> {
+        let decls = match self.arena.get(agg) {
+            Type::Struct(id) => &self.arena.structs[id.0 as usize].decls,
+            Type::Enum(id) => &self.arena.enums[id.0 as usize].decls,
+            Type::Union(id) => &self.arena.unions[id.0 as usize].decls,
+            _ => return None,
+        };
+        decls.iter().find(|d| d.name == field).map(|d| d.def)
     }
 
     /// Checks a bare `.Name` enum literal against an expected enum type.

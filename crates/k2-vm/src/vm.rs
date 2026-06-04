@@ -83,6 +83,52 @@ impl PanicInfo {
     }
 }
 
+/// The kind (strategy) of an allocator instance in the registry. The kind
+/// decides how `free`/`realloc`/`deinit` behave; allocation itself always goes
+/// through the one shared managed [`Heap`], so pointers/slices from every kind
+/// interoperate freely.
+enum AllocatorKind {
+    /// The program-wide default (`sys.heap`): plain allocate/free, no tracking.
+    Default,
+    /// A leak-/double-free-/use-after-free-checking general-purpose allocator
+    /// (also the testing allocator). Tracks every live cell; `deinit` reports a
+    /// leak, a double/foreign free traps.
+    Gpa,
+    /// An arena: `free` is a no-op; `deinit` frees every cell at once. Records the
+    /// cells it handed out.
+    Arena,
+    /// A fixed-buffer allocator carving from a caller-provided `[]u8`: it bumps an
+    /// offset into one backing cell; `free` is a no-op (reset only).
+    FixedBuffer { buf: Ptr, cap: usize },
+}
+
+/// One allocator instance: its kind plus the per-kind bookkeeping the VM keeps
+/// over the shared heap (the set of live cells for a GPA, the handed-out cells
+/// for an arena, the bump offset for a fixed-buffer allocator).
+struct AllocatorState {
+    kind: AllocatorKind,
+    /// Cells currently live (for a GPA: the leak set; for an arena: the cells to
+    /// free at `deinit`).
+    live: Vec<u32>,
+    /// Cells already freed through this allocator (for a GPA: the double-free
+    /// set).
+    freed: Vec<u32>,
+    /// The fixed-buffer bump offset (elements consumed from `buf`).
+    offset: usize,
+}
+
+impl AllocatorState {
+    /// A fresh allocator instance of `kind` with empty bookkeeping.
+    fn new(kind: AllocatorKind) -> AllocatorState {
+        AllocatorState {
+            kind,
+            live: Vec::new(),
+            freed: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
 /// One call frame: the callee, its register file, and its program counter.
 struct Frame {
     /// The compiled function this frame is executing.
@@ -101,6 +147,23 @@ pub struct Vm<'p> {
     compiled: Vec<CompiledFn>,
     heap: Heap,
     frames: Vec<Frame>,
+    /// The per-run allocator registry, indexed by handle id. Slot `0` is the
+    /// program-wide default (`sys.heap`). The `std.heap.*` allocators mint
+    /// further slots (GPA, arena, fixed-buffer) via `@allocId`, and every
+    /// `@*Raw`/`@gpaDeinit`/`@arenaDeinit` op dispatches on a handle id into this
+    /// table, so different allocator *kinds* behave differently over the one
+    /// shared managed [`Heap`].
+    allocators: Vec<AllocatorState>,
+    /// The VM's monotonic clock, in nanoseconds. Starts at zero and advances on
+    /// `@clockSleep`, so `@clockNow(0)` is deterministic across runs (the spec's
+    /// `FakeClock` is pure k2 over this same monotonic shape).
+    clock_nanos: u64,
+    /// The PRNG state (splitmix64). Seeded deterministically so `sys.random` is
+    /// reproducible unless a `--seed` is supplied.
+    rng: u64,
+    /// Whether this run strips safety checks (ReleaseFast): the GPA/testing leak
+    /// and double-free trackers are no-ops, mirroring the heap's `ignore_liveness`.
+    checks_off: bool,
     /// Captured standard output.
     pub stdout: Vec<u8>,
     /// Captured standard error.
@@ -127,6 +190,14 @@ impl<'p> Vm<'p> {
             compiled: compile_program(prog),
             heap: Heap::new(release_fast),
             frames: Vec::new(),
+            // Slot 0 is the always-present default allocator (`sys.heap`): plain
+            // heap allocation with no extra tracking.
+            allocators: vec![AllocatorState::new(AllocatorKind::Default)],
+            clock_nanos: 0,
+            // A fixed nonzero seed: deterministic but not all-zero (splitmix64 of
+            // 0 still produces a good stream, but a recognizable seed aids debug).
+            rng: 0x9E37_79B9_7F4A_7C15,
+            checks_off: release_fast,
             stdout: Vec::new(),
             stderr: Vec::new(),
             budget: STEP_BUDGET,
@@ -589,6 +660,15 @@ impl<'p> Vm<'p> {
     /// Structural equality for the value kinds equality is applied to (ints,
     /// bools, error tags, enums, strings).
     fn values_eq(&self, a: &Value, b: &Value) -> bool {
+        // Null comparison: `x == null` lowers to `eq x, undef`, and a "no value"
+        // result can be either `Optional(None)` or `Undef` (an opaque/`deferred`
+        // optional, e.g. `sys.env.get(...)` returning absence). Treat the null
+        // sentinels as interchangeable so `result == null` is true iff `result`
+        // holds no value, and a present `Optional(Some(_))` is correctly unequal.
+        let is_null = |v: &Value| matches!(v, Value::Optional(None) | Value::Undef(_));
+        if is_null(a) || is_null(b) {
+            return is_null(a) && is_null(b);
+        }
         match (a, b) {
             (Value::Int { v: x, .. }, Value::Int { v: y, .. }) => x == y,
             (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -693,6 +773,21 @@ impl<'p> Vm<'p> {
                     Err(f) => Err(self.heap_panic(f)),
                 }
             }
+            // An `undefined` array local read before any store: bounds-check
+            // against its known length and yield a default-initialized element.
+            Value::Undef(ty) => match self.prog.arena.get(*ty) {
+                k2_types::Type::Array { len, elem } => {
+                    let n = match len {
+                        k2_types::ArrayLen::Known(n) => *n as usize,
+                        _ => 0,
+                    };
+                    if i >= n {
+                        return Err(self.bounds_panic(i, n));
+                    }
+                    Ok(default_value(&self.prog.arena, *elem))
+                }
+                _ => Err(self.internal("index of non-indexable value")),
+            },
             _ => Err(self.internal("index of non-indexable value")),
         }
     }
@@ -741,6 +836,15 @@ impl<'p> Vm<'p> {
                     }
                     SliceMeta::Ptr => Ok(Value::Ptr(*p)),
                 }
+            }
+            // An `undefined` array local: `var buf: [N]u8 = undefined`. Materialize
+            // its default-initialized contents so `.len`/`.ptr` behave like a real
+            // array (the canonical FixedBufferAllocator / bufPrint scratch shape).
+            Value::Undef(ty)
+                if matches!(self.prog.arena.get(*ty), k2_types::Type::Array { .. }) =>
+            {
+                let materialized = default_value(&self.prog.arena, *ty);
+                self.slice_meta(&materialized, which)
             }
             _ => Err(self.internal("slice meta on non-slice")),
         }
@@ -850,6 +954,18 @@ impl<'p> Vm<'p> {
             *slot = value;
             return Ok(());
         };
+        // An `undefined` aggregate local (`var buf: [N]u8 = undefined`) must be
+        // materialized to its default-initialized contents before the first
+        // field/index store, so writing `buf[i] = v` works instead of tripping the
+        // internal "store on non-indexable" fault.
+        if let Value::Undef(ty) = slot {
+            if matches!(
+                self.prog.arena.get(*ty),
+                k2_types::Type::Array { .. } | k2_types::Type::Struct(_)
+            ) {
+                *slot = default_value(&self.prog.arena, *ty);
+            }
+        }
         match first {
             StoreStep::Deref => {
                 // Write through a pointer slot.
@@ -927,6 +1043,14 @@ impl<'p> Vm<'p> {
             if let Value::Ptr(p) = cur {
                 return Ok(Value::Ptr(p));
             }
+            // An `= undefined` aggregate (`var storage: [N]u8 = undefined`) holds a
+            // bare `Value::Undef(array_ty)`; boxing that as-is gives a cell whose
+            // `len_of` is 1, so `FixedBufferAllocator.init(&storage)` would report a
+            // capacity of 1 (and element stores would have nowhere to land).
+            // Materialize it to a real default-initialized array/struct first, so
+            // the boxed cell has the right length and indexable slots. (Mirrors the
+            // `slice_meta`/`store_into` undef-materialization at the use sites.)
+            let cur = self.materialize_undef_aggregate(cur);
             let ptr = self.heap.alloc_one(cur);
             self.set_cur(base, Value::Ptr(ptr));
             Ok(Value::Ptr(ptr))
@@ -938,12 +1062,30 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Materializes an `= undefined` array/struct value to its default-initialized
+    /// contents, so a boxed-then-indexed aggregate behaves like a real one. Any
+    /// other value (including a scalar `undefined`) is returned unchanged.
+    fn materialize_undef_aggregate(&self, v: Value) -> Value {
+        if let Value::Undef(ty) = v {
+            if matches!(
+                self.prog.arena.get(ty),
+                k2_types::Type::Array { .. } | k2_types::Type::Struct(_)
+            ) {
+                return default_value(&self.prog.arena, ty);
+            }
+            return Value::Undef(ty);
+        }
+        v
+    }
+
     /// Resolves a reference through a projection chain.
     fn ref_through(&mut self, base: &Value, steps: &[StoreStep]) -> Result<Value, Halt> {
         match steps.split_first() {
             None => {
-                // Box the value so callers get a stable pointer.
-                let ptr = self.heap.alloc_one(base.clone());
+                // Box the value so callers get a stable pointer. Materialize an
+                // `= undefined` aggregate first (see `take_ref`).
+                let boxed = self.materialize_undef_aggregate(base.clone());
+                let ptr = self.heap.alloc_one(boxed);
                 Ok(Value::Ptr(ptr))
             }
             Some((StoreStep::Deref, rest)) => {
@@ -991,43 +1133,113 @@ impl<'p> Vm<'p> {
             IntrinsicId::StdoutWriter => Ok(Value::Cap(Capability::StdoutWriter)),
             IntrinsicId::StderrWriter => Ok(Value::Cap(Capability::StderrWriter)),
             IntrinsicId::IoCap => Ok(Value::Cap(Capability::Io)),
-            IntrinsicId::HeapCap => Ok(Value::Cap(Capability::Allocator)),
+            // `sys.heap` is the default allocator (handle id 0).
+            IntrinsicId::HeapCap => Ok(Value::Cap(Capability::Allocator(0))),
             IntrinsicId::Print => self.intrinsic_print(recv, args),
+            // The `Allocator`-value method floor: `alloc.create/alloc/free/destroy`
+            // reached as member calls on an `Allocator` value. The handle id is on
+            // the receiver (`Capability::Allocator(id)`, or the bare `sys.heap`).
             IntrinsicId::Create => {
+                let id = alloc_id_of(&recv);
                 let ty = type_carrier(args).unwrap_or_else(|| self.prog.arena.t_void());
-                let init = default_value(&self.prog.arena, ty);
-                let ptr = self.heap.alloc_one(init);
-                Ok(Value::ErrOk(Box::new(Value::Ptr(ptr))))
+                self.alloc_create(id, ty)
             }
             IntrinsicId::Alloc => {
+                let id = alloc_id_of(&recv);
                 let ty = type_carrier(args).unwrap_or_else(|| self.prog.arena.t_void());
                 let n = args.iter().find_map(|a| a.as_usize()).unwrap_or(0);
-                let init = default_value(&self.prog.arena, ty);
-                // `alloc_many` validates `n` against a cap and reserves fallibly,
-                // so a huge request becomes a clean out-of-memory panic (nonzero
-                // exit) rather than an uncatchable Rust `handle_alloc_error`
-                // abort. `alloc` returns `![]T`, so a real program could also
-                // `catch` this; we surface it as the documented clean panic.
-                match self.heap.alloc_many(init, n) {
-                    Ok(ptr) => Ok(Value::ErrOk(Box::new(Value::Slice { ptr, len: n }))),
-                    Err(HeapFault::OutOfMemory) => Err(self.oom_panic()),
-                    Err(f) => Err(self.heap_panic(f)),
-                }
+                self.alloc_many(id, ty, n)
             }
             IntrinsicId::Destroy => {
-                if let Some(Value::Ptr(p)) = args.first() {
-                    self.heap.free(*p);
-                }
-                Ok(Value::Unit)
+                let id = alloc_id_of(&recv);
+                self.alloc_free(id, args.first())
             }
             IntrinsicId::Free => {
-                match args.first() {
-                    Some(Value::Slice { ptr, .. }) => self.heap.free(*ptr),
-                    Some(Value::Ptr(p)) => self.heap.free(*p),
-                    _ => {}
-                }
+                let id = alloc_id_of(&recv);
+                self.alloc_free(id, args.first())
+            }
+
+            // ---- The std allocator floor (handle-based) ------------------
+            IntrinsicId::AllocId => {
+                let kind = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+                let buf = args.get(2).cloned();
+                Ok(Value::int(
+                    self.register_allocator(kind, buf) as i128,
+                    IntRepr::USIZE,
+                ))
+            }
+            IntrinsicId::AllocHandle => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                Ok(Value::Cap(Capability::Allocator(id)))
+            }
+            IntrinsicId::AllocRaw => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                let ty = type_carrier(args).unwrap_or_else(|| self.prog.arena.t_void());
+                // The element count is the last non-type, non-id integer operand.
+                let n = args
+                    .iter()
+                    .skip(1)
+                    .filter(|a| !matches!(a, Value::Undef(_)))
+                    .find_map(|a| a.as_usize())
+                    .unwrap_or(0);
+                self.alloc_many(id, ty, n)
+            }
+            IntrinsicId::CreateRaw => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                let ty = type_carrier(args).unwrap_or_else(|| self.prog.arena.t_void());
+                self.alloc_create(id, ty)
+            }
+            IntrinsicId::ReallocRaw => {
+                let id = alloc_id_for_realloc(&recv, args);
+                self.alloc_realloc(id, args)
+            }
+            IntrinsicId::FreeRaw => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                self.alloc_free(id, args.get(1))
+            }
+            IntrinsicId::DestroyRaw => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                self.alloc_free(id, args.get(1))
+            }
+            IntrinsicId::ArenaDeinit => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                self.arena_deinit(id);
                 Ok(Value::Unit)
             }
+            IntrinsicId::GpaDeinit => {
+                let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+                Ok(Value::Bool(self.gpa_deinit(id)))
+            }
+
+            // ---- The *System capability floor ----------------------------
+            IntrinsicId::ClockNow => {
+                // `which`: 0 monotonic, 1 wall. Both read the deterministic VM
+                // monotonic counter so test output is reproducible.
+                Ok(Value::int(self.clock_nanos as i128, IntRepr::USIZE))
+            }
+            IntrinsicId::ClockSleep => {
+                let ns = args.first().and_then(|v| v.as_i128()).unwrap_or(0);
+                self.clock_nanos = self.clock_nanos.saturating_add(ns.max(0) as u64);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::RandomBytes => {
+                self.random_bytes(args.first());
+                Ok(Value::Unit)
+            }
+            IntrinsicId::RandomInt => Ok(Value::int(self.next_random() as i128, IntRepr::USIZE)),
+            IntrinsicId::EnvGet => {
+                // Offline-safe: no host env is consulted; every lookup is absent.
+                Ok(Value::Optional(None))
+            }
+            IntrinsicId::BufPrint => self.intrinsic_buf_print(args),
+            IntrinsicId::SliceLen => match recv {
+                Some(Value::Slice { len, .. }) => Ok(Value::int(len as i128, IntRepr::USIZE)),
+                _ => Ok(Value::int(0, IntRepr::USIZE)),
+            },
+            IntrinsicId::SlicePtr => match recv {
+                Some(Value::Slice { ptr, .. }) => Ok(Value::Ptr(ptr)),
+                _ => Ok(Value::Ptr(Ptr::NULL)),
+            },
             IntrinsicId::ErrorName => {
                 let name = match args.first() {
                     Some(v) => self.error_name_of(v),
@@ -1053,6 +1265,358 @@ impl<'p> Vm<'p> {
                 detail: Some(format!("unsupported intrinsic `{name}`")),
             })),
         }
+    }
+
+    // ---- the handle-based allocator registry --------------------------
+
+    /// Registers a fresh allocator instance of `kind` (the numeric kind tag the
+    /// std `@allocId` passes: 0=Default 1=GPA 2=Arena 3=FixedBuffer 5=Testing),
+    /// returning its handle id. `buf` is the caller's `[]u8` for a fixed-buffer
+    /// allocator (ignored otherwise).
+    fn register_allocator(&mut self, kind: usize, buf: Option<Value>) -> u32 {
+        let kind = match kind {
+            1 | 5 => AllocatorKind::Gpa, // GPA and testing share the tracker
+            2 => AllocatorKind::Arena,
+            3 => {
+                // The backing buffer is a `[]u8` view; carve from its cell. The
+                // caller may pass either a slice (`[]u8`) or a pointer-to-array
+                // (`&buf: *[N]u8`, the common `FixedBufferAllocator.init(&storage)`
+                // spelling), whose backing cell length is the capacity.
+                let (ptr, cap) = match buf {
+                    Some(Value::Slice { ptr, len }) => (ptr, len),
+                    Some(Value::Ptr(p)) => {
+                        let cap = self.heap.len_of(p).unwrap_or(0);
+                        (p, cap)
+                    }
+                    _ => (Ptr::NULL, 0),
+                };
+                AllocatorKind::FixedBuffer { buf: ptr, cap }
+            }
+            _ => AllocatorKind::Default,
+        };
+        let id = self.allocators.len() as u32;
+        self.allocators.push(AllocatorState::new(kind));
+        id
+    }
+
+    /// Allocates an `n`-element run through allocator `id`, returning `Ok([]T)`
+    /// (or a clean OutOfMemory panic). Records the cell into the kind's tracker.
+    fn alloc_many(&mut self, id: u32, ty: TypeId, n: usize) -> Result<Value, Halt> {
+        // A fixed-buffer allocator carves a sub-view of its backing buffer.
+        if let Some(AllocatorState {
+            kind: AllocatorKind::FixedBuffer { buf, cap },
+            offset,
+            ..
+        }) = self.allocators.get(id as usize)
+        {
+            let (buf, cap, offset) = (*buf, *cap, *offset);
+            if offset + n > cap {
+                // Exhausted: a real `error.OutOfMemory` value the caller can
+                // `try`/`catch`, matching the FBA contract.
+                return Ok(self.out_of_memory_value());
+            }
+            let view = Value::Slice {
+                ptr: Ptr {
+                    cell: buf.cell,
+                    offset: buf.offset + offset,
+                },
+                len: n,
+            };
+            if let Some(st) = self.allocators.get_mut(id as usize) {
+                st.offset += n;
+            }
+            return Ok(Value::ErrOk(Box::new(view)));
+        }
+
+        let init = default_value(&self.prog.arena, ty);
+        // `alloc_many` validates `n` against a cap and reserves fallibly, so an
+        // impossible request becomes a clean out-of-memory PANIC rather than an
+        // uncatchable Rust `handle_alloc_error` abort. (A heap-backed allocator
+        // surfaces an over-large request as the documented clean panic; only a
+        // *bounded* allocator like the fixed-buffer one above hands back a
+        // catchable `error.OutOfMemory` for its routine exhaustion.)
+        match self.heap.alloc_many(init, n) {
+            Ok(ptr) => {
+                self.track_alloc(id, ptr.cell);
+                Ok(Value::ErrOk(Box::new(Value::Slice { ptr, len: n })))
+            }
+            Err(f) => Err(self.heap_panic(f)),
+        }
+    }
+
+    /// Allocates a single `T` through allocator `id`, returning `Ok(*T)`.
+    fn alloc_create(&mut self, id: u32, ty: TypeId) -> Result<Value, Halt> {
+        let init = default_value(&self.prog.arena, ty);
+        let ptr = self.heap.alloc_one(init);
+        self.track_alloc(id, ptr.cell);
+        Ok(Value::ErrOk(Box::new(Value::Ptr(ptr))))
+    }
+
+    /// Reallocates the slice operand through allocator `id` to a new length,
+    /// returning `Ok([]T)`. The element type is recovered from the live slice's
+    /// own contents (the heap is value-typed), so no type carrier is needed.
+    fn alloc_realloc(&mut self, id: u32, args: &[Value]) -> Result<Value, Halt> {
+        // Operands: [maybe id], slice, new_len. Find the slice and the length.
+        let slice = args.iter().find_map(|a| match a {
+            Value::Slice { ptr, len } => Some((*ptr, *len)),
+            _ => None,
+        });
+        let n = args
+            .iter()
+            .filter(|a| !matches!(a, Value::Slice { .. } | Value::Undef(_)))
+            .filter_map(|a| a.as_usize())
+            .next_back()
+            .unwrap_or(0);
+        let (ptr, _len) = slice.unwrap_or((Ptr::NULL, 0));
+        // Preserve the element layout: copy through the heap's realloc, which
+        // keeps the existing values and frees the old cell.
+        let init = Value::int(0, IntRepr::USIZE);
+        match self.heap.realloc(ptr, n, init) {
+            Ok(new_ptr) => {
+                // The old cell is no longer live under this allocator; the new
+                // one is. Keep the GPA/arena tracker consistent.
+                self.retrack_realloc(id, ptr.cell, new_ptr.cell);
+                Ok(Value::ErrOk(Box::new(Value::Slice {
+                    ptr: new_ptr,
+                    len: n,
+                })))
+            }
+            Err(f) => Err(self.heap_panic(f)),
+        }
+    }
+
+    /// Frees the slice/pointer operand through allocator `id`. For a GPA/testing
+    /// allocator this is the checked path: a double-free or a free of a cell this
+    /// allocator never handed out is a clean panic; otherwise the cell moves from
+    /// the live set to the freed set and the heap cell is released (so a later
+    /// access trips use-after-free). For an arena, `free` is a no-op (the arena
+    /// frees in bulk at `deinit`). For a fixed-buffer allocator, `free` is a
+    /// no-op (it resets only).
+    fn alloc_free(&mut self, id: u32, operand: Option<&Value>) -> Result<Value, Halt> {
+        let ptr = match operand {
+            Some(Value::Slice { ptr, .. }) => *ptr,
+            Some(Value::Ptr(p)) => *p,
+            _ => return Ok(Value::Unit),
+        };
+        match self.allocators.get(id as usize).map(|s| &s.kind) {
+            // Arena / fixed-buffer: `free` is a no-op by contract.
+            Some(AllocatorKind::Arena | AllocatorKind::FixedBuffer { .. }) => {
+                return Ok(Value::Unit)
+            }
+            Some(AllocatorKind::Gpa) if !self.checks_off => {
+                // Checked free. The empty slice (null ptr) is a benign no-op.
+                if ptr.is_null() {
+                    return Ok(Value::Unit);
+                }
+                let st = &self.allocators[id as usize];
+                if st.freed.contains(&ptr.cell) {
+                    return Err(self.clean_panic("double free detected"));
+                }
+                if !st.live.contains(&ptr.cell) {
+                    return Err(self
+                        .clean_panic("invalid free: pointer was not allocated by this allocator"));
+                }
+                let st = &mut self.allocators[id as usize];
+                st.live.retain(|&c| c != ptr.cell);
+                st.freed.push(ptr.cell);
+                self.heap.free(ptr);
+                return Ok(Value::Unit);
+            }
+            _ => {}
+        }
+        // Default (or checks-off): plain heap free.
+        self.heap.free(ptr);
+        Ok(Value::Unit)
+    }
+
+    /// Frees every cell an arena handed out, all at once (the arena `deinit`
+    /// contract), then clears the arena's bookkeeping.
+    ///
+    /// KNOWN GAP (v0.10 NIT, intentionally not closed): a *forgotten*
+    /// `arena.deinit()` is not reported as a leak. Arena allocations are tracked
+    /// only under the arena's own handle, never under the backing GPA, and there
+    /// is no program-end live-arena report — so dropping an arena without
+    /// `deinit` silently reclaims at process exit rather than failing the GPA's
+    /// `deinit()` check. Correct code (arena + `deinit`, or arena + `defer
+    /// arena.deinit()`) is unaffected; only the misuse pattern goes undetected.
+    /// Closing it (routing arena backing through the GPA tracker, or reporting
+    /// live arena handles at program end) was deferred to avoid risking false
+    /// positives on legitimately-escaping arenas.
+    fn arena_deinit(&mut self, id: u32) {
+        let cells: Vec<u32> = match self.allocators.get(id as usize) {
+            Some(st) => st.live.clone(),
+            None => return,
+        };
+        for cell in cells {
+            self.heap.free(Ptr { cell, offset: 0 });
+        }
+        if let Some(st) = self.allocators.get_mut(id as usize) {
+            st.live.clear();
+        }
+    }
+
+    /// Reports whether allocator `id` (a GPA / testing allocator) leaked — i.e.
+    /// any cell it handed out is still live — then clears its tracker. With checks
+    /// off (ReleaseFast) this is always `false`, mirroring the stripped safety.
+    fn gpa_deinit(&mut self, id: u32) -> bool {
+        if self.checks_off {
+            return false;
+        }
+        let leaked = self
+            .allocators
+            .get(id as usize)
+            .map(|st| !st.live.is_empty())
+            .unwrap_or(false);
+        if let Some(st) = self.allocators.get_mut(id as usize) {
+            st.live.clear();
+            st.freed.clear();
+        }
+        leaked
+    }
+
+    /// Records a freshly-allocated `cell` into allocator `id`'s tracker (the GPA
+    /// leak set, or the arena's bulk-free set). The default allocator and the
+    /// checks-off path keep no bookkeeping.
+    fn track_alloc(&mut self, id: u32, cell: u32) {
+        if self.checks_off {
+            return;
+        }
+        if let Some(st) = self.allocators.get_mut(id as usize) {
+            if matches!(st.kind, AllocatorKind::Gpa | AllocatorKind::Arena) {
+                st.live.push(cell);
+            }
+        }
+    }
+
+    /// Updates a GPA/arena tracker after a `realloc` moved a live cell to a new
+    /// one (the old cell is freed by the heap, the new cell takes its place).
+    fn retrack_realloc(&mut self, id: u32, old_cell: u32, new_cell: u32) {
+        if self.checks_off {
+            return;
+        }
+        if let Some(st) = self.allocators.get_mut(id as usize) {
+            if matches!(st.kind, AllocatorKind::Gpa | AllocatorKind::Arena) {
+                st.live.retain(|&c| c != old_cell);
+                st.live.push(new_cell);
+            }
+        }
+    }
+
+    /// The `error.OutOfMemory` value an allocator returns when a request cannot be
+    /// satisfied (a real error the caller may `try`/`catch`).
+    fn out_of_memory_value(&self) -> Value {
+        let tag = self
+            .prog
+            .err_names
+            .iter()
+            .find(|(_, name)| name.as_str() == "OutOfMemory")
+            .map(|(t, _)| t.0)
+            .unwrap_or(0);
+        Value::ErrVal(tag)
+    }
+
+    /// A clean program panic carrying `detail` (used by the GPA double-/foreign-
+    /// free traps).
+    fn clean_panic(&self, detail: &str) -> Halt {
+        Halt::Panic(PanicInfo {
+            reason: TrapReason::Panic,
+            detail: Some(detail.to_string()),
+        })
+    }
+
+    // ---- the *System random capability --------------------------------
+
+    /// Advances the splitmix64 PRNG and returns the next 64-bit draw.
+    fn next_random(&mut self) -> u64 {
+        // splitmix64: a small, well-distributed, dependency-free generator.
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Fills the `[]u8` operand with PRNG bytes.
+    fn random_bytes(&mut self, operand: Option<&Value>) {
+        // The buffer may be a `[]u8` slice or a `*[N]u8` pointer-to-array (the
+        // `sys.random.bytes(&buf)` spelling), whose backing cell length is the
+        // count to fill.
+        let (ptr, len) = match operand {
+            Some(Value::Slice { ptr, len }) => (*ptr, *len),
+            Some(Value::Ptr(p)) => (*p, self.heap.len_of(*p).unwrap_or(0)),
+            _ => return,
+        };
+        for i in 0..len {
+            let byte = (self.next_random() & 0xFF) as i128;
+            let _ = self.heap.store_index(
+                ptr,
+                i,
+                Value::int(
+                    byte,
+                    IntRepr {
+                        width: 8,
+                        signed: false,
+                    },
+                ),
+            );
+        }
+    }
+
+    /// Implements `@bufPrint(buf, fmt, args)`: format into a scratch buffer, copy
+    /// into the caller's `[]u8` cell, and return `Ok([]u8)` of the written prefix
+    /// (or `error.NoSpaceLeft` if the formatted text does not fit).
+    fn intrinsic_buf_print(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let (buf_ptr, buf_len) = match args.first() {
+            Some(Value::Slice { ptr, len }) => (*ptr, *len),
+            _ => (Ptr::NULL, 0),
+        };
+        let fmt_bytes = match args.get(1) {
+            Some(Value::Str(b)) => b.clone(),
+            _ => Rc::new(Vec::new()),
+        };
+        let arg_values: Vec<Value> = match args.get(2) {
+            Some(Value::Struct(fields)) | Some(Value::Array(fields)) => fields.as_ref().clone(),
+            Some(other) => vec![other.clone()],
+            None => Vec::new(),
+        };
+        let mut scratch = Vec::new();
+        format_into(&mut scratch, &fmt_bytes, &arg_values).map_err(|e| {
+            Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some(e),
+            })
+        })?;
+        if scratch.len() > buf_len {
+            // `error.NoSpaceLeft` (fall back to OutOfMemory's slot if absent).
+            let tag = self
+                .prog
+                .err_names
+                .iter()
+                .find(|(_, name)| name.as_str() == "NoSpaceLeft")
+                .map(|(t, _)| t.0)
+                .unwrap_or_else(|| match self.out_of_memory_value() {
+                    Value::ErrVal(t) => t,
+                    _ => 0,
+                });
+            return Ok(Value::ErrVal(tag));
+        }
+        for (i, &b) in scratch.iter().enumerate() {
+            let _ = self.heap.store_index(
+                buf_ptr,
+                i,
+                Value::int(
+                    b as i128,
+                    IntRepr {
+                        width: 8,
+                        signed: false,
+                    },
+                ),
+            );
+        }
+        Ok(Value::ErrOk(Box::new(Value::Slice {
+            ptr: buf_ptr,
+            len: scratch.len(),
+        })))
     }
 
     /// The error name for an error-valued operand.
@@ -1177,16 +1741,6 @@ impl<'p> Vm<'p> {
         })
     }
 
-    /// A clean out-of-memory panic for an over-large allocation. Kept distinct
-    /// from [`Self::heap_panic`] so the message reads as a top-level `out of
-    /// memory` rather than a pointer fault.
-    fn oom_panic(&self) -> Halt {
-        Halt::Panic(PanicInfo {
-            reason: TrapReason::Panic,
-            detail: Some("out of memory".to_string()),
-        })
-    }
-
     /// An internal VM fault that should be impossible after `verify`; surfaced as
     /// a clean panic rather than a Rust panic.
     fn internal(&self, what: &str) -> Halt {
@@ -1240,6 +1794,34 @@ fn type_carrier(args: &[Value]) -> Option<TypeId> {
         Value::Undef(ty) => Some(*ty),
         _ => None,
     })
+}
+
+/// The handle id carried by an `Allocator` receiver value (the `Capability::
+/// Allocator(id)` from `sys.heap` or an `@allocHandle`). A non-allocator receiver
+/// (or an absent one) falls back to the default allocator id `0`.
+fn alloc_id_of(recv: &Option<Value>) -> u32 {
+    match recv {
+        Some(Value::Cap(Capability::Allocator(id))) => *id,
+        _ => 0,
+    }
+}
+
+/// The handle id for a `realloc` reached as `alloc.realloc(slice, n)`: the id is
+/// on the receiver. When the floor `@reallocRaw(id, slice, n)` form is used, the
+/// id is instead the first integer operand; we prefer the receiver if present.
+fn alloc_id_for_realloc(recv: &Option<Value>, args: &[Value]) -> u32 {
+    if let Some(Value::Cap(Capability::Allocator(id))) = recv {
+        return *id;
+    }
+    // The floor form: the leading `u32` operand before the slice is the id.
+    for a in args {
+        match a {
+            Value::Slice { .. } => break,
+            Value::Int { v, .. } if *v >= 0 => return *v as u32,
+            _ => {}
+        }
+    }
+    0
 }
 
 /// The shift amount, taken modulo the operand width for safety (an over-wide

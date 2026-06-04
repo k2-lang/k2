@@ -48,12 +48,12 @@ use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
 use k2_mir::{dump_mir, lower_program, BuildMode, MirProgram, Severity as MirSeverity};
 use k2_opt::{optimize, OptLevel, OptStats};
-use k2_parse::{parse, to_sexpr, Severity};
+use k2_parse::{parse, to_sexpr, ParseResult, Severity};
 use k2_resolve::{
     dump_resolution, dump_scopes, resolve_file, resolve_module, FileLoader, LoadError,
     ResolvedModule, Severity as ResolveSeverity,
 };
-use k2_syntax::{SourceFile, Span};
+use k2_syntax::{Expr, Item, SourceFile, Span};
 use k2_types::{check_file, dump_signatures, dump_types, Severity as TypeSeverity};
 use k2_vm::{run_metered, run_program, RunArgs, RunOutcome};
 
@@ -108,6 +108,68 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
         other => Err(format!("unknown subcommand `{other}` (try `{PROG} help`)")),
     }
+}
+
+/// Parses `source` together with the bundled standard library, producing a
+/// single [`ParseResult`] whose [`SourceFile`] is the user's items plus one
+/// synthetic `const __k2_std_root = struct { ... };` carrying the whole of
+/// `std`, with every `const X = @import("std")` re-pointed at that root.
+///
+/// This is what makes `@import("std")` resolve to a REAL compiled module: `std`
+/// becomes an ordinary type-valued `const`, so `std.heap.GeneralPurposeAllocator`
+/// / `std.ArrayList(u32)` resolve to real declarations and monomorphize through
+/// the normal pipeline (only the handle-based allocator floor stays intrinsic).
+///
+/// The std source is *appended* after the user source, so user spans — and thus
+/// every user diagnostic's line/column — are byte-for-byte identical to a
+/// std-free parse; the std items simply occupy the high end of the span space.
+/// Semantic phases that key on the appended (still-`@import`) string never see
+/// the original `@import("std")` because the AST node is rewritten in place to a
+/// name reference at the very same span.
+fn parse_program(source: &str) -> ParseResult {
+    // One combined text: user source first (offsets preserved), then std.
+    let mut combined = String::with_capacity(source.len() + k2_std::STD_BODY.len() + 64);
+    combined.push_str(source);
+    if !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(&k2_std::std_root_item_source());
+
+    let mut result = k2_parse::parse(&combined);
+    rewrite_std_imports(&mut result.file);
+    result
+}
+
+/// Re-points every user `const X = @import("std")` binding to the synthetic std
+/// root, by replacing the `@import("std")` initializer expression with a bare
+/// identifier reference to [`k2_std::STD_ROOT_NAME`] at the same span. Other
+/// imports (`@import("build")`, path imports) are left untouched and stay
+/// opaque exactly as before.
+fn rewrite_std_imports(file: &mut SourceFile) {
+    for item in &mut file.items {
+        if let Item::Const { value, .. } = item {
+            if import_target(value).as_deref() == Some("std") {
+                let span = value.span();
+                *value = Expr::Ident {
+                    name: k2_std::STD_ROOT_NAME.to_string(),
+                    span,
+                };
+            }
+        }
+    }
+}
+
+/// If `e` is exactly `@import("name")`, returns the imported `name` (with quotes
+/// stripped). Returns `None` for any other expression.
+fn import_target(e: &Expr) -> Option<String> {
+    if let Expr::Builtin { name, args, .. } = e {
+        if name == "@import" {
+            if let [Expr::Str { text, .. }] = args.as_slice() {
+                return Some(text.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The `tokenize` / `lex` subcommand: read source from a file path or stdin,
@@ -575,7 +637,7 @@ fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
         path.ok_or_else(|| "`check` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
 
     let (source, label) = read_source(path)?;
-    let pres = parse(&source);
+    let pres = parse_program(&source);
 
     // Parse errors gate type-checking: report them and stop, like `resolve`.
     if !pres.is_ok() {
@@ -736,7 +798,7 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
         path.ok_or_else(|| "`mir` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
 
     let (source, label) = read_source(path)?;
-    let pres = parse(&source);
+    let pres = parse_program(&source);
 
     // Parse errors gate lowering: report them and stop, like `check`.
     if !pres.is_ok() {
@@ -901,7 +963,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         path.ok_or_else(|| "`run` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
 
     let (source, label) = read_source(path)?;
-    let pres = parse(&source);
+    let pres = parse_program(&source);
 
     // Parse errors gate execution: report them and stop, like `mir`.
     if !pres.is_ok() {
@@ -1174,7 +1236,7 @@ fn lower_run_metered(
     mode: BuildMode,
     opt_flag: bool,
 ) -> Result<(String, i32, u64), String> {
-    let pres = parse(source);
+    let pres = parse_program(source);
     if !pres.is_ok() {
         return Err(format!("{label}: parse errors"));
     }

@@ -1,0 +1,257 @@
+// std.k2 — the bundled k2 standard library, written in k2.
+//
+// k2 — "Kardashev Type II": total control over the machine, with zero waste.
+//
+// This file is the BODY of the `std` namespace: the driver wraps it in a single
+// synthetic `const std = struct { <this file> };` and prepends it into the
+// user's source, so `@import("std")` resolves to a REAL compiled module. Every
+// declaration here is parsed, name-resolved, type-checked, monomorphized,
+// lowered, and executed exactly like user code.
+//
+// The design honors the charter pillar **No hidden allocation**: nothing here
+// allocates without an explicit `Allocator` capability, and the allocator is
+// HANDLE-BASED — an `Allocator` is a `u32` id that selects an allocator
+// instance in the VM, so different kinds (GPA, arena, fixed-buffer) behave
+// differently with no fn-pointer vtables. The handle methods bottom out in a
+// few `@builtin` leaf intrinsics (`@allocRaw`/`@reallocRaw`/`@freeRaw`/…) that
+// the VM implements over its managed heap.
+
+// =========================================================================
+//  mem — the Allocator capability + small memory helpers
+// =========================================================================
+
+/// The bundled-std view of memory utilities. The `Allocator` *type* itself is
+/// the predeclared opaque capability (so a user signature `fn f(a: Allocator)`
+/// and `std`'s own uses name the SAME type); `mem` adds value-level helpers.
+pub const mem = struct {
+    /// Copy `src` into `dst` element-by-element (both must be at least `n` long).
+    pub fn copy(comptime T: type, dst: []T, src: []const T) void {
+        var i: usize = 0;
+        while (i < src.len) : (i += 1) {
+            dst[i] = src[i];
+        }
+    }
+
+    /// `true` if two slices have equal length and equal elements.
+    pub fn eql(comptime T: type, a: []const T, b: []const T) bool {
+        if (a.len != b.len) return false;
+        var i: usize = 0;
+        while (i < a.len) : (i += 1) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+};
+
+// =========================================================================
+//  heap — the standard allocators
+// =========================================================================
+
+/// The family of standard allocators. They all expose the same `Allocator`
+/// interface (the handle methods `alloc`/`free`/`realloc`/`create`/`destroy`),
+/// so code written against `Allocator` works with any of them. You choose a
+/// STRATEGY where you create the allocator; the rest of the program is agnostic.
+pub const heap = struct {
+    /// The general-purpose allocator: the default-quality allocator and a leak /
+    /// double-free / use-after-free detector in safe builds. `deinit` reports
+    /// whether anything leaked. In ReleaseFast the checks are stripped.
+    pub const GeneralPurposeAllocator = struct {
+        const Self = @This();
+        /// The VM-side handle id of this allocator instance.
+        id: u32,
+
+        /// Create a fresh GPA. Takes `*System` to make heap authority explicit.
+        pub fn init(sys: *System) Self {
+            return Self{ .id = @allocId(1, 0) };
+        }
+
+        /// The `Allocator` capability backed by this GPA.
+        pub fn allocator(self: *Self) Allocator {
+            return @allocHandle(self.id);
+        }
+
+        /// Tear down the GPA, reporting whether any allocation was never freed.
+        /// `true` means a leak — the canonical pattern is to `@panic` on it.
+        pub fn deinit(self: *Self) bool {
+            return @gpaDeinit(self.id);
+        }
+    };
+
+    /// An arena allocator: allocates from a backing allocator and NEVER frees
+    /// individual allocations — everything is freed at once on `deinit`. Ideal
+    /// for phase- or request-scoped work where many objects share one lifetime.
+    pub const ArenaAllocator = struct {
+        const Self = @This();
+        id: u32,
+        backing: Allocator,
+
+        /// Create an arena over a backing allocator.
+        pub fn init(backing: Allocator) Self {
+            return Self{ .backing = backing, .id = @allocId(2, 0) };
+        }
+
+        /// The `Allocator` capability backed by this arena.
+        pub fn allocator(self: *Self) Allocator {
+            return @allocHandle(self.id);
+        }
+
+        /// Free EVERYTHING the arena handed out, in one operation.
+        pub fn deinit(self: *Self) void {
+            @arenaDeinit(self.id);
+        }
+    };
+
+    /// A fixed-buffer allocator: hands out memory from a caller-provided byte
+    /// buffer, with zero heap involvement. Allocation fails with `OutOfMemory`
+    /// when the buffer is exhausted. For real-time / embedded / bounded work.
+    pub const FixedBufferAllocator = struct {
+        const Self = @This();
+        id: u32,
+
+        /// Create an FBA over a caller buffer.
+        pub fn init(buffer: []u8) Self {
+            return Self{ .id = @allocId(3, 0, buffer) };
+        }
+
+        /// The `Allocator` capability backed by this buffer.
+        pub fn allocator(self: *Self) Allocator {
+            return @allocHandle(self.id);
+        }
+    };
+
+    /// The page allocator: requests memory directly from the OS. Here it is the
+    /// VM's managed heap proxy (the default allocator behavior). Use it as the
+    /// backing allocator for an arena, or for a few large, long-lived buffers.
+    pub const PageAllocator = struct {
+        const Self = @This();
+        id: u32,
+
+        pub fn init(sys: *System) Self {
+            return Self{ .id = @allocId(0, 0) };
+        }
+
+        pub fn allocator(self: *Self) Allocator {
+            return @allocHandle(self.id);
+        }
+    };
+};
+
+// =========================================================================
+//  ArrayList — the canonical growable container
+// =========================================================================
+
+/// A growable array of `T`, allocator-taking with explicit `init`/`deinit`.
+/// `ArrayList` is an ordinary function from a type to a type, evaluated at
+/// comptime — there is no special generics syntax. It stores the allocator it
+/// was handed and frees with THAT SAME allocator on `deinit`. No hidden
+/// allocation: `append` may fail with `OutOfMemory`, surfaced via `try`.
+pub fn ArrayList(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The live elements: a view of `store` truncated to the logical count.
+        /// Reading `list.items.len` / `list.items[i]` sees exactly the elements
+        /// that were appended.
+        items: []T,
+        /// The full capacity-length backing storage. `store.len` is the physical
+        /// capacity; `items` is always `store[0..count]`.
+        store: []T,
+        /// The allocator this list owns its storage through.
+        alloc: Allocator,
+
+        /// An empty list bound to `alloc`. `&.{}` is the canonical empty slice.
+        pub fn init(alloc: Allocator) Self {
+            return Self{ .items = &.{}, .store = &.{}, .alloc = alloc };
+        }
+
+        /// Release the backing storage with the list's own allocator.
+        pub fn deinit(self: *Self) void {
+            if (self.store.len != 0) {
+                self.alloc.free(self.store);
+            }
+        }
+
+        /// Append `value`, growing the backing storage if needed.
+        pub fn append(self: *Self, value: T) !void {
+            const n = self.items.len;
+            try self.ensureCapacity(n + 1);
+            // Grow the logical view by one (over `store`) and write the new tail.
+            self.items = self.store[0 .. n + 1];
+            self.items[n] = value;
+        }
+
+        /// Ensure the backing storage holds at least `need` elements, doubling
+        /// (from a floor of 8) so amortized append is O(1).
+        pub fn ensureCapacity(self: *Self, need: usize) !void {
+            if (need <= self.store.len) return;
+            var new_cap: usize = if (self.store.len == 0) 8 else self.store.len * 2;
+            if (new_cap < need) new_cap = need;
+            const count = self.items.len;
+            // `realloc` preserves contents; it returns a `new_cap`-length slice.
+            self.store = try self.alloc.realloc(self.store, new_cap);
+            // Keep `items` at the logical length over the grown storage.
+            self.items = self.store[0..count];
+        }
+
+        /// The number of live elements.
+        pub fn len(self: *const Self) usize {
+            return self.items.len;
+        }
+
+        /// Bounds-checked access; absence is an optional, never an accidental null.
+        pub fn get(self: *const Self, index: usize) ?T {
+            if (index >= self.items.len) return null;
+            return self.items[index];
+        }
+    };
+}
+
+// =========================================================================
+//  testing — assertions + a leak-detecting testing allocator
+// =========================================================================
+
+/// Test helpers. Assertions are VALUES: a failing `expect*` returns an error,
+/// so a test runner reports it as an ordinary failure (no exceptions).
+pub const testing = struct {
+    /// A leak-detecting allocator handed to each test. It is a GPA-tracked
+    /// handle; the test harness checks it at test end and fails on a leak.
+    pub const allocator: Allocator = @allocHandle(@allocId(5, 0));
+
+    /// Succeed iff `ok` is true.
+    pub fn expect(ok: bool) !void {
+        if (not ok) return error.TestUnexpectedResult;
+    }
+
+    /// Succeed iff `expected == actual`.
+    pub fn expectEqual(expected: anytype, actual: anytype) !void {
+        if (expected != actual) return error.TestExpectedEqual;
+    }
+
+    /// Succeed iff `actual` is the error `expected` (and not a success value).
+    pub fn expectError(expected: anyerror, actual: anytype) !void {
+        if (actual) |_| {
+            return error.TestExpectedError;
+        } else |e| {
+            if (e != expected) return error.TestUnexpectedError;
+        }
+    }
+
+    /// Succeed iff two slices are element-wise equal.
+    pub fn expectEqualSlices(comptime T: type, a: []const T, b: []const T) !void {
+        if (not mem.eql(T, a, b)) return error.TestExpectedEqual;
+    }
+};
+
+// =========================================================================
+//  fmt — formatting helpers shared with the io print path
+// =========================================================================
+
+/// Formatting helpers. `bufPrint` formats into a caller buffer, sharing the
+/// exact engine the `Writer.print` io path uses (the VM's `@bufPrint`/`@print`).
+pub const fmt = struct {
+    /// Format `args` into `buf` per `template`, returning the written prefix or
+    /// `error.NoSpaceLeft` if it does not fit.
+    pub fn bufPrint(buf: []u8, comptime template: []const u8, args: anytype) ![]u8 {
+        return @bufPrint(buf, template, args);
+    }
+};

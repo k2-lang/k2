@@ -62,6 +62,53 @@ pub enum IntrinsicId {
     NoNegOverflow,
     /// `@narrow_fits(v, T)` -> `true` if `v` fits the narrower `T`.
     NarrowFits,
+
+    // ---- The std allocator floor (handle-based) -------------------------
+    //
+    // The std `Allocator` and the `std.heap.*` allocators are handle-based: an
+    // `Allocator` is a `u32` id that selects an allocator *instance* in the VM's
+    // per-run registry, so different kinds (GPA, arena, fixed-buffer) behave
+    // differently with no fn-pointer vtables. These leaf intrinsics are what the
+    // std method bodies call, passing that id.
+    /// `@allocId(kind, backing_id)` -> registers a fresh allocator instance and
+    /// returns its `u32` id. `kind`: 0=Default 1=GPA 2=Arena 3=FixedBuffer.
+    AllocId,
+    /// `@allocHandle(id)` -> the opaque `Allocator` value carrying `id`.
+    AllocHandle,
+    /// `@allocRaw(id, T, n)` -> `Ok([]T)` (the kind's allocate-many).
+    AllocRaw,
+    /// `@reallocRaw(id, slice, n)` -> `Ok([]T)`, copying contents, freeing the old.
+    ReallocRaw,
+    /// `@freeRaw(id, slice)` -> release; GPA/testing trap on double/foreign free.
+    FreeRaw,
+    /// `@createRaw(id, T)` -> `Ok(*T)` (the kind's allocate-one).
+    CreateRaw,
+    /// `@destroyRaw(id, ptr)` -> release one; GPA/testing trap on double free.
+    DestroyRaw,
+    /// `@arenaDeinit(id)` -> free every cell the arena handed out, at once.
+    ArenaDeinit,
+    /// `@gpaDeinit(id)` -> `true` if anything leaked (drops the tracker).
+    GpaDeinit,
+
+    // ---- The *System capability floor -----------------------------------
+    /// `@clockNow(which)` -> a `u64` nanosecond reading (0=monotonic, 1=wall).
+    ClockNow,
+    /// `@clockSleep(ns)` -> advance the VM's monotonic clock by `ns`.
+    ClockSleep,
+    /// `@randomBytes(buf)` -> fill `buf: []u8` with PRNG bytes.
+    RandomBytes,
+    /// `@randomInt(T)` -> a `u64` PRNG draw (the caller narrows).
+    RandomInt,
+    /// `@envGet(name)` -> `?[]const u8`, the value of env var `name`.
+    EnvGet,
+    /// `@bufPrint(buf, fmt, args)` -> `Ok([]u8)` formatted into `buf`, or
+    /// `error.NoSpaceLeft`.
+    BufPrint,
+    /// `slice.len` on a still-`deferred`-typed receiver -> its `usize` length.
+    SliceLen,
+    /// `slice.ptr` on a still-`deferred`-typed receiver -> its data pointer.
+    SlicePtr,
+
     /// An intrinsic the VM does not implement (e.g. a `std.testing.*` member
     /// reached outside the `run` path). Dispatch yields a clean panic naming it.
     Unsupported(String),

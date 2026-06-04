@@ -98,6 +98,13 @@ struct FnCompiler<'p> {
     consts: Vec<Value>,
     /// `BlockId.index() -> instruction offset of that block's first instr`.
     block_offsets: Vec<usize>,
+    /// The width of the operand-scratch window: the largest number of non-trivial
+    /// operands any single rvalue (an `Aggregate`/`Call`/`Intrinsic`) in this
+    /// function materializes, with a small floor. The receiver / projected-store /
+    /// eval scratch slots live *past* this window so they never collide with an
+    /// operand slot, and the frame is sized to cover them all. See
+    /// [`max_operand_scratch`] and [`FnCompiler::op_scratch`].
+    op_window: usize,
 }
 
 impl<'p> FnCompiler<'p> {
@@ -235,9 +242,36 @@ impl<'p> FnCompiler<'p> {
         self.func.locals.len() as Reg
     }
 
-    /// A second reserved scratch register (for binary/intrinsic operands).
+    /// The `n`-th operand-scratch register. Operand windows occupy
+    /// `op_scratch(0)..op_scratch(op_window - 1)`; `n` must be `< op_window`
+    /// (guaranteed because `op_window` is sized to the function's widest operand
+    /// list — see [`max_operand_scratch`]). Slot layout in the frame is:
+    /// `[locals..][index_scratch][op_scratch 0..op_window-1][recv][store][eval]`.
     fn op_scratch(&self, n: usize) -> Reg {
+        debug_assert!(
+            n < self.op_window,
+            "op_scratch index {n} exceeds operand window {}",
+            self.op_window
+        );
         self.func.locals.len() as Reg + 1 + n as Reg
+    }
+
+    /// The dedicated receiver scratch slot for a value-rooted intrinsic chain. It
+    /// sits *past* the operand window so a many-argument intrinsic call cannot
+    /// overwrite the receiver register with one of its own operand scratch slots.
+    fn recv_scratch(&self) -> Reg {
+        self.func.locals.len() as Reg + 1 + self.op_window as Reg
+    }
+
+    /// The dedicated scratch slot for a projected-destination store (compute the
+    /// rvalue here, then store it through the place chain).
+    fn store_scratch(&self) -> Reg {
+        self.recv_scratch() + 1
+    }
+
+    /// The dedicated scratch slot for a discarded `Eval` rvalue.
+    fn eval_scratch(&self) -> Reg {
+        self.recv_scratch() + 2
     }
 
     /// Builds the `StoreStep` chain and base info for a projected place, lowering
@@ -459,7 +493,7 @@ impl<'p> FnCompiler<'p> {
         match &path.root {
             IntrinsicRoot::Value(op) => match op.as_ref() {
                 Operand::Copy(p) if p.proj.is_empty() => Some(p.base.0),
-                other => Some(self.operand_to_reg(other, self.op_scratch(7))),
+                other => Some(self.operand_to_reg(other, self.recv_scratch())),
             },
             _ => None,
         }
@@ -480,6 +514,23 @@ impl<'p> FnCompiler<'p> {
                 "narrow_fits" => IntrinsicId::NarrowFits,
                 "errorName" => IntrinsicId::ErrorName,
                 "typeName" => IntrinsicId::TypeName,
+                // The std allocator floor (handle-based) + the *System
+                // capability readers. See `IntrinsicId` and the VM dispatcher.
+                "allocId" => IntrinsicId::AllocId,
+                "allocHandle" => IntrinsicId::AllocHandle,
+                "allocRaw" => IntrinsicId::AllocRaw,
+                "reallocRaw" => IntrinsicId::ReallocRaw,
+                "freeRaw" => IntrinsicId::FreeRaw,
+                "createRaw" => IntrinsicId::CreateRaw,
+                "destroyRaw" => IntrinsicId::DestroyRaw,
+                "arenaDeinit" => IntrinsicId::ArenaDeinit,
+                "gpaDeinit" => IntrinsicId::GpaDeinit,
+                "clockNow" => IntrinsicId::ClockNow,
+                "clockSleep" => IntrinsicId::ClockSleep,
+                "randomBytes" => IntrinsicId::RandomBytes,
+                "randomInt" => IntrinsicId::RandomInt,
+                "envGet" => IntrinsicId::EnvGet,
+                "bufPrint" => IntrinsicId::BufPrint,
                 other => IntrinsicId::Unsupported(format!("@{other}")),
             },
             IntrinsicRoot::Value(_) => {
@@ -491,9 +542,31 @@ impl<'p> FnCompiler<'p> {
                     ["stdout"] => IntrinsicId::StdoutWriter,
                     ["stderr"] => IntrinsicId::StderrWriter,
                     ["heap"] => IntrinsicId::HeapCap,
+                    ["clock"] => IntrinsicId::ClockNow,
+                    // The documented `*System` capability method spellings (spec
+                    // §10.7). The underlying intrinsics are deterministic: the
+                    // clock starts at 0 and only advances on `sleep`, the PRNG is a
+                    // fixed-seed splitmix64, and env lookups are offline-absent.
+                    ["clock", "now" | "monotonicNanos" | "wallNanos"] => IntrinsicId::ClockNow,
+                    ["clock", "sleep"] => IntrinsicId::ClockSleep,
+                    ["random", "int" | "intRangeLessThan"] => IntrinsicId::RandomInt,
+                    ["random", "bytes"] => IntrinsicId::RandomBytes,
+                    ["env", "get"] => IntrinsicId::EnvGet,
                     ["print"] => IntrinsicId::Print,
+                    // Slice metadata reached on a still-`deferred` value (an
+                    // unannotated `const g = alloc.realloc(...)` whose element
+                    // type the checker left open): read the receiver's own
+                    // slice length / pointer at run time.
+                    ["len"] => IntrinsicId::SliceLen,
+                    ["ptr"] => IntrinsicId::SlicePtr,
+                    // The `Allocator` method floor, reached as member calls on an
+                    // `Allocator` value (`alloc.alloc(T,n)`, `alloc.realloc(s,n)`,
+                    // …). The receiver value carries the handle id (a `u32` field,
+                    // or the bare `sys.heap` capability == the default id 0), and
+                    // the VM routes the heap op to that allocator instance.
                     ["create"] => IntrinsicId::Create,
                     ["alloc"] => IntrinsicId::Alloc,
+                    ["realloc"] => IntrinsicId::ReallocRaw,
                     ["destroy"] => IntrinsicId::Destroy,
                     ["free"] => IntrinsicId::Free,
                     _ => IntrinsicId::Unsupported(format!("value.{}", path.dotted())),
@@ -560,14 +633,50 @@ pub fn default_value(arena: &TypeArena, ty: TypeId) -> Value {
     }
 }
 
+/// The width of the operand-scratch window a function needs: the largest number
+/// of operands any single `Aggregate`/`Call`/`Intrinsic` rvalue materializes,
+/// floored at a small constant so the common short rvalues keep a comfortable
+/// margin and the terminator/binary helpers (which use `op_scratch(0..=2)`)
+/// always have room.
+///
+/// `operands_to_regs` assigns one fresh scratch slot per *non-trivial* operand
+/// (a bare-local operand reuses its own register and consumes no slot), so the
+/// true demand is bounded by the total operand count — using the total is a safe
+/// over-estimate. Sizing the frame from this (rather than a fixed `+16`) is what
+/// keeps a 16+ element array literal, a many-argument call, or a wide `print`
+/// from writing past the frame and aborting the host Rust process.
+fn max_operand_scratch(func: &MirFunction) -> usize {
+    /// Floor on the operand window: enough for the binary/cast/slice helpers
+    /// (`op_scratch(0..=2)`) and a small margin of short aggregates.
+    const OP_WINDOW_FLOOR: usize = 8;
+    let mut max_ops = 0usize;
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let rvalue = match stmt {
+                Statement::Assign { rvalue, .. } | Statement::Eval { rvalue, .. } => rvalue,
+                _ => continue,
+            };
+            let n = match rvalue {
+                Rvalue::Aggregate { fields, .. } => fields.len(),
+                Rvalue::Call { args, .. } | Rvalue::Intrinsic { args, .. } => args.len(),
+                _ => 0,
+            };
+            max_ops = max_ops.max(n);
+        }
+    }
+    max_ops.max(OP_WINDOW_FLOOR)
+}
+
 /// Compiles a single function.
 fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
+    let op_window = max_operand_scratch(func);
     let mut c = FnCompiler {
         prog,
         func,
         code: Vec::new(),
         consts: Vec::new(),
         block_offsets: vec![usize::MAX; func.blocks.len()],
+        op_window,
     };
 
     // Records of control-flow instructions needing a BlockId -> offset patch.
@@ -661,10 +770,15 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
         }
     }
 
-    // The frame needs the MIR locals plus a small band of scratch registers used
-    // for index/operand materialization (index scratch + op scratch 0..=7 +
-    // receiver scratch). Eight op-scratch slots is more than any corpus rvalue.
-    let num_regs = func.locals.len() + 16;
+    // The frame needs the MIR locals plus a band of scratch registers used for
+    // index/operand materialization, sized from the function's *actual* widest
+    // operand list (see `max_operand_scratch`) rather than a fixed slack. The
+    // layout is:
+    //   [locals..][index_scratch][op_scratch 0..op_window-1][recv][store][eval]
+    // = locals.len() + 1 (index) + op_window (operands) + 3 (recv/store/eval).
+    // Sizing from the real demand is what prevents a >=15-operand aggregate/call/
+    // print from writing past the frame and aborting the host process.
+    let num_regs = func.locals.len() + 1 + op_window + 3;
 
     CompiledFn {
         code: c.code,
@@ -686,7 +800,7 @@ fn compile_stmt(c: &mut FnCompiler<'_>, stmt: &Statement) {
             } else {
                 // Projected destination: compute the rvalue into a scratch, then
                 // store it through the place chain.
-                let scratch = c.op_scratch(8);
+                let scratch = c.store_scratch();
                 let dst_ty = Some(c.place_target_ty(place));
                 c.compile_rvalue(scratch, rvalue, dst_ty);
                 let (base, steps) = c.place_steps(place);
@@ -698,7 +812,7 @@ fn compile_stmt(c: &mut FnCompiler<'_>, stmt: &Statement) {
             }
         }
         Statement::Eval { rvalue, .. } => {
-            let scratch = c.op_scratch(9);
+            let scratch = c.eval_scratch();
             c.compile_rvalue(scratch, rvalue, None);
         }
         Statement::StorageLive(l) => {

@@ -63,6 +63,14 @@ pub(crate) struct Lowerer<'a> {
     mode: BuildMode,
     /// Every `fn` item (top-level and nested-in-a-generic) by its DefId.
     fn_items: HashMap<DefId, Item>,
+    /// Value-producing `const` decls by DefId, mapping to their initializer
+    /// expression. A *value* const is one whose initializer is a runtime value
+    /// (e.g. `pub const allocator: Allocator = @allocHandle(@allocId(5, 0));`),
+    /// NOT a container/type/error-set/fn. Referencing such a member
+    /// (`std.testing.allocator`) inlines its initializer here instead of emitting
+    /// an unresolvable `@std.<member>` intrinsic. See
+    /// [`FnBuilder::lower_field_into`].
+    value_const_inits: HashMap<DefId, Expr>,
     /// The monomorphization worklist: instantiations still to lower.
     worklist: Vec<InstId>,
     /// Instantiation -> its assigned FnId (dedup; also lets recursion resolve).
@@ -120,12 +128,20 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Index value-producing `const` decls (incl. those nested in container
+        // types like `std.testing`) by DefId, so a member read that resolves to
+        // such a const can inline its initializer.
+        let mut value_const_inits = HashMap::new();
+        for item in &file.items {
+            index_value_consts(resolved, item, &mut value_const_inits);
+        }
         Lowerer {
             file,
             resolved,
             typed,
             mode,
             fn_items,
+            value_const_inits,
             err_set_consts,
             worklist: Vec::new(),
             by_inst: HashMap::new(),
@@ -133,7 +149,17 @@ impl<'a> Lowerer<'a> {
             entries: Vec::new(),
             consts: Vec::new(),
             str_intern: HashMap::new(),
-            err_tags: HashMap::new(),
+            // Pre-seed the std allocator-floor error names so they always carry a
+            // stable, nonzero tag even when no source spells them as `error.*`
+            // literals: the VM's bounded allocators (fixed-buffer / `@bufPrint`)
+            // synthesize these `error.OutOfMemory` / `error.NoSpaceLeft` values
+            // directly, and `@errorName`/`catch` must be able to name them.
+            err_tags: {
+                let mut m = HashMap::new();
+                m.insert("OutOfMemory".to_string(), ErrTag(1));
+                m.insert("NoSpaceLeft".to_string(), ErrTag(2));
+                m
+            },
             diagnostics: Vec::new(),
             fn_alloc_info: HashMap::new(),
             inst_budget: 100_000,
@@ -519,6 +545,71 @@ fn index_fn_items(resolved: &Resolved, item: &Item, out: &mut HashMap<DefId, Ite
         }
         _ => {}
     }
+}
+
+/// Recursively indexes *value-producing* `const` decls by DefId, descending into
+/// container-type const values (`pub const testing = struct { ... }`) so a member
+/// like `std.testing.allocator` can be inlined.
+///
+/// A const whose value is a [`Container`](Expr::Container), an
+/// [`ErrorSet`](Expr::ErrorSet), or a type-expression is NOT a runtime value
+/// (it is a namespace/type/error-set handled by the type system), so it is not
+/// indexed — only consts that yield a real value (e.g. an `@allocHandle(...)`
+/// capability) are.
+fn index_value_consts(resolved: &Resolved, item: &Item, out: &mut HashMap<DefId, Expr>) {
+    match item {
+        Item::Const { value, span, .. } => {
+            // Recurse into a container value to reach its nested member consts.
+            if let Expr::Container(c) = value {
+                for m in &c.members {
+                    if let Member::Decl(inner) = m {
+                        index_value_consts(resolved, inner, out);
+                    }
+                }
+                return;
+            }
+            // A runtime value const: index it (skip namespaces/error-sets/types).
+            if is_value_const_init(value) {
+                if let Some(d) = resolved.defs.iter().find(|d| d.span == *span) {
+                    out.insert(d.id, value.clone());
+                }
+            }
+        }
+        Item::Comptime { body, .. } => {
+            for s in body {
+                if let Stmt::Const {
+                    value: Expr::Container(c),
+                    ..
+                } = s
+                {
+                    for m in &c.members {
+                        if let Member::Decl(inner) = m {
+                            index_value_consts(resolved, inner, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `true` if a const's initializer expression yields a *runtime value* (rather
+/// than a type / namespace / error-set). Conservative: only the expression
+/// shapes that clearly denote a value are accepted, so a stray type-expression is
+/// never mistaken for an inlinable value const.
+fn is_value_const_init(value: &Expr) -> bool {
+    !matches!(
+        value,
+        Expr::Container(_)
+            | Expr::ErrorSet { .. }
+            | Expr::ArrayType { .. }
+            | Expr::FnType { .. }
+            | Expr::ErrorUnion { .. }
+            | Expr::AnyType { .. }
+            | Expr::Pointer { .. }
+            | Expr::Slice { .. }
+    )
 }
 
 /// Indexes fns nested in a statement (e.g. inside a returned `struct {...}`).

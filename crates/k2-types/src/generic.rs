@@ -94,14 +94,33 @@ impl crate::check::Checker<'_> {
     /// Resolves a call's callee expression to the fn definition it names, if it
     /// is a directly-named function with an indexed AST.
     fn callee_fn_def(&self, callee: &Expr) -> Option<DefId> {
-        if let Expr::Ident { span, .. } = callee {
-            if let Some(k2_resolve::Resolution::Def(id)) = self.resolution_at(*span) {
-                if self.fn_items.contains_key(&id) {
-                    return Some(id);
+        match callee {
+            // A bare generic-fn call: `List(u32)`.
+            Expr::Ident { span, .. } => {
+                if let Some(k2_resolve::Resolution::Def(id)) = self.resolution_at(*span) {
+                    if self.fn_items.contains_key(&id) {
+                        return Some(id);
+                    }
                 }
+                None
             }
+            // A namespaced generic-fn call: `std.ArrayList(u32)`. The field access
+            // was resolved (by the namespace-member path) to the member's decl,
+            // recorded as a `MemberRes::Decl`. This is what lets a bundled-std
+            // generic container instantiate through the normal engine, exactly
+            // like a user's own `List(T)`.
+            Expr::Field { span, .. } => {
+                if let Some(crate::ty::MemberRes::Decl(id)) =
+                    self.members.get(&(span.start, span.end)).copied()
+                {
+                    if self.fn_items.contains_key(&id) {
+                        return Some(id);
+                    }
+                }
+                None
+            }
+            _ => None,
         }
-        None
     }
 
     // =====================================================================

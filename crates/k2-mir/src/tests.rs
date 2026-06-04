@@ -1050,6 +1050,90 @@ fn leak_clean_when_try_alloc_payload_returned() {
 }
 
 #[test]
+fn leak_clean_for_fixed_buffer_allocator_no_free() {
+    // FINDING #2: an allocation from a FixedBufferAllocator (free is a no-op;
+    // buffer is caller-owned) must NOT be flagged even with no per-item free.
+    // The allocator is recognised as bulk/no-op-free by its struct type name and
+    // its `.allocator()` method, so Pattern A exempts the allocation.
+    let src = r#"
+        const FixedBufferAllocator = struct {
+            const Self = @This();
+            id: u32,
+            pub fn init() Self { return Self{ .id = 0 }; }
+            pub fn allocator(self: *Self) Allocator { return @allocHandle(self.id); }
+        };
+        fn useFba() void {
+            var fba = FixedBufferAllocator.init();
+            const al = fba.allocator();
+            const x = al.alloc(u8, 8) catch { return; };
+            _ = x;
+        }
+    "#;
+    let prog = lower(src, BuildMode::Debug);
+    assert!(
+        prog.diagnostics
+            .iter()
+            .all(|d| !d.is_error() || !d.message.contains("never freed")),
+        "an FBA allocation without per-item free is not a leak: {:?}",
+        prog.diagnostics
+    );
+}
+
+#[test]
+fn leak_clean_for_arena_allocator_no_free() {
+    // FINDING #2: an arena allocation (bulk free at `deinit`) must NOT be flagged
+    // even without an enclosing loop (which previously masked the false positive)
+    // and without per-item frees.
+    let src = r#"
+        const ArenaAllocator = struct {
+            const Self = @This();
+            id: u32,
+            pub fn init() Self { return Self{ .id = 0 }; }
+            pub fn allocator(self: *Self) Allocator { return @allocHandle(self.id); }
+            pub fn deinit(self: *Self) void { _ = self; }
+        };
+        fn useArena() void {
+            var arena = ArenaAllocator.init();
+            const scratch = arena.allocator();
+            const a = scratch.alloc(u8, 32) catch { return; };
+            _ = a;
+        }
+    "#;
+    let prog = lower(src, BuildMode::Debug);
+    assert!(
+        prog.diagnostics
+            .iter()
+            .all(|d| !d.is_error() || !d.message.contains("never freed")),
+        "an arena allocation without per-item free is not a leak: {:?}",
+        prog.diagnostics
+    );
+}
+
+#[test]
+fn leak_still_flagged_for_generic_allocator_after_bulk_free_exemption() {
+    // FINDING #2 (guardrail): the bulk-free exemption must NOT swallow a genuine
+    // leak through a plain `Allocator` (a GPA/page handle requires explicit free).
+    let src = r#"
+        fn bad(a: Allocator) void {
+            const x = a.alloc(u8, 8) catch { return; };
+            _ = x;
+        }
+    "#;
+    let prog = lower(src, BuildMode::Debug);
+    let leaks: Vec<&Diagnostic> = prog
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error() && d.message.contains("never freed"))
+        .collect();
+    assert_eq!(
+        leaks.len(),
+        1,
+        "a plain-Allocator leak is still flagged: {:?}",
+        prog.diagnostics
+    );
+}
+
+#[test]
 fn block_break_value_slot_is_typed_and_no_dead_block() {
     // REGRESSION: `const r = blk: { for ... break :blk x; break :blk 0; }` types
     // `r` as u32 (not noreturn) and leaves NO unreachable block after GC.
