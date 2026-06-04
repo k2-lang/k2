@@ -1,0 +1,804 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn partialSum
+    (params
+      (param lo
+        (ident u64)
+      )
+      (param hi
+        (ident u64)
+      )
+    )
+    (ret
+      (ident u64)
+    )
+    (block
+      (var s
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (var i
+        (ident lo)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (ident hi)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (assign +=
+              (ident s)
+              (ident i)
+            )
+          )
+        )
+      )
+      (return
+        (ident s)
+      )
+    )
+  )
+  (fn producer
+    (params
+      (param ch
+        (ptr
+          (call
+            (field Channel
+              (ident std)
+            )
+            (ident u64)
+          )
+        )
+      )
+      (param n
+        (ident u64)
+      )
+    )
+    (ret
+      (ident void)
+    )
+    (block
+      (var i
+        (ty
+          (ident u64)
+        )
+        (int 1)
+      )
+      (while
+        (cond
+          (binary le
+            (ident i)
+            (ident n)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (catch
+                (call
+                  (field send
+                    (ident ch)
+                  )
+                  (ident i)
+                )
+                (block)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field close
+            (ident ch)
+          )
+        )
+      )
+    )
+  )
+  (const Counter
+    (container struct
+      (field mu
+        (ty
+          (field Mutex
+            (field Thread
+              (ident std)
+            )
+          )
+        )
+      )
+      (field value
+        (ty
+          (ident u64)
+        )
+      )
+    )
+  )
+  (fn bump
+    (params
+      (param c
+        (ptr
+          (ident Counter)
+        )
+      )
+      (param times
+        (ident u64)
+      )
+    )
+    (ret
+      (ident void)
+    )
+    (block
+      (var k
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident k)
+            (ident times)
+          )
+        )
+        (cont
+          (assign +=
+            (ident k)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (call
+                (field lock
+                  (field mu
+                    (ident c)
+                  )
+                )
+              )
+            )
+            (defer
+              (expr
+                (call
+                  (field unlock
+                    (field mu
+                      (ident c)
+                    )
+                  )
+                )
+              )
+            )
+            (assign +=
+              (field value
+                (ident c)
+              )
+              (int 1)
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn doubleIt
+    (params
+      (param x
+        (ident u64)
+      )
+    )
+    (ret
+      (ident u64)
+    )
+    (block
+      (return
+        (binary mul
+          (ident x)
+          (int 2)
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var exec
+        (call
+          (field init
+            (field Executor
+              (field Thread
+                (ident std)
+              )
+            )
+          )
+          (field heap
+            (ident sys)
+          )
+          (init
+            (ty)
+            (fields
+              (field-init worker_count
+                (int 4)
+              )
+            )
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident exec)
+            )
+          )
+        )
+      )
+      (const t0
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident partialSum)
+          (init
+            (ty)
+            (tuple
+              (builtin @as
+                (ident u64)
+                (int 0)
+              )
+              (builtin @as
+                (ident u64)
+                (int 250)
+              )
+            )
+          )
+        )
+      )
+      (const t1
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident partialSum)
+          (init
+            (ty)
+            (tuple
+              (builtin @as
+                (ident u64)
+                (int 250)
+              )
+              (builtin @as
+                (ident u64)
+                (int 500)
+              )
+            )
+          )
+        )
+      )
+      (const t2
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident partialSum)
+          (init
+            (ty)
+            (tuple
+              (builtin @as
+                (ident u64)
+                (int 500)
+              )
+              (builtin @as
+                (ident u64)
+                (int 750)
+              )
+            )
+          )
+        )
+      )
+      (const t3
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident partialSum)
+          (init
+            (ty)
+            (tuple
+              (builtin @as
+                (ident u64)
+                (int 750)
+              )
+              (builtin @as
+                (ident u64)
+                (int 1000)
+              )
+            )
+          )
+        )
+      )
+      (const total
+        (binary add
+          (binary add
+            (binary add
+              (call
+                (field result
+                  (ident t0)
+                )
+                (ident u64)
+              )
+              (call
+                (field result
+                  (ident t1)
+                )
+                (ident u64)
+              )
+            )
+            (call
+              (field result
+                (ident t2)
+              )
+              (ident u64)
+            )
+          )
+          (call
+            (field result
+              (ident t3)
+            )
+            (ident u64)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sum 0..1000 = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident total)
+              )
+            )
+          )
+        )
+      )
+      (var ch
+        (call
+          (field init
+            (call
+              (field Channel
+                (ident std)
+              )
+              (ident u64)
+            )
+          )
+          (int 2)
+        )
+      )
+      (const prod
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident producer)
+          (init
+            (ty)
+            (tuple
+              (unary addrof
+                (ident ch)
+              )
+              (builtin @as
+                (ident u64)
+                (int 5)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"recv:\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (while
+        (cond
+          (call
+            (field recv
+              (ident ch)
+            )
+          )
+        )
+        (capture v)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\" {d}\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident v)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field join
+            (ident prod)
+          )
+        )
+      )
+      (var counter
+        (init
+          (ty
+            (ident Counter)
+          )
+          (fields
+            (field-init mu
+              (call
+                (field init
+                  (field Mutex
+                    (field Thread
+                      (ident std)
+                    )
+                  )
+                )
+              )
+            )
+            (field-init value
+              (int 0)
+            )
+          )
+        )
+      )
+      (const b0
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident bump)
+          (init
+            (ty)
+            (tuple
+              (unary addrof
+                (ident counter)
+              )
+              (builtin @as
+                (ident u64)
+                (int 1000)
+              )
+            )
+          )
+        )
+      )
+      (const b1
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident bump)
+          (init
+            (ty)
+            (tuple
+              (unary addrof
+                (ident counter)
+              )
+              (builtin @as
+                (ident u64)
+                (int 1000)
+              )
+            )
+          )
+        )
+      )
+      (const b2
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident bump)
+          (init
+            (ty)
+            (tuple
+              (unary addrof
+                (ident counter)
+              )
+              (builtin @as
+                (ident u64)
+                (int 1000)
+              )
+            )
+          )
+        )
+      )
+      (const b3
+        (call
+          (field spawn
+            (ident exec)
+          )
+          (ident bump)
+          (init
+            (ty)
+            (tuple
+              (unary addrof
+                (ident counter)
+              )
+              (builtin @as
+                (ident u64)
+                (int 1000)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field join
+            (ident b0)
+          )
+        )
+      )
+      (expr
+        (call
+          (field join
+            (ident b1)
+          )
+        )
+      )
+      (expr
+        (call
+          (field join
+            (ident b2)
+          )
+        )
+      )
+      (expr
+        (call
+          (field join
+            (ident b3)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"counter = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field value
+                  (ident counter)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var at
+        (call
+          (field init
+            (call
+              (field Value
+                (field atomic
+                  (ident std)
+                )
+              )
+              (ident u64)
+            )
+          )
+          (int 0)
+        )
+      )
+      (assign =
+        (ident _)
+        (call
+          (field fetchAdd
+            (ident at)
+          )
+          (int 40)
+          (enum-lit monotonic)
+        )
+      )
+      (var cur
+        (call
+          (field load
+            (ident at)
+          )
+          (enum-lit monotonic)
+        )
+      )
+      (while
+        (cond
+          (call
+            (field cmpxchgWeak
+              (ident at)
+            )
+            (ident cur)
+            (binary add
+              (ident cur)
+              (int 2)
+            )
+            (enum-lit acq_rel)
+            (enum-lit monotonic)
+          )
+        )
+        (capture actual)
+        (body
+          (block
+            (assign =
+              (ident cur)
+              (ident actual)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"atomic = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field load
+                    (ident at)
+                  )
+                  (enum-lit monotonic)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var loop
+        (call
+          (field init
+            (field Loop
+              (field event
+                (ident std)
+              )
+            )
+          )
+          (field heap
+            (ident sys)
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident loop)
+            )
+          )
+        )
+      )
+      (const f
+        (call
+          (field spawn
+            (ident loop)
+          )
+          (ident doubleIt)
+          (init
+            (ty)
+            (tuple
+              (builtin @as
+                (ident u64)
+                (int 21)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"await = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field await
+                    (ident f)
+                  )
+                  (unary addrof
+                    (ident loop)
+                  )
+                  (ident u64)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

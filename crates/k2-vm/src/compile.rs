@@ -62,6 +62,9 @@ pub fn const_to_value(prog: &MirProgram, c: &Const) -> Value {
         },
         Const::Undef { ty } => Value::Undef(*ty),
         Const::Aggregate { id, ty } => aggregate_const_value(prog, *id, *ty),
+        // The v0.11 spawn tag: a function reference, carried by value so the VM's
+        // `@schedSpawn` can build the new fiber's root frame.
+        Const::FnRef(f) => Value::FnRef(*f),
     }
 }
 
@@ -531,6 +534,30 @@ impl<'p> FnCompiler<'p> {
                 "randomInt" => IntrinsicId::RandomInt,
                 "envGet" => IntrinsicId::EnvGet,
                 "bufPrint" => IntrinsicId::BufPrint,
+                // The concurrency / scheduler floor (v0.11). See `IntrinsicId` and
+                // the VM dispatcher + `crate::sched`.
+                "schedSpawn" => IntrinsicId::SchedSpawn,
+                "schedYield" => IntrinsicId::SchedYield,
+                "schedAwait" => IntrinsicId::SchedAwait,
+                "schedRun" => IntrinsicId::SchedRun,
+                "chanMake" => IntrinsicId::ChanMake,
+                "chanSend" => IntrinsicId::ChanSend,
+                "chanRecv" => IntrinsicId::ChanRecv,
+                "chanClose" => IntrinsicId::ChanClose,
+                "chanLen" => IntrinsicId::ChanLen,
+                "mutexMake" => IntrinsicId::MutexMake,
+                "mutexLock" => IntrinsicId::MutexLock,
+                "mutexUnlock" => IntrinsicId::MutexUnlock,
+                "atomicMake" => IntrinsicId::AtomicMake,
+                "atomicLoad" => IntrinsicId::AtomicLoad,
+                "atomicStore" => IntrinsicId::AtomicStore,
+                "atomicFetchAdd" => IntrinsicId::AtomicFetchAdd,
+                "atomicSwap" => IntrinsicId::AtomicSwap,
+                "atomicCas" => IntrinsicId::AtomicCas,
+                "wgMake" => IntrinsicId::WgMake,
+                "wgAdd" => IntrinsicId::WgAdd,
+                "wgDone" => IntrinsicId::WgDone,
+                "wgWait" => IntrinsicId::WgWait,
                 other => IntrinsicId::Unsupported(format!("@{other}")),
             },
             IntrinsicRoot::Value(_) => {
@@ -569,6 +596,25 @@ impl<'p> FnCompiler<'p> {
                     ["realloc"] => IntrinsicId::ReallocRaw,
                     ["destroy"] => IntrinsicId::Destroy,
                     ["free"] => IntrinsicId::Free,
+                    // The v0.11 concurrency method floor, reached as member calls
+                    // on a still-`deferred` handle (e.g. `c.mu.lock()` where the
+                    // field access through `*Counter` left the `Mutex` type open).
+                    // The receiver value carries the handle id in its first field;
+                    // the VM reads it and routes to the scheduler. (These method
+                    // names are distinct from the slice/allocator floor above.)
+                    ["lock"] => IntrinsicId::MutexLock,
+                    ["unlock"] => IntrinsicId::MutexUnlock,
+                    ["send"] => IntrinsicId::ChanSend,
+                    ["recv"] => IntrinsicId::ChanRecv,
+                    ["close"] => IntrinsicId::ChanClose,
+                    ["load"] => IntrinsicId::AtomicLoad,
+                    ["store"] => IntrinsicId::AtomicStore,
+                    ["fetchAdd"] => IntrinsicId::AtomicFetchAdd,
+                    ["swap"] => IntrinsicId::AtomicSwap,
+                    ["cmpxchgStrong" | "cmpxchgWeak"] => IntrinsicId::AtomicCas,
+                    ["add"] => IntrinsicId::WgAdd,
+                    ["done"] => IntrinsicId::WgDone,
+                    ["wait"] => IntrinsicId::WgWait,
                     _ => IntrinsicId::Unsupported(format!("value.{}", path.dotted())),
                 }
             }

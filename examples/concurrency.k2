@@ -1,0 +1,108 @@
+// concurrency.k2 — deterministic cooperative concurrency over the VM's fiber
+// scheduler.
+//
+// k2 — "Kardashev Type II": total control over the machine, with zero waste.
+//
+// The VM is single-threaded, so it realizes k2's colorless async / `Executor`
+// API with a DETERMINISTIC COOPERATIVE FIBER SCHEDULER: each spawned unit of
+// work is a green fiber with its own call stack, and a single-threaded event
+// loop interleaves ready fibers at explicit yield points (spawn / channel
+// send-recv / mutex acquire / await). Output is reproducible because the
+// scheduler is a FIFO state machine. Every capability here — the `Executor`, the
+// event `Loop`, each `Channel`/`Mutex`/`atomic`/`WaitGroup` — is a VALUE built
+// and passed explicitly, never an ambient global. OS-thread parallelism is the
+// native-backend realization of the SAME API.
+
+const std = @import("std");
+
+// (a) spawn + join: parallel partial sums, aggregated.
+fn partialSum(lo: u64, hi: u64) u64 {
+    var s: u64 = 0;
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        s += i;
+    }
+    return s;
+}
+
+// (b) channel producer: send 1..=n, then close.
+fn producer(ch: *std.Channel(u64), n: u64) void {
+    var i: u64 = 1;
+    while (i <= n) : (i += 1) {
+        ch.send(i) catch {};
+    }
+    ch.close();
+}
+
+// (c) Mutex-protected shared counter: many cooperative tasks bump it.
+const Counter = struct {
+    mu: std.Thread.Mutex,
+    value: u64,
+};
+
+fn bump(c: *Counter, times: u64) void {
+    var k: u64 = 0;
+    while (k < times) : (k += 1) {
+        c.mu.lock();
+        defer c.mu.unlock();
+        c.value += 1;
+    }
+}
+
+// (d) async/await body: an ordinary function driven via the event loop.
+fn doubleIt(x: u64) u64 {
+    return x * 2;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var exec = std.Thread.Executor.init(sys.heap, .{ .worker_count = 4 });
+    defer exec.deinit();
+
+    // (a) spawn/join aggregation: 0..1000 split into four ranges.
+    const t0 = exec.spawn(partialSum, .{ @as(u64, 0), @as(u64, 250) });
+    const t1 = exec.spawn(partialSum, .{ @as(u64, 250), @as(u64, 500) });
+    const t2 = exec.spawn(partialSum, .{ @as(u64, 500), @as(u64, 750) });
+    const t3 = exec.spawn(partialSum, .{ @as(u64, 750), @as(u64, 1000) });
+    const total = t0.result(u64) + t1.result(u64) + t2.result(u64) + t3.result(u64);
+    try out.print("sum 0..1000 = {d}\n", .{total});
+
+    // (b) channel: a producer sends 1..5 on a bounded(2) channel (so a fast
+    // producer blocks on a full buffer), a consumer prints them in order.
+    var ch = std.Channel(u64).init(2);
+    const prod = exec.spawn(producer, .{ &ch, @as(u64, 5) });
+    try out.print("recv:", .{});
+    while (ch.recv()) |v| {
+        try out.print(" {d}", .{v});
+    }
+    try out.print("\n", .{});
+    prod.join();
+
+    // (c) mutex counter: 4 tasks * 1000 bumps = 4000, serialized by the lock.
+    var counter = Counter{ .mu = std.Thread.Mutex.init(), .value = 0 };
+    const b0 = exec.spawn(bump, .{ &counter, @as(u64, 1000) });
+    const b1 = exec.spawn(bump, .{ &counter, @as(u64, 1000) });
+    const b2 = exec.spawn(bump, .{ &counter, @as(u64, 1000) });
+    const b3 = exec.spawn(bump, .{ &counter, @as(u64, 1000) });
+    b0.join();
+    b1.join();
+    b2.join();
+    b3.join();
+    try out.print("counter = {d}\n", .{counter.value});
+
+    // (d) atomics: fetchAdd then a CAS clamp-add loop reaching 42.
+    var at = std.atomic.Value(u64).init(0);
+    _ = at.fetchAdd(40, .monotonic);
+    var cur = at.load(.monotonic);
+    while (at.cmpxchgWeak(cur, cur + 2, .acq_rel, .monotonic)) |actual| {
+        cur = actual;
+    }
+    try out.print("atomic = {d}\n", .{at.load(.monotonic)});
+
+    // (e) async/await via the event loop.
+    var loop = std.event.Loop.init(sys.heap);
+    defer loop.deinit();
+    const f = loop.spawn(doubleIt, .{@as(u64, 21)});
+    try out.print("await = {d}\n", .{f.await(&loop, u64)});
+}

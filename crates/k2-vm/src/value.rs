@@ -142,9 +142,41 @@ pub enum Value {
     /// A runtime capability/opaque handle (the `*System` root and its `io`/`heap`
     /// children).
     Cap(Capability),
+    /// A live scheduler-object handle: a Task/Future, Channel, Mutex, Atomic, or
+    /// WaitGroup. The [`SchedKind`] disambiguates which scheduler table `id`
+    /// indexes. Like [`Capability::Allocator`], this is a pure kind+id pair (no Rust
+    /// state) — copying it shares the same underlying object, which is exactly the
+    /// intended channel/mutex/task aliasing semantics.
+    Sched {
+        /// Which scheduler table `id` indexes.
+        kind: SchedKind,
+        /// The handle id into that table.
+        id: u32,
+    },
+    /// A reference to a compiled function, carrying its [`k2_mir::FnId`]. This is
+    /// the spawn tag: `Executor.spawn(work, …)` lowers `work` to an `FnRef` so the
+    /// scheduler can build a fresh fiber whose root frame runs that function. (The
+    /// MIR has no indirect calls, so a function passed by value is materialized as
+    /// this const tag at the call site rather than a real first-class pointer.)
+    FnRef(k2_mir::FnId),
     /// Undefined bits of a known type. Also carries a type for the `create(undef)`
     /// idiom, where the `undef` operand is a *type carrier* for the element type.
     Undef(TypeId),
+}
+
+/// The kind of scheduler object a [`Value::Sched`] handle indexes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SchedKind {
+    /// A spawned task / awaitable future: `id` is a [`crate::sched::FiberId`].
+    Task,
+    /// A channel: `id` is a [`crate::sched::ChanId`].
+    Channel,
+    /// A mutex: `id` is a [`crate::sched::MutexId`].
+    Mutex,
+    /// An atomic cell: `id` is a [`crate::sched::AtomicId`].
+    Atomic,
+    /// A wait-group: `id` is a [`crate::sched::WgId`].
+    WaitGroup,
 }
 
 /// A runtime capability handle. The shim hands `main` the [`Capability::System`]

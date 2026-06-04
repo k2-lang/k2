@@ -135,7 +135,10 @@ impl crate::check::Checker<'_> {
             // type is recovered at run time from the live operand). `@allocHandle`
             // yields the predeclared opaque `Allocator` so a `.allocator()` method
             // returns a value of the same type user signatures spell.
-            "@allocId" => {
+            // The concurrency / scheduler floor (v0.11): the handle-minting
+            // builtins yield a `u32` id; `@schedSpawn`/`@chanMake`/`@mutexMake`/
+            // `@atomicMake`/`@wgMake` are all id-returning makers.
+            "@allocId" | "@schedSpawn" | "@chanMake" | "@mutexMake" | "@atomicMake" | "@wgMake" => {
                 self.synth_all(args);
                 self.arena.intern(Type::Int {
                     signed: false,
@@ -149,9 +152,34 @@ impl crate::check::Checker<'_> {
                     bits: IntBits::Fixed(64),
                 })
             }
-            "@gpaDeinit" => {
+            // `@chanLen` -> `usize`, the buffered count.
+            "@chanLen" => {
+                self.synth_all(args);
+                self.arena.t_usize()
+            }
+            // `@gpaDeinit` / `@chanSend` -> `bool`.
+            "@gpaDeinit" | "@chanSend" => {
                 self.synth_all(args);
                 self.arena.t_bool()
+            }
+            // The void-returning scheduler ops. Naming them keeps an expression-
+            // statement use (`@mutexLock(id);`) precisely `void` rather than
+            // Deferred, so the surrounding `void` method body type-checks exactly.
+            "@schedYield" | "@schedRun" | "@chanClose" | "@mutexLock" | "@mutexUnlock"
+            | "@atomicStore" | "@wgAdd" | "@wgDone" | "@wgWait" => {
+                self.synth_all(args);
+                self.arena.t_void()
+            }
+            // The optional-returning scheduler ops: `@chanRecv` (`?T`, `null` when
+            // closed-and-drained) and `@atomicCas` (`?T`, `null` on success). They
+            // MUST synth to a concrete `Optional` so the surrounding `if (x) |v|`
+            // unwrap is lowered as an OPTIONAL discriminant, not an error union.
+            // The inner type is Deferred (recovered at run time / coerced by the
+            // method's `?T` annotation).
+            "@chanRecv" | "@atomicCas" => {
+                self.synth_all(args);
+                let inner = self.arena.t_deferred();
+                self.arena.intern(Type::Optional(inner))
             }
             "@allocHandle" => {
                 self.synth_all(args);

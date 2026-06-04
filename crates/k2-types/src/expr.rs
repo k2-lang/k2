@@ -652,14 +652,6 @@ impl crate::check::Checker<'_> {
     /// Arithmetic result type: both operands must be the same numeric type after
     /// comptime-int/float unification.
     fn arith_result(&mut self, op: BinOp, lt: TypeId, rt: TypeId, span: Span) -> TypeId {
-        if matches!(self.arena.get(lt), Type::Bool) {
-            let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!(
-                "DEBUG arith bt:
-{}",
-                bt
-            );
-        }
         if self.numeric(lt) && self.numeric(rt) {
             if let Some(common) = self.try_unify_numeric(lt, rt) {
                 return common;

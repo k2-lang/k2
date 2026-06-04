@@ -18,25 +18,46 @@ use crate::compile::{compile_program, default_value, int_repr_of};
 use crate::fmt::format_into;
 use crate::heap::{Heap, HeapFault, Ptr};
 use crate::isa::{AggregateKind, CompiledFn, Instr, IntrinsicId, Reg, StoreStep};
-use crate::value::{Capability, IntRepr, Value};
+use crate::sched::{BlockReason, FiberId, FiberState, Frame, Scheduler};
+use crate::value::{Capability, IntRepr, SchedKind, Value};
 
 /// How far the VM may step before it gives up on a presumed-nonterminating
 /// program. Real corpus programs finish in a few thousand steps; this is still
 /// five orders of magnitude larger so no genuine program is cut off, yet small
-/// enough to bound the worst case. A [`WALL_DEADLINE`] runs alongside it so a
-/// runaway loop is reported within a few seconds even under the (slower) debug
-/// build, where 2e8 steps would otherwise take ~30s.
+/// enough to bound the worst case.
+///
+/// THIS is the deterministic termination guarantee: the step counter advances by
+/// exactly one per executed instruction, identically on every machine and every
+/// run, so a program either finishes within the budget on *all* machines or trips
+/// the budget on *all* machines — its pass/fail outcome never varies with host
+/// speed. Every real program (and every deliberately-nonterminating one, e.g. an
+/// infinite `yieldNow` loop) is bounded by this alone; the [`WALL_DEADLINE`]
+/// below is only a non-deterministic backstop layered on top, never the metric a
+/// correct program's outcome depends on.
 const STEP_BUDGET: u64 = 200_000_000;
 
-/// The wall-clock deadline: a program that runs longer than this is presumed
-/// nonterminating and reported with the same clean budget panic as the step
-/// counter. This makes a runaway loop terminate in a few seconds regardless of
-/// the per-step cost of the build, while real corpus programs (milliseconds)
-/// are unaffected. Checked only every [`WALL_CHECK_INTERVAL`] steps so the
-/// `Instant::now()` cost is negligible.
+/// The wall-clock deadline: a NON-DETERMINISTIC safety backstop, NOT the
+/// termination guarantee. The deterministic [`STEP_BUDGET`] above is the real
+/// bound and is sufficient to terminate every program on its own; this clause
+/// only exists so a runaway loop is reported within a few seconds of real time
+/// even under the (slower) debug build, where exhausting 2e8 steps would
+/// otherwise take ~30s.
+///
+/// Because it reads `Instant::elapsed()`, a program that runs *near* this
+/// boundary could trip it on a slow/loaded machine and not on a fast one — i.e.
+/// this guard alone is machine-dependent. That is acceptable ONLY because no
+/// real or corpus program runs anywhere near 5 s of wall time *or* near the 2e8
+/// step budget: every genuine program finishes in milliseconds / a few thousand
+/// steps, far below both guards, and any true infinite loop trips the
+/// deterministic step budget first (a yield/spin loop burns one step per turn).
+/// So in practice the wall-clock clause is never the deciding guard; it is a pure
+/// backstop. Do NOT make any program's correctness depend on it.
 const WALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often (in steps) the wall-clock deadline is polled.
+/// How often (in steps) the wall-clock backstop is polled. Polling is itself
+/// deterministic (every 2^20 steps), so only the `elapsed() > WALL_DEADLINE`
+/// comparison — never *when* it is checked — carries the non-determinism noted on
+/// [`WALL_DEADLINE`].
 const WALL_CHECK_INTERVAL: u64 = 1 << 20;
 
 /// The maximum call depth before a clean `stack overflow` panic (rather than a
@@ -129,24 +150,16 @@ impl AllocatorState {
     }
 }
 
-/// One call frame: the callee, its register file, and its program counter.
-struct Frame {
-    /// The compiled function this frame is executing.
-    fnid: FnId,
-    /// The register file (registers 1:1 with MIR locals, plus scratch).
-    regs: Vec<Value>,
-    /// The instruction pointer within the function's code.
-    pc: usize,
-    /// The caller's destination register for this call's result.
-    ret_reg: Reg,
-}
-
 /// The virtual machine.
 pub struct Vm<'p> {
     prog: &'p MirProgram,
     compiled: Vec<CompiledFn>,
     heap: Heap,
-    frames: Vec<Frame>,
+    /// The deterministic cooperative fiber scheduler. The program runs as a root
+    /// fiber; `spawn`/channel/mutex/await suspend a fiber to a yield point and the
+    /// event loop interleaves ready fibers. A non-concurrent program runs as a
+    /// single root fiber whose dispatch is byte-for-byte the old single-stack path.
+    sched: Scheduler,
     /// The per-run allocator registry, indexed by handle id. Slot `0` is the
     /// program-wide default (`sys.heap`). The `std.heap.*` allocators mint
     /// further slots (GPA, arena, fixed-buffer) via `@allocId`, and every
@@ -189,7 +202,7 @@ impl<'p> Vm<'p> {
             prog,
             compiled: compile_program(prog),
             heap: Heap::new(release_fast),
-            frames: Vec::new(),
+            sched: Scheduler::new(),
             // Slot 0 is the always-present default allocator (`sys.heap`): plain
             // heap allocation with no extra tracking.
             allocators: vec![AllocatorState::new(AllocatorKind::Default)],
@@ -214,14 +227,20 @@ impl<'p> Vm<'p> {
 
     /// Runs `main(sys)` to completion. On success returns `Ok(())`; otherwise a
     /// [`Halt`] describing the panic / program error / exit.
+    ///
+    /// The main program is the **root fiber**. The event loop then interleaves it
+    /// with any fibers it spawns, running each to its next yield point, until all
+    /// complete (or a deadlock is detected). For a program that never spawns this
+    /// is a single fiber whose dispatch matches the old single-stack path exactly.
     pub fn run_main(&mut self) -> Result<(), Halt> {
         let main = self.find_main().ok_or(Halt::Exit(0))?;
-        // Build the root `*System` capability and call `main(sys)`.
+        // Build the root `*System` capability and seed the root fiber.
         let sys = Value::Cap(Capability::System);
-        let result = self.call_top(main, vec![sys])?;
-        // `main` returns `!void`: inspect the result.
-        match result {
-            Value::ErrVal(tag) => Err(Halt::ProgramError(tag)),
+        let root = self.spawn_fiber_for(main, vec![sys])?;
+        self.event_loop()?;
+        // `main` returns `!void`: inspect the root fiber's result.
+        match self.sched.fibers[root as usize].result.take() {
+            Some(Value::ErrVal(tag)) => Err(Halt::ProgramError(tag)),
             _ => Ok(()),
         }
     }
@@ -234,34 +253,30 @@ impl<'p> Vm<'p> {
         self.prog.entries.first().copied()
     }
 
-    /// Calls `fnid` with `args` from the top level (no caller frame), running the
-    /// VM loop until that call's frame returns, and yields the returned value.
-    fn call_top(&mut self, fnid: FnId, args: Vec<Value>) -> Result<Value, Halt> {
-        self.push_frame(fnid, args, 0)?;
-        let base_depth = self.frames.len();
-        self.run_until_depth(base_depth - 1)
+    /// Builds the root [`Frame`] for `fnid` seeded with `args`, registers a fresh
+    /// fiber for it (enqueued Ready), and returns its id.
+    fn spawn_fiber_for(&mut self, fnid: FnId, args: Vec<Value>) -> Result<FiberId, Halt> {
+        let frame = self.make_frame(fnid, args, 0)?;
+        let id = self.sched.spawn_fiber(frame);
+        // Box any address-taken params of the new fiber's root frame.
+        let prev = self.sched.current;
+        self.sched.current = id;
+        self.init_addr_taken_params(fnid);
+        self.sched.current = prev;
+        Ok(id)
     }
 
-    /// Pushes a new frame for `fnid`, seeding its parameter registers with `args`.
+    /// Pushes a new frame for `fnid` onto the *current* fiber's stack, seeding its
+    /// parameter registers with `args` and boxing any address-taken params.
     fn push_frame(&mut self, fnid: FnId, args: Vec<Value>, ret_reg: Reg) -> Result<(), Halt> {
-        if self.frames.len() >= MAX_DEPTH {
+        if self.sched.cur_frames().len() >= MAX_DEPTH {
             return Err(Halt::Panic(PanicInfo {
                 reason: TrapReason::Panic,
                 detail: Some("stack overflow".to_string()),
             }));
         }
-        let cf = &self.compiled[fnid.index()];
-        let mut regs = vec![Value::Unit; cf.num_regs];
-        // Params occupy registers 1..=args.len() (register 0 is the return slot).
-        for (i, a) in args.into_iter().enumerate() {
-            regs[i + 1] = a;
-        }
-        self.frames.push(Frame {
-            fnid,
-            regs,
-            pc: 0,
-            ret_reg,
-        });
+        let frame = self.make_frame(fnid, args, ret_reg)?;
+        self.sched.cur_frames_mut().push(frame);
         // Initialize address-taken parameters into heap homes immediately, so a
         // `&param` / `self.*` receiver works. (Locals get their homes at their
         // StorageLive via InitAddrLocal.)
@@ -269,7 +284,27 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    /// Boxes any `address_taken` parameter into a heap cell at frame entry.
+    /// Builds (but does not push) a fresh [`Frame`] for `fnid` with `args` in the
+    /// parameter registers.
+    fn make_frame(&self, fnid: FnId, args: Vec<Value>, ret_reg: Reg) -> Result<Frame, Halt> {
+        let cf = &self.compiled[fnid.index()];
+        let mut regs = vec![Value::Unit; cf.num_regs];
+        // Params occupy registers 1..=args.len() (register 0 is the return slot).
+        for (i, a) in args.into_iter().enumerate() {
+            if i + 1 < regs.len() {
+                regs[i + 1] = a;
+            }
+        }
+        Ok(Frame {
+            fnid,
+            regs,
+            pc: 0,
+            ret_reg,
+        })
+    }
+
+    /// Boxes any `address_taken` parameter of the current fiber's top frame into a
+    /// heap cell at frame entry.
     fn init_addr_taken_params(&mut self, fnid: FnId) {
         let cf = &self.compiled[fnid.index()];
         let func = &self.prog.funcs[fnid.index()];
@@ -277,17 +312,55 @@ impl<'p> Vm<'p> {
         // Collect the param register indices that are address-taken.
         let to_box: Vec<usize> = (1..=nparams).filter(|&i| cf.addr_taken[i]).collect();
         for i in to_box {
-            let cur = self.frames.last().unwrap().regs[i].clone();
+            let cur = self.sched.cur_frames().last().unwrap().regs[i].clone();
             let ptr = self.heap.alloc_one(cur);
-            self.frames.last_mut().unwrap().regs[i] = Value::Ptr(ptr);
+            self.sched.cur_frames_mut().last_mut().unwrap().regs[i] = Value::Ptr(ptr);
         }
     }
 
-    /// Runs the dispatch loop until the frame stack shrinks back to
-    /// `target_depth` (i.e. the just-pushed top frame has returned), yielding the
-    /// value that frame returned.
-    fn run_until_depth(&mut self, target_depth: usize) -> Result<Value, Halt> {
+    /// The deterministic event loop: pick the next Ready fiber (FIFO), run it to
+    /// its next suspend/yield/completion, and repeat until every fiber is Done. An
+    /// empty ready queue with live fibers is a clean deadlock (never a hang).
+    fn event_loop(&mut self) -> Result<(), Halt> {
         loop {
+            let Some(fid) = self.sched.ready.pop_front() else {
+                if self.sched.all_done() {
+                    return Ok(());
+                }
+                return Err(self.deadlock_panic());
+            };
+            if matches!(self.sched.fibers[fid as usize].state, FiberState::Done) {
+                continue; // a stale ready-queue entry (already completed); skip.
+            }
+            self.sched.current = fid;
+            self.sched.fibers[fid as usize].state = FiberState::Running;
+            match self.run_fiber()? {
+                Suspend::Blocked => { /* parked by the intrinsic; not re-enqueued */ }
+                Suspend::Yielded => {
+                    self.sched.fibers[fid as usize].state = FiberState::Ready;
+                    self.sched.ready.push_back(fid);
+                }
+                Suspend::Completed(v) => self.complete_fiber(fid, v),
+            }
+        }
+    }
+
+    /// Runs the *current* fiber's dispatch loop until it suspends (blocks/yields)
+    /// or its root frame returns. The instruction budget and the `instr_count`
+    /// metric stay global across all fibers, so a runaway program still terminates
+    /// with the existing clean budget panic.
+    ///
+    /// Termination is guarded by two clauses below. The first — `budget == 0` — is
+    /// the DETERMINISTIC guarantee: one decrement per executed instruction, so the
+    /// outcome is identical on every machine and every run (see [`STEP_BUDGET`]).
+    /// The second — the [`WALL_DEADLINE`] elapsed check — is only a
+    /// non-deterministic backstop (see its doc); it never decides the outcome of a
+    /// real program, every one of which finishes far below both bounds.
+    fn run_fiber(&mut self) -> Result<Suspend, Halt> {
+        loop {
+            // Deterministic step budget (the real guarantee) OR the wall-clock
+            // backstop (a machine-dependent safety net, polled cheaply). See the
+            // constants' docs: only the first clause is relied upon for correctness.
             if self.budget == 0
                 || (self.budget.is_multiple_of(WALL_CHECK_INTERVAL)
                     && self.started.elapsed() > WALL_DEADLINE)
@@ -302,32 +375,76 @@ impl<'p> Vm<'p> {
             self.budget -= 1;
             self.instr_count += 1;
 
-            let depth = self.frames.len();
-            if depth == 0 {
-                // Should not happen; the loop exits via the Return handler.
-                return Ok(Value::Unit);
-            }
-            let frame = self.frames.last_mut().unwrap();
+            let frame = self.sched.cur_frames_mut().last_mut().unwrap();
             let fnid = frame.fnid;
             let pc = frame.pc;
             let instr = self.compiled[fnid.index()].code[pc].clone();
             frame.pc += 1;
 
             match self.step(instr)? {
-                Flow::Next => {}
-                Flow::Jumped => {}
+                Flow::Next | Flow::Jumped => {}
+                // A blocking intrinsic already parked the current fiber (recording
+                // its dst as the resume register); just stop running it.
+                Flow::Suspend => return Ok(Suspend::Blocked),
+                // An explicit `@schedYield`: the fiber is still Ready, re-enqueued
+                // by the event loop next tick (fair round-robin).
+                Flow::Yield => return Ok(Suspend::Yielded),
                 Flow::Returned(v) => {
                     // Pop the returning frame; deliver its value to the caller.
-                    let done = self.frames.pop().unwrap();
-                    if self.frames.len() == target_depth {
-                        return Ok(v);
+                    let done = self.sched.cur_frames_mut().pop().unwrap();
+                    if self.sched.cur_frames().is_empty() {
+                        // The fiber's root frame returned: the fiber completes.
+                        return Ok(Suspend::Completed(v));
                     }
                     // Write the result into the caller's destination register.
-                    let caller = self.frames.last_mut().unwrap();
+                    let caller = self.sched.cur_frames_mut().last_mut().unwrap();
                     Self::set_reg(caller, done.ret_reg, v);
                 }
             }
         }
+    }
+
+    /// Marks fiber `fid` completed with result `v` and wakes every joiner (each
+    /// receives the result into its parked `resume_reg`).
+    fn complete_fiber(&mut self, fid: FiberId, v: Value) {
+        let f = &mut self.sched.fibers[fid as usize];
+        f.result = Some(v.clone());
+        f.state = FiberState::Done;
+        let joiners = std::mem::take(&mut f.joiners);
+        // Deliver the unwrapped result into each joiner's parked await register.
+        let delivered = unwrap_task_result(v);
+        for j in joiners {
+            self.sched.wake(j, Some(delivered.clone()));
+        }
+    }
+
+    /// The clean "all fibers blocked" deadlock diagnostic. Because every block
+    /// reason has an explicit waker and the ready queue is the only progress
+    /// source, an empty ready queue with live fibers is provably a deadlock; this
+    /// is reported immediately (no timeout) as a clean panic, never a hang.
+    fn deadlock_panic(&self) -> Halt {
+        let blocked = self.sched.blocked_count();
+        // Summarize what each stuck fiber is waiting on, so the diagnostic names
+        // the culprit (e.g. "channel recv") rather than just a count.
+        let mut waiting: Vec<String> = self
+            .sched
+            .fibers
+            .iter()
+            .filter_map(|f| match &f.state {
+                FiberState::Blocked(reason) => Some(reason.label()),
+                _ => None,
+            })
+            .collect();
+        waiting.sort_unstable();
+        waiting.dedup();
+        let on = waiting.join(", ");
+        Halt::Panic(PanicInfo {
+            reason: TrapReason::Panic,
+            detail: Some(format!(
+                "deadlock: all {blocked} fiber(s) are blocked with no runnable task \
+                 (waiting on: {on}) — no waker can ever fire"
+            )),
+        })
     }
 
     /// Executes one instruction in the current top frame.
@@ -375,7 +492,7 @@ impl<'p> Vm<'p> {
                 Ok(Flow::Next)
             }
             Instr::Jump { target } => {
-                self.frames.last_mut().unwrap().pc = target;
+                self.sched.cur_frames_mut().last_mut().unwrap().pc = target;
                 Ok(Flow::Jumped)
             }
             Instr::Branch {
@@ -384,7 +501,8 @@ impl<'p> Vm<'p> {
                 else_pc,
             } => {
                 let c = self.get(cond).as_bool().unwrap_or(false);
-                self.frames.last_mut().unwrap().pc = if c { then_pc } else { else_pc };
+                self.sched.cur_frames_mut().last_mut().unwrap().pc =
+                    if c { then_pc } else { else_pc };
                 Ok(Flow::Jumped)
             }
             Instr::Switch {
@@ -398,7 +516,7 @@ impl<'p> Vm<'p> {
                     .find(|(v, _)| *v == s)
                     .map(|(_, t)| *t)
                     .unwrap_or(default);
-                self.frames.last_mut().unwrap().pc = target;
+                self.sched.cur_frames_mut().last_mut().unwrap().pc = target;
                 Ok(Flow::Jumped)
             }
             Instr::Return { src } => {
@@ -426,9 +544,37 @@ impl<'p> Vm<'p> {
             } => {
                 let recv_v = recv.map(|r| self.get(r));
                 let argv: Vec<Value> = args.iter().map(|&r| self.get(r)).collect();
-                let v = self.dispatch_intrinsic(&id, recv_v, &argv)?;
-                self.set_cur(dst, v);
-                Ok(Flow::Next)
+                match self.dispatch_intrinsic(&id, recv_v, &argv)? {
+                    IntrinsicOutcome::Value(v) => {
+                        self.set_cur(dst, v);
+                        Ok(Flow::Next)
+                    }
+                    // A blocking intrinsic: park the current fiber, recording `dst`
+                    // as the register a later wake delivers the value into. The
+                    // `pc` was already advanced, so on resume the fiber continues
+                    // right after this instruction.
+                    IntrinsicOutcome::Suspend(reason) => {
+                        self.sched.block_current(reason, dst);
+                        Ok(Flow::Suspend)
+                    }
+                    // An explicit cooperative yield: the fiber stays Ready and, on
+                    // resume, continues to the statement after this one.
+                    IntrinsicOutcome::Yield => {
+                        self.set_cur(dst, Value::Unit);
+                        Ok(Flow::Yield)
+                    }
+                    // A drive-to-quiescence yield (`@schedRun`): rewind the pc to
+                    // re-point at *this* instruction so it re-executes — and so
+                    // re-tests `other_runnable()` — when the fiber is next scheduled.
+                    // `run_fiber` advanced `pc` by 1 before `step`, so we undo that
+                    // single advance here. Nothing is written to `dst` yet (the value
+                    // is produced only when the drain finally returns a `Value`).
+                    IntrinsicOutcome::YieldReexec => {
+                        let frame = self.sched.cur_frames_mut().last_mut().unwrap();
+                        frame.pc -= 1;
+                        Ok(Flow::Yield)
+                    }
+                }
             }
             Instr::LoadField { dst, base, idx } => {
                 let bv = self.get(base);
@@ -542,19 +688,19 @@ impl<'p> Vm<'p> {
 
     // ---- register access ----------------------------------------------
 
-    /// The current frame's function id.
+    /// The current frame's function id (of the running fiber).
     fn cur_fnid(&self) -> FnId {
-        self.frames.last().unwrap().fnid
+        self.sched.cur_frames().last().unwrap().fnid
     }
 
-    /// Reads register `r` of the current frame.
+    /// Reads register `r` of the current (running fiber's top) frame.
     fn get(&self, r: Reg) -> Value {
-        self.frames.last().unwrap().regs[r as usize].clone()
+        self.sched.cur_frames().last().unwrap().regs[r as usize].clone()
     }
 
-    /// Writes register `r` of the current frame.
+    /// Writes register `r` of the current (running fiber's top) frame.
     fn set_cur(&mut self, r: Reg, v: Value) {
-        let frame = self.frames.last_mut().unwrap();
+        let frame = self.sched.cur_frames_mut().last_mut().unwrap();
         Self::set_reg(frame, r, v);
     }
 
@@ -1122,8 +1268,93 @@ impl<'p> Vm<'p> {
 
     // ---- intrinsics ----------------------------------------------------
 
-    /// Dispatches a resolved intrinsic.
+    /// Dispatches a resolved intrinsic, returning the result value *or* a suspend/
+    /// yield signal for the cooperative scheduler. The concurrency floor is handled
+    /// here (some of it blocking); every other intrinsic delegates to
+    /// [`Vm::dispatch_intrinsic_value`] and wraps its value.
     fn dispatch_intrinsic(
+        &mut self,
+        id: &IntrinsicId,
+        recv: Option<Value>,
+        args: &[Value],
+    ) -> Result<IntrinsicOutcome, Halt> {
+        // A concurrency method reached as `value.<method>` (a deferred receiver —
+        // e.g. `c.mu.lock()` where the field access lost the concrete `Mutex` type)
+        // carries the handle in the RECEIVER, not the operands. Unify by prepending
+        // the (unwrapped) receiver handle so every scheduler handler finds it the
+        // same way whether reached via the std method body or this deferred path.
+        if is_concurrency_intrinsic(id) {
+            if let Some(r) = &recv {
+                let mut merged = Vec::with_capacity(args.len() + 1);
+                merged.push(self.handle_of_receiver(r));
+                merged.extend_from_slice(args);
+                return self.dispatch_concurrency(id, &merged);
+            }
+            return self.dispatch_concurrency(id, args);
+        }
+        // Every other intrinsic is non-blocking: compute its value and wrap it.
+        self.dispatch_intrinsic_value(id, recv, args)
+            .map(IntrinsicOutcome::Value)
+    }
+
+    /// Dispatches one concurrency / scheduler intrinsic. `args[0]` (when the op
+    /// takes a handle) is the scheduler-object handle.
+    fn dispatch_concurrency(
+        &mut self,
+        id: &IntrinsicId,
+        args: &[Value],
+    ) -> Result<IntrinsicOutcome, Halt> {
+        match id {
+            IntrinsicId::SchedSpawn => self.sched_spawn(args).map(IntrinsicOutcome::Value),
+            IntrinsicId::SchedYield => Ok(IntrinsicOutcome::Yield),
+            IntrinsicId::SchedAwait => Ok(self.sched_await(args)),
+            IntrinsicId::SchedRun => Ok(self.sched_run()),
+            IntrinsicId::ChanMake => Ok(IntrinsicOutcome::Value(self.chan_make(args))),
+            IntrinsicId::ChanSend => Ok(self.chan_send(args)),
+            IntrinsicId::ChanRecv => Ok(self.chan_recv(args)),
+            IntrinsicId::ChanClose => {
+                self.chan_close(args);
+                Ok(IntrinsicOutcome::Value(Value::Unit))
+            }
+            IntrinsicId::ChanLen => Ok(IntrinsicOutcome::Value(self.chan_len(args))),
+            IntrinsicId::MutexMake => Ok(IntrinsicOutcome::Value(Value::Sched {
+                kind: SchedKind::Mutex,
+                id: self.sched.make_mutex(),
+            })),
+            IntrinsicId::MutexLock => Ok(self.mutex_lock(args)),
+            IntrinsicId::MutexUnlock => {
+                self.mutex_unlock(args);
+                Ok(IntrinsicOutcome::Value(Value::Unit))
+            }
+            IntrinsicId::AtomicMake => Ok(IntrinsicOutcome::Value(self.atomic_make(args))),
+            IntrinsicId::AtomicLoad => Ok(IntrinsicOutcome::Value(self.atomic_load(args))),
+            IntrinsicId::AtomicStore => {
+                self.atomic_store(args);
+                Ok(IntrinsicOutcome::Value(Value::Unit))
+            }
+            IntrinsicId::AtomicFetchAdd => Ok(IntrinsicOutcome::Value(self.atomic_fetch_add(args))),
+            IntrinsicId::AtomicSwap => Ok(IntrinsicOutcome::Value(self.atomic_swap(args))),
+            IntrinsicId::AtomicCas => Ok(IntrinsicOutcome::Value(self.atomic_cas(args))),
+            IntrinsicId::WgMake => Ok(IntrinsicOutcome::Value(Value::Sched {
+                kind: SchedKind::WaitGroup,
+                id: self.sched.make_waitgroup(),
+            })),
+            IntrinsicId::WgAdd => {
+                self.wg_add(args);
+                Ok(IntrinsicOutcome::Value(Value::Unit))
+            }
+            IntrinsicId::WgDone => {
+                self.wg_done(args);
+                Ok(IntrinsicOutcome::Value(Value::Unit))
+            }
+            IntrinsicId::WgWait => Ok(self.wg_wait(args)),
+            _ => Err(self.internal("non-concurrency intrinsic in scheduler dispatcher")),
+        }
+    }
+
+    /// Dispatches every non-concurrency intrinsic (the v0.10 floor), returning its
+    /// result value. None of these suspend.
+    fn dispatch_intrinsic_value(
         &mut self,
         id: &IntrinsicId,
         recv: Option<Value>,
@@ -1264,7 +1495,366 @@ impl<'p> Vm<'p> {
                 reason: TrapReason::Panic,
                 detail: Some(format!("unsupported intrinsic `{name}`")),
             })),
+            // The concurrency floor is routed by `dispatch_intrinsic` (some of it
+            // blocking) and never reaches this value-only dispatcher.
+            _ => Err(self.internal("concurrency intrinsic reached value dispatcher")),
         }
+    }
+
+    // ---- the concurrency / scheduler floor (v0.11) --------------------
+
+    /// Unwraps a concurrency *receiver* to its scheduler handle. A handle is either
+    /// a bare [`Value::Sched`], a one-field handle struct (`Mutex`/`Channel`/
+    /// `Atomic`/… wrap their id in field 0), or a pointer to such a struct (a
+    /// `*Self` receiver), which is dereferenced through the heap.
+    fn handle_of_receiver(&self, recv: &Value) -> Value {
+        match recv {
+            Value::Sched { .. } => recv.clone(),
+            Value::Struct(fields) => fields.first().cloned().unwrap_or(Value::Unit),
+            Value::Ptr(p) => match self.heap.load(*p) {
+                Ok(inner) => self.handle_of_receiver(&inner),
+                Err(_) => Value::Unit,
+            },
+            _ => recv.clone(),
+        }
+    }
+
+    /// `@schedSpawn(fn, args_tuple)`: build a fresh fiber whose root frame runs the
+    /// `FnRef` callee, seeded from the argument tuple, and return its `Task` handle.
+    fn sched_spawn(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        // The first operand is the `FnRef` tag; the second (if present) is the
+        // argument tuple (a struct/array of by-value arguments).
+        let fnid = args.iter().find_map(|a| match a {
+            Value::FnRef(f) => Some(*f),
+            _ => None,
+        });
+        let Some(fnid) = fnid else {
+            return Err(self.internal("@schedSpawn without a function reference"));
+        };
+        let call_args: Vec<Value> = match args.iter().find(|a| !matches!(a, Value::FnRef(_))) {
+            Some(Value::Struct(fields)) | Some(Value::Array(fields)) => fields.as_ref().clone(),
+            Some(other) => vec![other.clone()],
+            None => Vec::new(),
+        };
+        let id = self.spawn_fiber_for(fnid, call_args)?;
+        Ok(Value::Sched {
+            kind: SchedKind::Task,
+            id,
+        })
+    }
+
+    /// `@schedAwait(task)`: if the task is already Done, return its result inline;
+    /// otherwise block the current fiber as a joiner of the task.
+    fn sched_await(&mut self, args: &[Value]) -> IntrinsicOutcome {
+        let Some(tid) = sched_handle(args, SchedKind::Task) else {
+            return IntrinsicOutcome::Value(Value::Unit);
+        };
+        let target = &mut self.sched.fibers[tid as usize];
+        if let FiberState::Done = target.state {
+            let v = target.result.clone().unwrap_or(Value::Unit);
+            return IntrinsicOutcome::Value(unwrap_task_result(v));
+        }
+        // Register the current fiber as a joiner and park it.
+        let cur = self.sched.current;
+        target.joiners.push(cur);
+        IntrinsicOutcome::Suspend(BlockReason::Join(tid))
+    }
+
+    /// `@schedRun()`: drive the ready set to quiescence — the engine behind
+    /// `Executor.waitIdle()` and `event.Loop.run()`.
+    ///
+    /// Each invocation tests whether any *other* fiber is currently runnable
+    /// ([`Scheduler::other_runnable`], i.e. present in the FIFO ready queue):
+    ///
+    /// * If so, it returns [`IntrinsicOutcome::YieldReexec`]. The dispatch site
+    ///   rewinds the calling fiber's `pc` to re-point at this very `@schedRun`
+    ///   instruction and re-enqueues the fiber at the back of the ready queue. The
+    ///   other ready fibers therefore all get a turn first; when the caller cycles
+    ///   back to the front it *re-executes* `@schedRun` and re-tests the condition.
+    ///   This repeats — driving every transitively-reachable ready fiber (children,
+    ///   grandchildren, woken joiners, channel/mutex wakeups) to completion — until
+    ///   no other fiber is runnable.
+    ///
+    /// * Once no other fiber is runnable the drain is quiescent and it returns
+    ///   `Value::Unit`, so the caller proceeds.
+    ///
+    /// Crucially, the loop is bounded by *forward progress*, not by a fixed number
+    /// of yields: it stops the instant `other_runnable()` is false. A fiber that is
+    /// merely *blocked* (awaiting a handle, parked on a channel/mutex) but has no
+    /// ready waker does **not** keep the drain spinning — `other_runnable()` ignores
+    /// blocked fibers — so a genuine deadlock falls through to a clean return here
+    /// (and, if the caller then has nothing to do either, the event loop's
+    /// empty-ready-queue detector reports it; it is never an infinite drain loop).
+    fn sched_run(&mut self) -> IntrinsicOutcome {
+        if self.sched.other_runnable() {
+            IntrinsicOutcome::YieldReexec
+        } else {
+            IntrinsicOutcome::Value(Value::Unit)
+        }
+    }
+
+    /// `@chanMake(cap)`: register a channel (cap < 0 is unbounded).
+    fn chan_make(&mut self, args: &[Value]) -> Value {
+        let cap = args.first().and_then(|v| v.as_i128()).unwrap_or(-1) as i64;
+        Value::Sched {
+            kind: SchedKind::Channel,
+            id: self.sched.make_channel(cap),
+        }
+    }
+
+    /// `@chanSend(chan, value)`: enqueue (waking a receiver), or block when a
+    /// bounded channel is full, or return `false` when the channel is closed.
+    fn chan_send(&mut self, args: &[Value]) -> IntrinsicOutcome {
+        let Some(cid) = sched_handle(args, SchedKind::Channel) else {
+            return IntrinsicOutcome::Value(Value::Bool(false));
+        };
+        let value = args
+            .iter()
+            .find(|a| !matches!(a, Value::Sched { .. }))
+            .cloned()
+            .unwrap_or(Value::Unit);
+        let ch = &mut self.sched.channels[cid as usize];
+        if ch.closed {
+            return IntrinsicOutcome::Value(Value::Bool(false));
+        }
+        let full = matches!(ch.cap, Some(cap) if ch.queue.len() >= cap);
+        if full {
+            // Park the sender; the value is admitted when a receiver makes room.
+            // The fiber is recorded in `send_waiters` (FIFO) so a receiver can find
+            // and admit it; the reason carries the value to enqueue on wake.
+            ch.send_waiters.push_back(self.sched.current);
+            return IntrinsicOutcome::Suspend(BlockReason::ChanSend { value });
+        }
+        ch.queue.push_back(value);
+        // Wake one parked receiver (it dequeues on resume — see `chan_recv`).
+        if let Some(r) = ch.recv_waiters.pop_front() {
+            let v = self.sched.channels[cid as usize].queue.pop_front();
+            self.sched.wake(r, Some(Value::Optional(v.map(Box::new))));
+        }
+        IntrinsicOutcome::Value(Value::Bool(true))
+    }
+
+    /// `@chanRecv(chan)`: dequeue a value (waking a parked sender, admitting its
+    /// value), or return `null` when closed and drained, or block when empty.
+    fn chan_recv(&mut self, args: &[Value]) -> IntrinsicOutcome {
+        let Some(cid) = sched_handle(args, SchedKind::Channel) else {
+            return IntrinsicOutcome::Value(Value::Optional(None));
+        };
+        let ch = &mut self.sched.channels[cid as usize];
+        if let Some(v) = ch.queue.pop_front() {
+            // A buffered value: hand it over, then admit one parked sender's value
+            // into the freed slot (waking that sender).
+            self.admit_parked_sender(cid);
+            return IntrinsicOutcome::Value(Value::Optional(Some(Box::new(v))));
+        }
+        if ch.closed {
+            // Drained and closed: the canonical loop terminator.
+            return IntrinsicOutcome::Value(Value::Optional(None));
+        }
+        // A parked sender (only possible on a zero-capacity channel) can hand its
+        // value directly to this receiver.
+        if let Some(s) = ch.send_waiters.front().copied() {
+            if let FiberState::Blocked(BlockReason::ChanSend { value, .. }) =
+                &self.sched.fibers[s as usize].state
+            {
+                let value = value.clone();
+                self.sched.channels[cid as usize].send_waiters.pop_front();
+                self.sched.wake(s, Some(Value::Bool(true)));
+                return IntrinsicOutcome::Value(Value::Optional(Some(Box::new(value))));
+            }
+        }
+        // Empty and open: park the receiver.
+        self.sched.channels[cid as usize]
+            .recv_waiters
+            .push_back(self.sched.current);
+        IntrinsicOutcome::Suspend(BlockReason::ChanRecv(cid))
+    }
+
+    /// After a `recv` freed a slot, admit one parked sender's value into the queue
+    /// and wake it (its send succeeded).
+    fn admit_parked_sender(&mut self, cid: u32) {
+        let s = self.sched.channels[cid as usize].send_waiters.pop_front();
+        if let Some(s) = s {
+            if let FiberState::Blocked(BlockReason::ChanSend { value, .. }) =
+                &self.sched.fibers[s as usize].state
+            {
+                let value = value.clone();
+                self.sched.channels[cid as usize].queue.push_back(value);
+            }
+            self.sched.wake(s, Some(Value::Bool(true)));
+        }
+    }
+
+    /// `@chanClose(chan)`: close and wake all waiters.
+    fn chan_close(&mut self, args: &[Value]) {
+        if let Some(cid) = sched_handle(args, SchedKind::Channel) {
+            self.sched.close_channel(cid);
+        }
+    }
+
+    /// `@chanLen(chan)`: the buffered count.
+    fn chan_len(&self, args: &[Value]) -> Value {
+        let n = sched_handle(args, SchedKind::Channel)
+            .map(|cid| self.sched.channel_len(cid))
+            .unwrap_or(0);
+        Value::int(n as i128, IntRepr::USIZE)
+    }
+
+    /// `@mutexLock(m)`: acquire if free, else park as a FIFO waiter.
+    fn mutex_lock(&mut self, args: &[Value]) -> IntrinsicOutcome {
+        let Some(mid) = sched_handle(args, SchedKind::Mutex) else {
+            return IntrinsicOutcome::Value(Value::Unit);
+        };
+        let cur = self.sched.current;
+        let m = &mut self.sched.mutexes[mid as usize];
+        match m.held_by {
+            None => {
+                m.held_by = Some(cur);
+                IntrinsicOutcome::Value(Value::Unit)
+            }
+            Some(_) => {
+                m.waiters.push_back(cur);
+                IntrinsicOutcome::Suspend(BlockReason::MutexLock(mid))
+            }
+        }
+    }
+
+    /// `@mutexUnlock(m)`: release, handing the lock to the first FIFO waiter (so it
+    /// wakes already-holding the lock — no thundering re-contention).
+    fn mutex_unlock(&mut self, args: &[Value]) {
+        let Some(mid) = sched_handle(args, SchedKind::Mutex) else {
+            return;
+        };
+        let next = self.sched.mutexes[mid as usize].waiters.pop_front();
+        match next {
+            Some(w) => {
+                self.sched.mutexes[mid as usize].held_by = Some(w);
+                self.sched.wake(w, Some(Value::Unit));
+            }
+            None => self.sched.mutexes[mid as usize].held_by = None,
+        }
+    }
+
+    /// `@atomicMake(init)`: register an atomic cell.
+    fn atomic_make(&mut self, args: &[Value]) -> Value {
+        let init = args.first().and_then(|v| v.as_i128()).unwrap_or(0);
+        Value::Sched {
+            kind: SchedKind::Atomic,
+            id: self.sched.make_atomic(init),
+        }
+    }
+
+    /// `@atomicLoad(a)`: read the cell (as a full-precision integer; the std
+    /// wrapper casts to the declared `T`).
+    fn atomic_load(&self, args: &[Value]) -> Value {
+        let v = sched_handle(args, SchedKind::Atomic)
+            .and_then(|aid| self.sched.atomics.get(aid as usize).copied())
+            .unwrap_or(0);
+        Value::int(v, IntRepr::COMPTIME)
+    }
+
+    /// `@atomicStore(a, v)`: write the cell.
+    fn atomic_store(&mut self, args: &[Value]) {
+        if let Some(aid) = sched_handle(args, SchedKind::Atomic) {
+            let v = atomic_operand(args, 0);
+            if let Some(cell) = self.sched.atomics.get_mut(aid as usize) {
+                *cell = v;
+            }
+        }
+    }
+
+    /// `@atomicFetchAdd(a, delta)`: add and return the previous value.
+    fn atomic_fetch_add(&mut self, args: &[Value]) -> Value {
+        let mut prev = 0;
+        if let Some(aid) = sched_handle(args, SchedKind::Atomic) {
+            let delta = atomic_operand(args, 0);
+            if let Some(cell) = self.sched.atomics.get_mut(aid as usize) {
+                prev = *cell;
+                *cell = cell.wrapping_add(delta);
+            }
+        }
+        Value::int(prev, IntRepr::COMPTIME)
+    }
+
+    /// `@atomicSwap(a, v)`: store and return the previous value.
+    fn atomic_swap(&mut self, args: &[Value]) -> Value {
+        let mut prev = 0;
+        if let Some(aid) = sched_handle(args, SchedKind::Atomic) {
+            let v = atomic_operand(args, 0);
+            if let Some(cell) = self.sched.atomics.get_mut(aid as usize) {
+                prev = *cell;
+                *cell = v;
+            }
+        }
+        Value::int(prev, IntRepr::COMPTIME)
+    }
+
+    /// `@atomicCas(a, expected, new)`: compare-and-swap. Returns `null` on success,
+    /// else `Some(actual)` — the lock-free retry idiom (spec §4.3).
+    fn atomic_cas(&mut self, args: &[Value]) -> Value {
+        let Some(aid) = sched_handle(args, SchedKind::Atomic) else {
+            return Value::Optional(None);
+        };
+        let expected = atomic_operand(args, 0);
+        let new = atomic_operand(args, 1);
+        let cell = match self.sched.atomics.get_mut(aid as usize) {
+            Some(c) => c,
+            None => return Value::Optional(None),
+        };
+        if *cell == expected {
+            *cell = new;
+            Value::Optional(None)
+        } else {
+            Value::Optional(Some(Box::new(Value::int(*cell, IntRepr::COMPTIME))))
+        }
+    }
+
+    /// `@wgAdd(wg, n)`: bump the counter.
+    fn wg_add(&mut self, args: &[Value]) {
+        if let Some(wid) = sched_handle(args, SchedKind::WaitGroup) {
+            let n = args
+                .iter()
+                .filter(|a| !matches!(a, Value::Sched { .. }))
+                .find_map(|a| a.as_i128())
+                .unwrap_or(0);
+            if let Some(wg) = self.sched.waitgroups.get_mut(wid as usize) {
+                wg.count += n as i64;
+            }
+        }
+    }
+
+    /// `@wgDone(wg)`: decrement; when the counter reaches zero, wake all waiters.
+    fn wg_done(&mut self, args: &[Value]) {
+        let Some(wid) = sched_handle(args, SchedKind::WaitGroup) else {
+            return;
+        };
+        let reached_zero = {
+            let wg = &mut self.sched.waitgroups[wid as usize];
+            wg.count -= 1;
+            wg.count <= 0
+        };
+        if reached_zero {
+            let waiters: Vec<FiberId> = self.sched.waitgroups[wid as usize]
+                .waiters
+                .drain(..)
+                .collect();
+            for w in waiters {
+                self.sched.wake(w, Some(Value::Unit));
+            }
+        }
+    }
+
+    /// `@wgWait(wg)`: return immediately if the counter is already zero, else park.
+    fn wg_wait(&mut self, args: &[Value]) -> IntrinsicOutcome {
+        let Some(wid) = sched_handle(args, SchedKind::WaitGroup) else {
+            return IntrinsicOutcome::Value(Value::Unit);
+        };
+        if self.sched.waitgroups[wid as usize].count <= 0 {
+            return IntrinsicOutcome::Value(Value::Unit);
+        }
+        let cur = self.sched.current;
+        self.sched.waitgroups[wid as usize].waiters.push_back(cur);
+        IntrinsicOutcome::Suspend(BlockReason::WaitGroup(wid))
     }
 
     // ---- the handle-based allocator registry --------------------------
@@ -1710,11 +2300,37 @@ impl<'p> Vm<'p> {
         Value::Bool(ok)
     }
 
-    /// The narrowing predicate: `true` if the value fits the narrower target.
+    /// The narrowing predicate (`@intCast`): `true` if the value fits the narrower
+    /// target type.
+    ///
+    /// The target type is the `undef` carrier minted from the `@intCast` result
+    /// type. When that carrier names a concrete sized integer (the usual case) we
+    /// range-check against its true bounds — so a genuinely out-of-range narrow
+    /// still traps. But when the carrier is *unsized/unknown* (a `comptime_int` or a
+    /// `Deferred` result type — e.g. a monomorphized generic whose `@as(T, …)`
+    /// target never concretized, as in `std.atomic.Value(u64).load`), the target
+    /// range is genuinely unknown. In that case we must NOT fabricate a signed-i64
+    /// range and trap a perfectly valid value (the historical bug: a `u64` above
+    /// `i64::MAX` round-tripped through such a cast was rejected): with an unknown
+    /// target the narrow is unconstrained — the paired `IntNarrow` is an unmasked
+    /// identity that preserves the exact value — so the predicate passes. A
+    /// genuinely lossy narrow only happens against a *known* narrower type, which is
+    /// still checked precisely.
     fn narrow_fits(&self, args: &[Value]) -> Value {
         let a = args.first().and_then(|v| v.as_i128()).unwrap_or(0);
-        let repr = self.check_repr(args);
-        Value::Bool(a >= repr.min_value() && a <= repr.max_value())
+        // Only the explicit carrier names the *target* type; the value operand's own
+        // repr describes the SOURCE, never the narrow target, so it must not drive
+        // this check (using it would invent an i64 range — see the doc above).
+        let target = type_carrier(args).map(|ty| int_repr_of(&self.prog.arena, ty));
+        match target {
+            // A concrete sized integer target: range-check precisely.
+            Some(repr) if repr.width != 0 => {
+                Value::Bool(a >= repr.min_value() && a <= repr.max_value())
+            }
+            // No carrier, or an unsized/unknown (comptime/deferred) target: the
+            // narrow target range is unknown, so the cast is unconstrained — pass.
+            _ => Value::Bool(true),
+        }
     }
 
     // ---- panic construction -------------------------------------------
@@ -1759,6 +2375,41 @@ enum Flow {
     Jumped,
     /// The current frame returns this value.
     Returned(Value),
+    /// A blocking intrinsic parked the current fiber; stop running it.
+    Suspend,
+    /// An explicit cooperative yield; the fiber stays Ready and is re-enqueued. This
+    /// covers both `@schedYield` (the fiber resumes at the statement *after* the
+    /// yield) and the drive-to-quiescence `@schedRun` (whose dispatch arm first
+    /// rewinds the `pc` so it *re-executes* on resume — see the `YieldReexec` arm in
+    /// [`Vm::step`] and [`Vm::sched_run`]). Either way the event loop re-enqueues the
+    /// fiber, so the loop layer treats both identically.
+    Yield,
+}
+
+/// How a fiber stopped running (returned by [`Vm::run_fiber`]).
+enum Suspend {
+    /// Parked on a wait reason (a waker will re-ready it later).
+    Blocked,
+    /// Explicitly yielded; still Ready, to be re-enqueued by the event loop.
+    Yielded,
+    /// The fiber's root frame returned this value (the fiber completes).
+    Completed(Value),
+}
+
+/// The result of dispatching an intrinsic: either a value to write into the dst
+/// register, or a scheduler signal (suspend the fiber, or yield it).
+enum IntrinsicOutcome {
+    /// A plain result value (the non-blocking case).
+    Value(Value),
+    /// Park the current fiber on this reason; resume into the intrinsic's dst.
+    Suspend(BlockReason),
+    /// Cooperatively yield the current fiber (it stays Ready) — `@schedYield`. The
+    /// fiber resumes at the statement *after* the yield.
+    Yield,
+    /// Yield the current fiber for *re-execution* of the same intrinsic — `@schedRun`.
+    /// The fiber stays Ready, but its `pc` is rewound so the intrinsic runs again on
+    /// resume. This drives the drain loop to quiescence (see [`Vm::sched_run`]).
+    YieldReexec,
 }
 
 /// The arithmetic op an overflow predicate guards.
@@ -1794,6 +2445,66 @@ fn type_carrier(args: &[Value]) -> Option<TypeId> {
         Value::Undef(ty) => Some(*ty),
         _ => None,
     })
+}
+
+/// `true` if `id` is one of the concurrency / scheduler intrinsics (routed by
+/// [`Vm::dispatch_concurrency`], some of it blocking).
+fn is_concurrency_intrinsic(id: &IntrinsicId) -> bool {
+    matches!(
+        id,
+        IntrinsicId::SchedSpawn
+            | IntrinsicId::SchedYield
+            | IntrinsicId::SchedAwait
+            | IntrinsicId::SchedRun
+            | IntrinsicId::ChanMake
+            | IntrinsicId::ChanSend
+            | IntrinsicId::ChanRecv
+            | IntrinsicId::ChanClose
+            | IntrinsicId::ChanLen
+            | IntrinsicId::MutexMake
+            | IntrinsicId::MutexLock
+            | IntrinsicId::MutexUnlock
+            | IntrinsicId::AtomicMake
+            | IntrinsicId::AtomicLoad
+            | IntrinsicId::AtomicStore
+            | IntrinsicId::AtomicFetchAdd
+            | IntrinsicId::AtomicSwap
+            | IntrinsicId::AtomicCas
+            | IntrinsicId::WgMake
+            | IntrinsicId::WgAdd
+            | IntrinsicId::WgDone
+            | IntrinsicId::WgWait
+    )
+}
+
+/// Finds the scheduler-object handle id of `kind` among an intrinsic's operands.
+/// (Concurrency intrinsics take the object handle as their receiver/first operand,
+/// e.g. `@chanSend(chan, value)` or `@mutexLock(m)`.)
+fn sched_handle(args: &[Value], want: SchedKind) -> Option<u32> {
+    args.iter().find_map(|a| match a {
+        Value::Sched { kind, id } if *kind == want => Some(*id),
+        _ => None,
+    })
+}
+
+/// Reads the `n`-th non-handle integer operand of an atomic op as an `i128` (skips
+/// the leading `Sched` handle). Used for `store`/`fetchAdd`/`swap`/`cas` operands.
+fn atomic_operand(args: &[Value], n: usize) -> i128 {
+    args.iter()
+        .filter(|a| !matches!(a, Value::Sched { .. }))
+        .filter_map(|a| a.as_i128())
+        .nth(n)
+        .unwrap_or(0)
+}
+
+/// Unwraps a task's result for delivery to an `await`. A fiber's root frame may
+/// return an `Ok(v)`/bare value; `await` yields the inner value so a `void` task
+/// awaits cleanly and a value task yields its `T`.
+fn unwrap_task_result(v: Value) -> Value {
+    match v {
+        Value::ErrOk(inner) => *inner,
+        other => other,
+    }
 }
 
 /// The handle id carried by an `Allocator` receiver value (the `Capability::

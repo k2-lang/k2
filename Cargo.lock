@@ -80,6 +80,8 @@ dependencies = [
  "k2-mir",
  "k2-parse",
  "k2-resolve",
+ "k2-std",
+ "k2-syntax",
  "k2-types",
 ]
 

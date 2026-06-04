@@ -255,3 +255,336 @@ pub const fmt = struct {
         return @bufPrint(buf, template, args);
     }
 };
+
+// =========================================================================
+//  Thread — the Executor capability + Task handle + sync primitives
+// =========================================================================
+//
+// CONCURRENCY MODEL (v0.11). The VM realizes the spec's colorless async /
+// `Executor` API with a DETERMINISTIC COOPERATIVE FIBER SCHEDULER: each spawned
+// unit of work is a green fiber with its own call stack, and a single-threaded
+// event loop interleaves ready fibers at explicit yield points (spawn / channel
+// send-recv / mutex acquire / await / yield). Output is reproducible because the
+// scheduler is a FIFO state machine. NONE of these objects is global: an
+// `Executor`/`Loop` is a value built from `sys.heap` and passed explicitly,
+// exactly as `ArrayList` is. OS-thread parallelism and the stackless async
+// lowering are the NATIVE-backend (post-0.13) realization of the SAME API; the
+// VM realizes it via fibers. See `crates/k2-vm/src/sched.rs`.
+
+/// The thread / executor namespace: the spawning capability and the cooperative
+/// synchronization primitives, every one an explicit value (never a global).
+pub const Thread = struct {
+    /// The thread-pool / executor capability. Built from the heap capability
+    /// (charter: visible authority). Under the VM it drives fibers; native
+    /// codegen maps it to OS threads. `spawn(work, args)` returns a `Task`.
+    pub const Executor = struct {
+        const Self = @This();
+        /// The allocator the executor was built over (its visible authority).
+        alloc: Allocator,
+
+        /// Executor configuration: how many workers to (virtually) run.
+        pub const Config = struct {
+            /// Worker count. Virtual under the cooperative fiber scheduler.
+            worker_count: u32 = 1,
+        };
+
+        /// Construct the executor over the heap capability — the visible point at
+        /// which spawning authority enters the program.
+        pub fn init(alloc: Allocator, cfg: Config) Self {
+            _ = cfg;
+            return Self{ .alloc = alloc };
+        }
+
+        /// Tear down. Tasks are joined explicitly via `Task.join`, so this is a
+        /// no-op for the fiber realization (no OS threads to join).
+        pub fn deinit(self: *Self) void {
+            _ = self;
+        }
+
+        /// Spawn `work(args...)` as a fiber; return its `Task` handle. `work` is a
+        /// function and `args` an argument tuple copied into the task's frame. The
+        /// lowerer rewrites this call to the `@schedSpawn` scheduler intrinsic with
+        /// `work` resolved to its function reference (colorless: any fn can be
+        /// spawned).
+        pub fn spawn(self: *Self, work: anytype, args: anytype) Task {
+            _ = self;
+            return Task{ .id = @schedSpawn(work, args) };
+        }
+
+        /// Drain all spawned work cooperatively (the spec's `waitIdle`): drives the
+        /// scheduler to quiescence, returning only once no fiber is still runnable.
+        /// `@schedRun` re-enters the ready set each round (yielding to every ready
+        /// fiber, including descendants spawned mid-drain and joiners woken as work
+        /// completes) until the ready queue is empty — so every transitively
+        /// reachable task has run to completion before this returns. A fiber left
+        /// permanently blocked with no waker is a deadlock, reported cleanly by the
+        /// event loop rather than spun on.
+        pub fn waitIdle(self: *Self) void {
+            _ = self;
+            @schedRun();
+        }
+    };
+
+    /// A spawned task / future handle. `join` blocks the current fiber until the
+    /// task completes; `result(T)` additionally yields its value.
+    pub const Task = struct {
+        const Self = @This();
+        /// The VM-side fiber id.
+        id: u32,
+
+        /// Block until the task completes (its result is discarded).
+        pub fn join(self: Self) void {
+            _ = @schedAwait(self.id);
+        }
+
+        /// Block until the task completes and yield its `T` result.
+        pub fn result(self: Self, comptime T: type) T {
+            return @schedAwait(self.id);
+        }
+    };
+
+    /// A cooperative mutex. A fiber holding the lock that yields keeps it; other
+    /// fibers `lock` block (FIFO) until `unlock` hands it over. Pair `lock()` with
+    /// `defer unlock()` — the same explicit-cleanup discipline as allocations.
+    pub const Mutex = struct {
+        const Self = @This();
+        /// The VM-side mutex id. Construct with `Mutex.init()` (the cooperative
+        /// fiber realization needs a registered cell, so the id is not defaulted).
+        id: u32,
+
+        /// Construct a fresh, unheld mutex.
+        pub fn init() Self {
+            return Self{ .id = @mutexMake() };
+        }
+
+        /// Acquire the lock, blocking the current fiber while it is held elsewhere.
+        pub fn lock(self: *Self) void {
+            @mutexLock(self.id);
+        }
+
+        /// Release the lock, handing it to the first waiter (if any).
+        pub fn unlock(self: *Self) void {
+            @mutexUnlock(self.id);
+        }
+    };
+
+    /// A wait-group: the structured-concurrency join primitive. `add(n)` raises
+    /// the outstanding count, `done()` lowers it, and `wait()` blocks until zero.
+    pub const WaitGroup = struct {
+        const Self = @This();
+        /// The VM-side wait-group id. Construct with `WaitGroup.init()`.
+        id: u32,
+
+        /// Construct a fresh wait-group with a zero counter.
+        pub fn init() Self {
+            return Self{ .id = @wgMake() };
+        }
+
+        /// Add `n` to the outstanding count.
+        pub fn add(self: *Self, n: u32) void {
+            @wgAdd(self.id, n);
+        }
+
+        /// Mark one unit of work done; wakes waiters when the count reaches zero.
+        pub fn done(self: *Self) void {
+            @wgDone(self.id);
+        }
+
+        /// Block the current fiber until the count reaches zero.
+        pub fn wait(self: *Self) void {
+            @wgWait(self.id);
+        }
+    };
+
+    /// Cooperatively yield the current fiber to the scheduler.
+    pub fn yieldNow() void {
+        @schedYield();
+    }
+};
+
+// =========================================================================
+//  Channel(T) — a bounded/unbounded mpsc for fiber communication
+// =========================================================================
+
+/// A first-in-first-out channel of `T` for fiber communication. `send` may block
+/// (yield) when a bounded channel is full; `recv` blocks until a value arrives or
+/// the channel is closed and drained. It is an ordinary generic — a comptime
+/// function from a type to a type — and a value you pass explicitly.
+pub fn Channel(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        /// The VM-side channel id.
+        id: u32,
+
+        /// Construct a channel. `cap == 0` is unbounded; `cap > 0` bounds the
+        /// buffer to `cap` values (so a producer outrunning a consumer blocks).
+        pub fn init(cap: usize) Self {
+            return Self{ .id = @chanMake(if (cap == 0) @as(i64, -1) else @as(i64, @intCast(cap))) };
+        }
+
+        /// Send `value`. Blocks the current fiber while a bounded channel is full;
+        /// errors with `ChannelClosed` if the channel has been closed.
+        pub fn send(self: *Self, value: T) !void {
+            if (not @chanSend(self.id, value)) return error.ChannelClosed;
+        }
+
+        /// Receive the next value, or `null` once the channel is closed AND
+        /// drained — the canonical `while (ch.recv()) |v| { ... }` terminator.
+        pub fn recv(self: *Self) ?T {
+            return @chanRecv(self.id);
+        }
+
+        /// Close the channel: no further sends are admitted, and a drained `recv`
+        /// returns `null`.
+        pub fn close(self: *Self) void {
+            @chanClose(self.id);
+        }
+
+        /// The number of buffered values currently in the channel.
+        pub fn len(self: *const Self) usize {
+            return @chanLen(self.id);
+        }
+    };
+}
+
+// =========================================================================
+//  atomic — lock-free primitives (correct under the cooperative model)
+// =========================================================================
+
+/// Lock-free atomics. Under the single-threaded cooperative VM an RMW cannot be
+/// interleaved mid-operation, so every op is trivially atomic; the `Ordering`
+/// argument is accepted (the cost model is honest) and is a no-op here, while
+/// native codegen emits the real fences. Every operation names its ordering, so
+/// there is never a hidden "sequentially consistent by default".
+pub const atomic = struct {
+    /// The memory-ordering enum, required on every atomic operation (spec §4.2).
+    pub const Ordering = enum {
+        /// No ordering beyond atomicity of this one op. Correct for tallies.
+        monotonic,
+        /// An acquiring load; pairs with `release`.
+        acquire,
+        /// A releasing store; pairs with `acquire`.
+        release,
+        /// Both acquire and release on one RMW.
+        acq_rel,
+        /// A single global total order; strongest and most expensive.
+        seq_cst,
+    };
+
+    /// A typed atomic cell. `T` is an integer or bool. Ordering is accepted and
+    /// ignored on the single-threaded VM (see the namespace doc).
+    pub fn Value(comptime T: type) type {
+        return struct {
+            const Self = @This();
+            /// The VM-side atomic-cell id.
+            id: u32,
+
+            /// Construct an atomic initialized to `v`.
+            pub fn init(v: T) Self {
+                return Self{ .id = @atomicMake(@as(i128, @intCast(v))) };
+            }
+
+            /// Atomically read the value.
+            pub fn load(self: *const Self, order: Ordering) T {
+                _ = order;
+                return @as(T, @intCast(@atomicLoad(self.id)));
+            }
+
+            /// Atomically write `v`.
+            pub fn store(self: *Self, v: T, order: Ordering) void {
+                _ = order;
+                @atomicStore(self.id, @as(i128, @intCast(v)));
+            }
+
+            /// Atomically add `delta`, returning the PREVIOUS value (spec §4.1).
+            pub fn fetchAdd(self: *Self, delta: T, order: Ordering) T {
+                _ = order;
+                return @as(T, @intCast(@atomicFetchAdd(self.id, @as(i128, @intCast(delta)))));
+            }
+
+            /// Atomically store `v`, returning the previous value.
+            pub fn swap(self: *Self, v: T, order: Ordering) T {
+                _ = order;
+                return @as(T, @intCast(@atomicSwap(self.id, @as(i128, @intCast(v)))));
+            }
+
+            /// Compare-and-swap: returns `null` on success, else the actual
+            /// witnessed value to retry against (spec §4.3 lock-free idiom).
+            pub fn cmpxchgStrong(self: *Self, expected: T, new: T, so: Ordering, fo: Ordering) ?T {
+                _ = so;
+                _ = fo;
+                const w = @atomicCas(self.id, @as(i128, @intCast(expected)), @as(i128, @intCast(new)));
+                if (w) |actual| {
+                    return @as(T, @intCast(actual));
+                } else {
+                    return null;
+                }
+            }
+
+            /// As `cmpxchgStrong`; the VM never fails spuriously, so the two
+            /// coincide (a retry loop written against `Weak` is still correct).
+            pub fn cmpxchgWeak(self: *Self, expected: T, new: T, so: Ordering, fo: Ordering) ?T {
+                return self.cmpxchgStrong(expected, new, so, fo);
+            }
+        };
+    }
+};
+
+// =========================================================================
+//  event — the explicit async event-loop capability (§8)
+// =========================================================================
+
+/// The async event-loop namespace. A `Loop` is a capability built from the heap;
+/// `loop.spawn(f, args)` returns a `Future` (a task under the hood) and
+/// `future.await(loop, T)` drives it to completion and yields its value. Colorless
+/// and keyword-free: `spawn`/`await` are ordinary method calls (spec §§7–8).
+pub const event = struct {
+    /// The event loop: drives spawned frames to completion. Built from `sys.heap`,
+    /// passed explicitly, never ambient.
+    pub const Loop = struct {
+        const Self = @This();
+        /// The allocator the loop was built over.
+        alloc: Allocator,
+
+        /// Construct an event loop over the heap capability.
+        pub fn init(alloc: Allocator) Self {
+            return Self{ .alloc = alloc };
+        }
+
+        /// Tear down the loop (a no-op for the fiber realization).
+        pub fn deinit(self: *Self) void {
+            _ = self;
+        }
+
+        /// Start `work(args...)` as a fiber and return a `Future`. Like
+        /// `Executor.spawn`, this call is rewritten to `@schedSpawn` with `work`
+        /// resolved to its function reference.
+        pub fn spawn(self: *Self, work: anytype, args: anytype) Future {
+            _ = self;
+            return Future{ .id = @schedSpawn(work, args) };
+        }
+
+        /// Drive all in-flight frames to completion: drives the scheduler to
+        /// quiescence (the same `@schedRun` drain as `Executor.waitIdle`), so every
+        /// spawned frame — and any child frame it awaits — has finished before this
+        /// returns.
+        pub fn run(self: *Self) void {
+            _ = self;
+            @schedRun();
+        }
+    };
+
+    /// A future / frame handle the caller owns. `await(loop, T)` drives it to
+    /// completion and yields its `T` result.
+    pub const Future = struct {
+        const Self = @This();
+        /// The VM-side fiber id.
+        id: u32,
+
+        /// Drive this frame to completion under `loop` and yield its `T` value.
+        pub fn await(self: Self, loop: anytype, comptime T: type) T {
+            _ = loop;
+            return @schedAwait(self.id);
+        }
+    };
+};

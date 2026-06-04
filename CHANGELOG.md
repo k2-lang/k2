@@ -65,6 +65,26 @@ is being designed in the open and nothing is stable yet.
     (~50% fewer instructions / ~2x across the suite). A differential corpus
     test asserts opt == unopt behavior in every mode (a single divergence is a
     blocker) and Debug == ReleaseSafe strictly.
+  - **Concurrency (v0.11).** A deterministic **cooperative fiber scheduler** in
+    `k2-vm` (`crate::sched`): each spawned unit of work is a green fiber with its
+    own call-frame stack, and a single-threaded event loop interleaves ready
+    fibers at explicit yield points (`spawn`/channel `send`-`recv`/`Mutex`
+    acquire/`await`/`yield`). A FIFO ready queue plus FIFO waiter lists make the
+    interleaving — and thus the output — reproducible run to run; an
+    "all-fibers-blocked" state is reported as a clean deadlock diagnostic rather
+    than a hang. The std concurrency surface is written in k2 over a small set of
+    scheduler `@builtin` leaf intrinsics: `std.Thread.Executor`/`Task` (capability-
+    passed spawn + join), `std.Channel(T)` (bounded/unbounded mpsc with blocking
+    `send`/`recv` and `close`), `std.Thread.Mutex`/`WaitGroup`, `std.atomic.Value(T)`
+    (`load`/`store`/`fetchAdd`/`swap`/`cmpxchg*` with explicit `Ordering`), and the
+    colorless, keyword-free `std.event.Loop`/`Future` async surface
+    (`loop.spawn(f, args)` + `future.await(loop, T)`). Every object is a value built
+    from `sys.heap` and passed explicitly, never a global. OS-thread parallelism
+    and the stackless async lowering are the native-backend realization of the
+    same API; the VM realizes it via fibers (documented in
+    `docs/spec/09-concurrency.md §8.1` and `crate::sched`). New example
+    `examples/concurrency.k2` (spawn+join parallel sum, channel producer/consumer,
+    mutex counter, atomics, async/await) runs with deterministic output.
 
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security

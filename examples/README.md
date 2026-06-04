@@ -61,6 +61,7 @@ through it.
 | [`generic_list.k2`](generic_list.k2) | `comptime` generics, `@This()`, `realloc` | A generic container as a function from a type to a type. |
 | [`errors.k2`](errors.k2) | `error` sets, `try`, `catch`, `errdefer`, `\|\|` | Failures are values; cleanup and propagation are visible. |
 | [`comptime_reflection.k2`](comptime_reflection.k2) | `@typeInfo`, `inline for`, `@field`, `@compileError` | Generate a struct printer and a serializer at compile time. |
+| [`concurrency.k2`](concurrency.k2) | `Executor`/`Task` spawn-join, `Channel(T)`, `Mutex`, `atomic`, `event.Loop`/`await` | Deterministic cooperative concurrency: capabilities passed, never global. |
 | [`build.k2`](build.k2) | `*Build`, artifacts, options, steps | A realistic build description, written in k2 itself. |
 
 ---

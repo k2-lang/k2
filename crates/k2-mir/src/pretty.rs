@@ -342,6 +342,7 @@ fn fmt_const(c: &Const) -> String {
         Const::EmptySlice { .. } => "&.{}".to_string(),
         Const::Undef { .. } => "undef".to_string(),
         Const::Aggregate { id, .. } => format!("agg#{}", id.0),
+        Const::FnRef(f) => format!("fn#{}", f.0),
     }
 }
 

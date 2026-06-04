@@ -717,6 +717,16 @@ impl FnBuilder<'_, '_> {
     /// Lowers a call `callee(args)` into `dst`.
     pub(super) fn lower_call_into(&mut self, dst: Place, callee: &Expr, args: &[Expr], span: Span) {
         let ret_ty = self.type_at(span);
+        // The v0.11 `spawn` rewrite: `exec.spawn(work, args)` / `loop.spawn(...)`
+        // is lowered DIRECTLY to the `@schedSpawn` scheduler intrinsic with `work`
+        // resolved to its function reference, then wrapped in the result handle
+        // (`Task`/`Future`) struct. This sidesteps passing a function by value
+        // through a generic method body (the MIR has no indirect calls / first-
+        // class fn pointers); the handle struct is single-field (`id: u32`), so the
+        // wrap is a one-field aggregate of the call's own result type.
+        if self.try_lower_spawn(dst.clone(), callee, args, span, ret_ty) {
+            return;
+        }
         // A still-Deferred member call -> intrinsic (std/sys/build boundary).
         if let Some((path, recv_args)) = self.try_intrinsic_call(callee, args) {
             let mut arg_ops = recv_args;
@@ -806,6 +816,128 @@ impl FnBuilder<'_, '_> {
             return Operand::Const(Const::Undef { ty: aty });
         }
         self.lower_operand(a, ty)
+    }
+
+    /// Lowers a *function-reference* argument (the work fn passed to
+    /// `Executor.spawn`/`Loop.spawn` via `@schedSpawn`). A bare function identifier
+    /// is resolved to its `DefId`, enqueued for monomorphization (as a plain
+    /// instantiation — spawned work is non-generic), and emitted as an `FnRef`
+    /// const carrying the callee's [`FnId`]. Anything that is not a resolvable
+    /// function name falls back to `undef` (lowering stays total).
+    fn lower_fn_ref_arg(&mut self, a: &Expr) -> Operand {
+        self.try_fn_ref(a).unwrap_or_else(|| {
+            Operand::Const(Const::Undef {
+                ty: self.type_at(a.span()),
+            })
+        })
+    }
+
+    /// Resolves an expression naming a function to an `FnRef` operand, or `None` if
+    /// it is not a resolvable (non-generic) function identifier.
+    fn try_fn_ref(&mut self, a: &Expr) -> Option<Operand> {
+        let Expr::Ident { span, .. } = a else {
+            return None;
+        };
+        let def = self.resolved_def(*span)?;
+        if !self.lo.fn_items.contains_key(&def) {
+            return None;
+        }
+        let fid = self.lo.enqueue(InstId::plain(def));
+        Some(Operand::Const(Const::FnRef(fid)))
+    }
+
+    /// Rewrites the v0.11 concurrency-handle methods to direct scheduler
+    /// intrinsics, since `Executor.spawn`/`Loop.spawn` take a function *by value*
+    /// (which the MIR cannot pass as a first-class pointer) and the resulting
+    /// `Task`/`Future` is realized as a bare `u32` fiber id. Recognized shapes:
+    ///
+    /// - `recv.spawn(work, args)` -> `@schedSpawn(FnRef(work), args)` (the id).
+    /// - `task.join()` / `task.result(T)` -> `@schedAwait(task)`.
+    /// - `future.await(loop, T)` -> `@schedAwait(future)`.
+    ///
+    /// Returns `true` if it matched and lowered the call. The `await`/`result`/
+    /// `join`/`spawn` member names plus an operand-shaped receiver make a false
+    /// match vanishingly unlikely; if a future user type reuses these names this
+    /// guard can be tightened to the concrete std handle types.
+    fn try_lower_spawn(
+        &mut self,
+        dst: Place,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        ret_ty: TypeId,
+    ) -> bool {
+        let Expr::Field { base, field, .. } = callee else {
+            return false;
+        };
+        match field.as_str() {
+            // `recv.spawn(work, args)` -> `@schedSpawn(FnRef(work), args)`.
+            "spawn" if args.len() == 2 => {
+                let Some(fn_ref) = self.try_fn_ref(&args[0]) else {
+                    return false;
+                };
+                let args_ty = self.type_at(args[1].span());
+                let args_op = self.lower_call_arg(&args[1], args_ty);
+                self.emit_sched_intrinsic(dst, "schedSpawn", vec![fn_ref, args_op], ret_ty, span);
+                true
+            }
+            // `task.join()` / `task.result(T)` -> `@schedAwait(task)`.
+            "join" | "result" if self.receiver_is_handle(base) => {
+                let recv = self.lower_handle_receiver(base);
+                self.emit_sched_intrinsic(dst, "schedAwait", vec![recv], ret_ty, span);
+                true
+            }
+            // `future.await(loop, T)` -> `@schedAwait(future)`.
+            "await" if self.receiver_is_handle(base) => {
+                let recv = self.lower_handle_receiver(base);
+                self.emit_sched_intrinsic(dst, "schedAwait", vec![recv], ret_ty, span);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `true` if `base` denotes a concurrency-handle receiver (a `u32` fiber id or
+    /// a still-`deferred` value — the shape `Task`/`Future` lowers to). This keeps
+    /// the `join`/`result`/`await` rewrite from firing on an unrelated method of
+    /// the same name on a concrete non-handle type.
+    fn receiver_is_handle(&self, base: &Expr) -> bool {
+        let ty = self.type_at(base.span());
+        matches!(
+            self.lo.typed.arena.get(ty),
+            Type::Deferred | Type::Int { .. }
+        )
+    }
+
+    /// Lowers a concurrency-handle receiver (the `Task`/`Future` value) to its
+    /// `u32` fiber-id operand.
+    fn lower_handle_receiver(&mut self, base: &Expr) -> Operand {
+        let ty = self.type_at(base.span());
+        self.lower_operand(base, ty)
+    }
+
+    /// Emits a scheduler `@builtin` intrinsic call into `dst`.
+    fn emit_sched_intrinsic(
+        &mut self,
+        dst: Place,
+        name: &str,
+        args: Vec<Operand>,
+        ret_ty: TypeId,
+        span: Span,
+    ) {
+        self.assign(
+            dst,
+            Rvalue::Intrinsic {
+                path: IntrinsicPath {
+                    root: IntrinsicRoot::Builtin(name.to_string()),
+                    members: Vec::new(),
+                    is_call: true,
+                },
+                args,
+                ty: ret_ty,
+            },
+            span,
+        );
     }
 
     /// The parameter types of a monomorphized callee (from its lowered locals).
@@ -1270,10 +1402,27 @@ impl FnBuilder<'_, '_> {
             | "@allocRaw" | "@reallocRaw" | "@freeRaw" | "@createRaw" | "@destroyRaw"
             | "@arenaDeinit" | "@gpaDeinit"
             | "@clockNow" | "@clockSleep" | "@randomBytes" | "@randomInt"
-            | "@envGet" | "@bufPrint" => {
-                // Runtime ops on opaque data -> intrinsic.
+            | "@envGet" | "@bufPrint"
+            // The concurrency / scheduler floor (v0.11): thin `@builtin` leaf
+            // intrinsics the std `Executor`/`Channel`/`Mutex`/`atomic`/`WaitGroup`
+            // types call over the VM's deterministic cooperative fiber scheduler.
+            // See `crates/k2-vm/src/sched.rs` and the VM dispatcher.
+            | "@schedSpawn" | "@schedYield" | "@schedAwait" | "@schedRun"
+            | "@chanMake" | "@chanSend" | "@chanRecv" | "@chanClose" | "@chanLen"
+            | "@mutexMake" | "@mutexLock" | "@mutexUnlock"
+            | "@atomicMake" | "@atomicLoad" | "@atomicStore" | "@atomicFetchAdd"
+            | "@atomicSwap" | "@atomicCas"
+            | "@wgMake" | "@wgAdd" | "@wgDone" | "@wgWait" => {
+                // Runtime ops on opaque data -> intrinsic. `@schedSpawn`'s first
+                // argument is the work *function*: lower it to an `FnRef` const
+                // tag (the MIR has no indirect calls), so the VM can build the new
+                // fiber's root frame from that callee.
                 let mut arg_ops = Vec::new();
-                for a in args {
+                for (i, a) in args.iter().enumerate() {
+                    if name == "@schedSpawn" && i == 0 {
+                        arg_ops.push(self.lower_fn_ref_arg(a));
+                        continue;
+                    }
                     let aty = self.type_at(a.span());
                     arg_ops.push(self.lower_call_arg(a, aty));
                 }

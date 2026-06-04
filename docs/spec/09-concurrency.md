@@ -823,6 +823,37 @@ without contradicting `no runtime` and `no ambient authority`:
 > event-loop capability among its arguments. Async did not punch a hole in the
 > capability model, and it added no keyword to the language.
 
+### 8.1 Realizations: VM fibers vs the native backend (v0.11 note)
+
+The model above is the **language contract**; how it is *executed* depends on the
+backend. k2 v0.11 ships a development/test interpreter (`k2c run`), and that
+interpreter realizes the colorless async / `Executor` surface with a
+**deterministic cooperative fiber scheduler** inside the VM:
+
+- Each spawned unit of work is a **green fiber** with its own call-frame stack;
+  a single-threaded **event loop** interleaves ready fibers at the explicit yield
+  points (`spawn`, channel `send`/`recv`, `Mutex` acquire, `await`, an explicit
+  `yield`). A FIFO ready queue plus FIFO waiter lists make the interleaving — and
+  therefore the program's output — **reproducible run to run**.
+- An "all fibers blocked" state (the ready queue empties while live fibers
+  remain) is a **clean deadlock diagnostic**, reported immediately rather than
+  hanging, because every block reason carries an explicit waker.
+- Memory `Ordering` is **accepted and ignored** on the single-threaded VM (an RMW
+  cannot be interleaved mid-operation, so it is trivially atomic), while the cost
+  model stays honest: you still write the ordering you would pay for natively.
+
+The **native backend (post-0.13)** realizes the *same surface* differently: async
+lowers to the stackless `Frame` state machine of §7 (no green-thread runtime is
+linked into the binary, per §1 and §10), `Executor` maps to **OS threads**, and
+`Ordering` emits **real memory fences**. The VM's fiber scheduler is therefore an
+implementation detail of the interpreter — **not** a baked-in runtime — and the
+charter's "no green threads linked into your binary" commitment holds for shipped
+code. Across both realizations the API is identical: capability-passed, keyword-
+free, caller-owned-handle. (Concretely, the v0.11 std surface is
+`std.Thread.Executor`/`Task`, `std.Channel(T)`, `std.Thread.Mutex`/`WaitGroup`,
+`std.atomic.Value(T)`, and `std.event.Loop`/`Future` — every one a value built
+from `sys.heap` and passed explicitly, never a global.)
+
 ---
 
 ## 9. Testing concurrent code

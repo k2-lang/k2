@@ -109,6 +109,61 @@ pub enum IntrinsicId {
     /// `slice.ptr` on a still-`deferred`-typed receiver -> its data pointer.
     SlicePtr,
 
+    // ---- The concurrency / scheduler floor (v0.11) ----------------------
+    //
+    // These back the std `Executor`/`Task`/`Channel(T)`/`Mutex`/`atomic.Value(T)`/
+    // `WaitGroup` types over the deterministic cooperative fiber scheduler
+    // (`crate::sched`). The *blocking* ones (`@schedAwait`, `@chanSend/Recv`,
+    // `@mutexLock`, `@wgWait`) may suspend the current fiber and resume into their
+    // `dst` register when their waker fires.
+    /// `@schedSpawn(fn, args_tuple)` -> a `u32` task/fiber id. `fn` is an `FnRef`.
+    SchedSpawn,
+    /// `@schedYield()` -> void. Cooperatively yields the current fiber.
+    SchedYield,
+    /// `@schedAwait(task_id)` -> the task's result (blocks until it completes).
+    SchedAwait,
+    /// `@schedRun()` -> void. Drives the ready set to quiescence (loop/waitIdle).
+    SchedRun,
+    /// `@chanMake(cap)` -> a `u32` channel id (`cap < 0` is unbounded).
+    ChanMake,
+    /// `@chanSend(chan, value)` -> `bool` (false if the channel is closed). Blocks
+    /// when a bounded channel is full.
+    ChanSend,
+    /// `@chanRecv(chan)` -> `?T` (`null` when closed and drained). Blocks when the
+    /// queue is empty and the channel is open.
+    ChanRecv,
+    /// `@chanClose(chan)` -> void.
+    ChanClose,
+    /// `@chanLen(chan)` -> `usize`, the buffered count.
+    ChanLen,
+    /// `@mutexMake()` -> a `u32` mutex id.
+    MutexMake,
+    /// `@mutexLock(m)` -> void. Blocks while the lock is held by another fiber.
+    MutexLock,
+    /// `@mutexUnlock(m)` -> void. Hands the lock to the first waiter, if any.
+    MutexUnlock,
+    /// `@atomicMake(init)` -> a `u32` atomic id.
+    AtomicMake,
+    /// `@atomicLoad(a)` -> the cell value.
+    AtomicLoad,
+    /// `@atomicStore(a, v)` -> void.
+    AtomicStore,
+    /// `@atomicFetchAdd(a, delta)` -> the previous value.
+    AtomicFetchAdd,
+    /// `@atomicSwap(a, v)` -> the previous value.
+    AtomicSwap,
+    /// `@atomicCas(a, expected, new)` -> `?T` (`null` on success, else the actual
+    /// witnessed value).
+    AtomicCas,
+    /// `@wgMake()` -> a `u32` wait-group id.
+    WgMake,
+    /// `@wgAdd(wg, n)` -> void.
+    WgAdd,
+    /// `@wgDone(wg)` -> void. Wakes waiters when the counter reaches zero.
+    WgDone,
+    /// `@wgWait(wg)` -> void. Blocks until the counter reaches zero.
+    WgWait,
+
     /// An intrinsic the VM does not implement (e.g. a `std.testing.*` member
     /// reached outside the `run` path). Dispatch yields a clean panic naming it.
     Unsupported(String),

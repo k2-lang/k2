@@ -698,6 +698,11 @@ pub enum Const {
         /// The aggregate's type.
         ty: TypeId,
     },
+    /// A reference to a compiled function (the v0.11 spawn tag). The MIR has no
+    /// indirect calls, so a function passed by value to `Executor.spawn`/
+    /// `Loop.spawn` is materialized as this const, carrying the callee's [`FnId`];
+    /// the VM's `@schedSpawn` reads it to build the new fiber's root frame.
+    FnRef(FnId),
 }
 
 /// A globally-stable error tag (spec §6.1.1: a nonzero `u16`).

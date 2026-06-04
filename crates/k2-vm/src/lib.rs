@@ -40,6 +40,7 @@ mod compile;
 mod fmt;
 mod heap;
 mod isa;
+mod sched;
 mod value;
 mod vm;
 
@@ -51,7 +52,7 @@ use std::process::ExitCode;
 
 use k2_mir::{BuildMode, MirProgram};
 
-pub use value::{Capability, IntRepr, Value};
+pub use value::{Capability, IntRepr, SchedKind, Value};
 pub use vm::{Halt, PanicInfo, Vm};
 
 /// The arguments to a run: the build mode (informs ReleaseFast behaviour) and the
