@@ -1696,3 +1696,89 @@ pub fn build(b: *Build) void {
         .to_string();
     assert_eq!(hash1, hash3, "restoring the source must restore graph_hash");
 }
+
+// =========================================================================
+//  `k2c lsp` — the language server over real stdio
+// =========================================================================
+
+/// Frames a JSON-RPC body as a `Content-Length` message.
+fn lsp_frame(body: &str) -> String {
+    format!("Content-Length: {}\r\n\r\n{}", body.len(), body)
+}
+
+#[test]
+fn lsp_initialize_smoke_returns_capabilities() {
+    // The minimal acceptance: an initialize request over stdio returns a result
+    // advertising capabilities. Closing stdin ends the server cleanly.
+    let mut session = String::new();
+    session.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ));
+    let (_ok, stdout, _stderr) = run_with_stdin(&["lsp"], session.as_bytes());
+    assert!(
+        stdout.contains("capabilities"),
+        "initialize response advertises capabilities: {stdout}"
+    );
+    assert!(
+        stdout.contains("hoverProvider"),
+        "initialize advertises hoverProvider: {stdout}"
+    );
+}
+
+#[test]
+fn lsp_scripted_session_over_stdio() {
+    // A full scripted session through the *real* `k2c lsp` binary: initialize,
+    // didOpen a .k2 doc, hover, definition, completion, formatting, shutdown.
+    let uri = "file:///session.k2";
+    // The doc text, JSON-escaped for embedding in a request body.
+    let doc = "const x: i32 = 1;\\npub fn main() void {\\n    const y = x;\\n}\\n";
+
+    let mut s = String::new();
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ));
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    ));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"k2","version":1,"text":"{doc}"}}}}}}"#
+    )));
+    // hover/definition on the `x` use at line 2, char 14.
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":2,"character":14}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":2,"character":14}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":2,"character":14}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"textDocument/formatting","params":{{"textDocument":{{"uri":"{uri}"}},"options":{{}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":6,"method":"shutdown"}"#,
+    ));
+    s.push_str(&lsp_frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let (ok, stdout, _stderr) = run_with_stdin(&["lsp"], s.as_bytes());
+    assert!(ok, "clean exit after shutdown/exit");
+
+    // publishDiagnostics arrived (the clean doc → empty list).
+    assert!(
+        stdout.contains("textDocument/publishDiagnostics"),
+        "diagnostics published: {stdout}"
+    );
+    // hover returned a type containing i32.
+    assert!(stdout.contains("i32"), "hover/type present: {stdout}");
+    // completion returned candidates (the `main` item is visible).
+    assert!(
+        stdout.contains("\"main\""),
+        "completion candidates: {stdout}"
+    );
+    // formatting returned the canonical newText.
+    assert!(
+        stdout.contains("newText"),
+        "formatting edit present: {stdout}"
+    );
+}

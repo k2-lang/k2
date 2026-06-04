@@ -38,7 +38,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | --- | --- | --- |
 | v0.1 | Lexer + driver | ✅ |
 | v0.2 | Parser → AST | ⬜ |
-| v0.3 | Canonical formatter + AST tooling | ⬜ |
+| v0.3 | Canonical formatter + AST tooling (finalized in v0.13) | ✅ |
 | v0.4 | Name resolution, scopes & module graph (HIR) | ⬜ |
 | v0.5 | Type system & checker | ⬜ |
 | v0.6 | The comptime engine & generics | ⬜ |
@@ -48,7 +48,13 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | v0.10 | Standard library & the `*System` capabilities | ⬜ |
 | v0.11 | Concurrency: threads, sync & async | ⬜ |
 | v0.12 | `build.k2` & the package/module system | ✅ |
-| v0.13 | Tooling: formatter polish & language server | ⬜ |
+| v0.13 | Tooling: formatter polish & language server | ✅ |
+
+**The `v0.x` line is complete.** The k2 front end runs end to end — lex, parse,
+resolve, type-check, comptime, MIR, optimize, run — and the canonical formatter
+and the `k2c lsp` language server reuse those exact stages. What remains is the
+*Beyond 0.13* work (native codegen, FFI, self-hosting), which deliberately steps
+outside the pure-`std` rule.
 
 ---
 
@@ -73,11 +79,12 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 - `k2c parse <file>` dumps the AST; an S-expression form supports round-trip
   testing.
 
-## v0.3 — Canonical formatter + AST tooling ⬜
+## v0.3 — Canonical formatter + AST tooling ✅ (finalized in v0.13)
 
-- `k2c fmt` — the one canonical layout for k2 source, built on the AST.
-- Idempotence and parse-print-parse round-trip tests across every example.
-- `k2c ast` structured dump for tooling and golden tests.
+- ✅ `k2c fmt` — the one canonical layout for k2 source, built on the AST. Marked
+  **stable** in v0.13; the `k2c lsp` formatting feature reuses the same engine.
+- ✅ Idempotence and parse-print-parse round-trip tests across every example.
+- ✅ `k2c ast` structured dump for tooling and golden tests.
 
 ## v0.4 — Name resolution, scopes & module graph (HIR) ⬜
 
@@ -178,14 +185,31 @@ Library-provided over OS threads; no built-in runtime. See
   synthesized comptime module whose `if (opts.flag)` dead branch the optimizer
   eliminates entirely.
 
-## v0.13 — Tooling: formatter polish & language server ⬜
+## v0.13 — Tooling: formatter polish & language server ✅
 
-- `k2 fmt` finalized as the canonical formatter.
-- A **language server** (`k2c lsp`) over the LSP base protocol: diagnostics,
-  hover, go-to-definition, and completion — reusing the front-end crates, in
-  pure `std`.
-- Editor-integration notes. Final integration pass: every example runs, the
-  whole suite is green, and the optimizer's wins are re-verified.
+- ✅ **`k2c fmt` finalized** as *the* canonical formatter — stable, idempotent,
+  comment-preserving. The language server reuses the same `format_source` engine,
+  so format-on-save and the CLI cannot diverge.
+- ✅ A **pure-`std` JSON** value/parser/serializer (objects, arrays, strings with
+  `\`-escapes and `\u` surrogate pairs, numbers, bool, null) that round-trips the
+  LSP base protocol, with a depth guard and never-panic error handling.
+- ✅ An **LSP server** (`k2c lsp`) over stdio: `Content-Length`-framed JSON-RPC,
+  the full lifecycle (`initialize` → `ServerCapabilities`, `initialized`,
+  `shutdown`, `exit`), and document sync (`didOpen`/`didChange` full **and**
+  incremental/`didClose`) over an in-memory document store.
+- ✅ **Features reusing the front-end crates** (zero re-implementation):
+  `publishDiagnostics` (lex+parse+resolve+check with exact ranges/severities),
+  `hover` (per-occurrence type + def kind), `definition` (occurrence→definition,
+  fields/variants via the member table), `completion` (scope-aware identifiers +
+  member-after-`.`), and `formatting` (a single full-document `TextEdit`).
+- ✅ **UTF-16 ↔ scalar-offset position mapping**, unit-tested on multi-byte and
+  astral (surrogate-pair) text — ranges are exact.
+- ✅ **Editor-integration notes** (`docs/lsp.md`) and the updated `docs/tooling.md`
+  status.
+- ✅ **Final integration pass:** every example runs (`hello`/`errors`/
+  `allocators`/`generic_list`/`concurrency` via `k2c run`, `build.k2` via
+  `k2c build`), the whole `cargo test --workspace` suite is green, and the
+  optimizer benchmark still shows the ~2× speedup (`k2c bench`).
 
 ---
 

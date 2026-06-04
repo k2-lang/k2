@@ -21,6 +21,7 @@ members = [
     "crates/k2-opt",
     "crates/k2-vm",
     "crates/k2-fmt",
+    "crates/k2-lsp",
     "crates/k2c",
 ]
 

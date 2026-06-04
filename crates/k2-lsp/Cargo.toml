@@ -1,0 +1,27 @@
+# k2-lsp — the language server for the k2 programming language.
+#
+# k2 — "Kardashev Type II": total control over the machine, with zero waste.
+#
+# This crate is the developer-tooling layer (v0.13): a Language Server Protocol
+# server that speaks JSON-RPC over stdio and reuses the existing front-end crates
+# (lexer, parser, resolver, type checker, formatter) for every feature, so the
+# editor experience cannot drift from `k2c check`/`k2c fmt`. Consistent with the
+# rest of the toolchain it depends on the standard library ONLY — the JSON
+# implementation and the LSP framing are hand-rolled — so it builds offline.
+[package]
+name = "k2-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "Language server (LSP) for the k2 programming language."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "k2_lsp"
+
+[dependencies]
+k2-lexer = { path = "../k2-lexer" }
+k2-syntax = { path = "../k2-syntax" }
+k2-parse = { path = "../k2-parse" }
+k2-resolve = { path = "../k2-resolve" }
+k2-types = { path = "../k2-types" }
+k2-fmt = { path = "../k2-fmt" }

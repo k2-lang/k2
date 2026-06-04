@@ -104,6 +104,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "run" => cmd_run(rest),
         "build" => build_cmd::cmd_build(rest),
         "bench" => cmd_bench(rest),
+        "lsp" => cmd_lsp(rest),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -1205,6 +1206,29 @@ struct BenchResult {
 /// Usage:
 ///   k2c bench                  Run the committed benchmark suite and print a table.
 ///   k2c bench <file.k2> ...    Benchmark the given programs instead.
+/// The `lsp` subcommand: run the k2 language server over stdio.
+///
+/// This speaks the Language Server Protocol (JSON-RPC framed by `Content-Length`)
+/// on stdin/stdout, reusing the front-end crates for every feature so the editor
+/// experience matches `k2c check`/`k2c fmt` exactly. The only transport is stdio;
+/// the optional `--stdio` flag is accepted for the conventional spelling. All RPC
+/// goes to stdout, all logging to stderr; the process exits `0` on a clean
+/// `shutdown`/`exit` or stdin close.
+fn cmd_lsp(args: &[String]) -> Result<ExitCode, String> {
+    for arg in args {
+        match arg.as_str() {
+            // The standard, default transport; accepted explicitly.
+            "--stdio" => {}
+            other => return Err(format!("unknown `lsp` flag `{other}` (only --stdio)")),
+        }
+    }
+    match k2_lsp::run_stdio() {
+        Ok(0) => Ok(ExitCode::SUCCESS),
+        Ok(code) => Ok(ExitCode::from(code as u8)),
+        Err(e) => Err(format!("language server I/O error: {e}")),
+    }
+}
+
 ///   k2c bench --emit-baseline  Print a `name debug=.. fast=.. safe=..` line per bench.
 fn cmd_bench(args: &[String]) -> Result<ExitCode, String> {
     let mut files: Vec<String> = Vec::new();
@@ -1509,6 +1533,7 @@ fn print_usage() {
          \x20   run <file.k2>        Compile to bytecode and execute `main` (Debug mode).\n\
          \x20   run --release-fast <f>  Optimize + execute with safety checks stripped.\n\
          \x20   bench [file.k2 ...]  Benchmark Debug vs ReleaseFast executed VM instructions.\n\
+         \x20   lsp                  Run the language server over stdio (LSP / JSON-RPC).\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\

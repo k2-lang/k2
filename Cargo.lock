@@ -16,6 +16,18 @@ name = "k2-lexer"
 version = "0.1.0"
 
 [[package]]
+name = "k2-lsp"
+version = "0.1.0"
+dependencies = [
+ "k2-fmt",
+ "k2-lexer",
+ "k2-parse",
+ "k2-resolve",
+ "k2-syntax",
+ "k2-types",
+]
+
+[[package]]
 name = "k2-mir"
 version = "0.1.0"
 dependencies = [
@@ -91,6 +103,7 @@ version = "0.1.0"
 dependencies = [
  "k2-fmt",
  "k2-lexer",
+ "k2-lsp",
  "k2-mir",
  "k2-opt",
  "k2-parse",

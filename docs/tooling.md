@@ -82,10 +82,10 @@ authoritative, milestone-by-milestone breakdown lives in
 | `k2c build` | Compile the project's artifacts via `build.k2`. | Specified — needs a backend (ROADMAP v0.7+). |
 | `k2c run`   | Build the executable and run it, forwarding program arguments. | Specified — needs a backend (ROADMAP v0.7+). |
 | `k2c test`  | Compile and execute every `test { ... }` block reachable from a test root. | Specified — needs a backend (ROADMAP v0.7+). |
-| `k2c fmt`   | Rewrite source into the one canonical style. | Specified — needs the parser/AST (ROADMAP v0.13). |
+| `k2c fmt`   | Rewrite source into the one canonical style. | **Implemented** (ROADMAP v0.3; finalized/stable in v0.13). |
 | `k2c check` | Parse, resolve, type-check, and run comptime — **no codegen**. | Specified — needs the middle end (ROADMAP v0.3–v0.5). |
 | `k2c doc`   | Generate API documentation from `///` doc comments. | Specified — needs resolve + comptime (ROADMAP v0.13). |
-| `k2c lsp`   | Start the language server on stdio (also installed as `k2c-lsp`). | Specified (ROADMAP v0.13). |
+| `k2c lsp`   | Start the language server on stdio (also installed as `k2c-lsp`). | **Implemented** (ROADMAP v0.13). |
 | `k2c pkg`   | Manage content-addressed dependencies (`fetch` / `update` / `hash`). | Specified (ROADMAP v0.12). |
 | `k2c init`  | Scaffold a new project (`build.k2`, `k2.pkg`, `src/main.k2`). | Specified (ROADMAP v0.12). |
 | `k2c targets` | List the target triples the bundled toolchain can cross-compile to. | Specified (ROADMAP v0.8). |
@@ -624,24 +624,29 @@ the server, and the toolchain also installs a `k2c-lsp` alias so editors that
 expect a dedicated executable find one. Because it is built on the **same front
 end** as `k2c build`/`k2c check`, the diagnostics, types, and definitions an editor
 shows are *identical* to what the compiler reports; there is no second, divergent
-analyzer to drift out of sync. (The server reuses the front-end crates and is
-specified for ROADMAP v0.13; it is not yet implemented.)
+analyzer to drift out of sync. (**Implemented in v0.13** — the server reuses the
+front-end crates in pure `std`. See **`docs/lsp.md`** for editor-integration
+notes and the exact set of capabilities it advertises today; the table below lists
+the full *designed* surface, with the v0.13 subset noted in 8.1.)
 
 ### 8.1 Capabilities
 
 `k2c-lsp` provides the standard editor features, each backed by a real compiler
-pass rather than a heuristic:
+pass rather than a heuristic. The **v0.13 status** column records what ships in
+this milestone (single open buffer, pure `std`); the rest remain designed.
 
-| Feature | Backed by |
-|---------|-----------|
-| **Diagnostics** (errors, warnings) | The resolver and comptime engine — same errors as `k2c check`, pushed live as you type. |
-| **Hover** (type and doc) | `@TypeOf`-style inference plus the `///` doc comment of the symbol under the cursor. |
-| **Go-to-definition / references** | The name-resolution graph, across files and `@import` boundaries. |
-| **Completion** | Members of the resolved type or namespace at the cursor, including capability methods reachable from `sys`. |
-| **Formatting** | The exact `k2c fmt` engine — format-on-save with no extra config. |
-| **Rename** | The resolver's symbol graph (rename a `pub fn`, update every reference). |
-| **Signature help** | The callee's real parameter list, including `comptime` parameters. |
-| **Inlay hints** | Inferred types for `const`/`var` bindings and `|capture|` payloads. |
+| Feature | Backed by | v0.13 |
+|---------|-----------|-------|
+| **Diagnostics** (errors, warnings) | The resolver and type checker — same errors as `k2c check`, pushed live as you type. | ✅ shipped |
+| **Hover** (type and kind) | Per-occurrence inferred types plus the definition kind of the symbol under the cursor. | ✅ shipped |
+| **Go-to-definition** | The name-resolution occurrence→definition map; fields/variants via the type checker's member table. | ✅ shipped (in-buffer) |
+| **Completion** | Scope-visible bindings (params/locals/items/predeclared) and members of the resolved base type after `.`. | ✅ shipped |
+| **Formatting** | The exact `k2c fmt` engine — format-on-save with no extra config. | ✅ shipped |
+| **References** | The resolver's symbol graph. | designed |
+| **Rename** | The resolver's symbol graph (rename a `pub fn`, update every reference). | designed |
+| **Signature help** | The callee's real parameter list, including `comptime` parameters. | designed |
+| **Inlay hints** | Inferred types for `const`/`var` bindings and `|capture|` payloads. | designed |
+| **Cross-file definition** | The module graph across `@import` boundaries. | designed |
 
 ### 8.2 Capability-aware assistance
 
@@ -795,8 +800,9 @@ deliberate one: fast feedback on the left, harnessed-star throughput on the righ
   match `k2c check` exactly.
 - **Every tool is the same compiler** stopped at a different point. One front end,
   one comptime engine, two backends — small surface, no waste, nothing happening
-  behind your back. Today that compiler runs as far as the lexer; the rest is
-  specified and on the roadmap.
+  behind your back. As of v0.13 the front end runs end to end — lex, parse,
+  resolve, type-check, comptime, MIR, optimize, and execute on the bytecode VM —
+  and the formatter and language server reuse those exact stages.
 
 ---
 
