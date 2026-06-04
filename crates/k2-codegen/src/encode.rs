@@ -32,6 +32,7 @@
 //! the system assembler (see `tests.rs`).
 
 use crate::reg::Gpr;
+use crate::runtime::RuntimeFn;
 
 /// A condition code, naming the `setcc`/`jcc` variant to emit. The encoding adds
 /// the [`Cc::tttn`] nibble to a base opcode: `0F 80+tttn` for a near `jcc`,
@@ -65,6 +66,10 @@ pub enum Cc {
     /// unsigned add/sub overflow check (`setc`) — an unsigned add/sub overflows
     /// exactly when it carries/borrows out of the top bit.
     C,
+    /// Not-sign (`SF=0`). `tttn = 9`. The non-negative branch of a syscall result:
+    /// a successful `mmap` returns a (sign-clear) user address, while a failure
+    /// returns `-errno` in `[-4095,-1]` (sign set), so `jns` selects success.
+    Ns,
 }
 
 impl Cc {
@@ -83,6 +88,7 @@ impl Cc {
             Cc::Ae => 0x3,
             Cc::O => 0x0,
             Cc::C => 0x2,
+            Cc::Ns => 0x9,
         }
     }
 }
@@ -107,6 +113,16 @@ pub enum FixupKind {
     /// loads the string's absolute virtual address — the ELF is non-PIE, so the
     /// address is fixed at link time).
     Data(u32),
+    /// A `rel32` displacement to a runtime support routine (an `E8` call). The
+    /// program layout pass patches it once the routine's offset within `.text` is
+    /// known (the runtime prelude is appended after the user functions). These are
+    /// the hand-written heap / capability routines (see [`crate::runtime`]).
+    Runtime(RuntimeFn),
+    /// An 8-byte absolute pointer into the writable state segment (registry / clock
+    /// / RNG) at the given byte offset, patched to `state_vaddr + offset` (a `mov
+    /// r64, imm64`). The state segment is a fixed-address `.bss`-like `PT_LOAD`, so
+    /// the address is known at link time exactly like a `.rodata` pointer.
+    State(u32),
 }
 
 /// One unresolved reference embedded in the code stream.
@@ -572,6 +588,21 @@ impl Asm {
         });
     }
 
+    /// `mov dst, imm64` whose 8 immediate bytes are a writable-state pointer hole.
+    /// Records a [`FixupKind::State`] so the layout pass writes the segment's
+    /// absolute virtual address plus `state_off`. Always uses the full `B8+rd io`
+    /// form so the hole is a fixed 8 bytes regardless of the (unknown) address.
+    pub fn mov_ri_state(&mut self, dst: Gpr, state_off: u32) {
+        self.rex(true, false, false, dst.is_ext());
+        self.byte(0xB8 | dst.low3());
+        let at = self.pos();
+        self.imm64(0);
+        self.fixups.push(Fixup {
+            at,
+            kind: FixupKind::State(state_off),
+        });
+    }
+
     // ---------------------------------------------------------------------
     //  Integer arithmetic / bitwise (r64, r64)
     // ---------------------------------------------------------------------
@@ -783,6 +814,15 @@ impl Asm {
         self.byte(imm);
     }
 
+    /// `shr dst, imm8`: `REX.W C1 /5 ib` — logical right-shift by a constant. Used
+    /// by the runtime splitmix64 PRNG step (`z ^ z >> 30/27/31`).
+    pub fn shr_ri(&mut self, dst: Gpr, imm: u8) {
+        self.rex(true, false, false, dst.is_ext());
+        self.byte(0xC1);
+        self.modrm_rr_op(5, dst);
+        self.byte(imm);
+    }
+
     /// `sub rsp, imm32`: `REX.W 81 /5 id` (allocate stack frame).
     pub fn sub_rsp_imm(&mut self, imm: i32) {
         self.rex(true, false, false, false);
@@ -913,6 +953,28 @@ impl Asm {
         self.push_rel32_fixup(FixupKind::Call(func));
     }
 
+    /// `call <runtime routine>` (near, rel32): `E8 cd`. Records a
+    /// [`FixupKind::Runtime`] the program layout pass patches once the routine's
+    /// `.text` offset is known.
+    pub fn call_runtime(&mut self, rt: RuntimeFn) {
+        self.byte(0xE8);
+        self.push_rel32_fixup(FixupKind::Runtime(rt));
+    }
+
+    /// `call label` (near, rel32 to a function-local label): `E8 cd`. Resolved by
+    /// [`Asm::finish`]. The runtime trap helper uses `call after; <bytes>; after:
+    /// pop` to recover the absolute address of inline data bytes.
+    pub fn call_label(&mut self, label: LabelId) {
+        self.byte(0xE8);
+        self.push_rel32_fixup(FixupKind::Local(label));
+    }
+
+    /// Appends `bytes` verbatim into the code stream (raw data embedded in `.text`,
+    /// e.g. a runtime trap's panic message reached via a `call`/`pop` thunk).
+    pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
     /// Writes a 4-byte zero placeholder at the current position and records a
     /// fixup of `kind` pointing at it.
     fn push_rel32_fixup(&mut self, kind: FixupKind) {
@@ -986,7 +1048,10 @@ impl Asm {
                     let rel32 = rel as i32;
                     self.buf[fx.at..fx.at + 4].copy_from_slice(&rel32.to_le_bytes());
                 }
-                FixupKind::Call(_) | FixupKind::Data(_) => remaining.push(fx),
+                FixupKind::Call(_)
+                | FixupKind::Data(_)
+                | FixupKind::Runtime(_)
+                | FixupKind::State(_) => remaining.push(fx),
             }
         }
         (self.buf, remaining)

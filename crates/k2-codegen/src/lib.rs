@@ -28,18 +28,24 @@
 //! crate's *execution* tests are gated `#[cfg(all(target_arch = "x86_64",
 //! target_os = "linux"))]` so they run on CI but never break other platforms.
 //!
-//! ## Scope (v0.15)
+//! ## Scope (v0.16)
 //!
 //! Accepted: scalar integers / `bool` / pointers / `f64`, structs / fixed arrays
 //! / slices / optionals / error unions as stack values, all place projections,
 //! aggregate construction + `Ref` + `MakeSlice`, runtime-formatted `print`
-//! (`{d}`/`{s}`/`{c}`/`{x}`/`{X}`/`{b}`/`{o}`/`{}`), recursion, `>6`-arg and
-//! aggregate-by-value calls, enum `switch`, the `@no_*_overflow`/`narrow_fits`
-//! safety predicates, and an escaped-error exit path. Still **out** — rejected
-//! up-front with a [`CodegenError::Unsupported`] message rather than miscompiled,
-//! with the VM path via `k2c run` available: the heap allocator and the scheduler
-//! (v0.16), `print` width/alignment padding, and runtime (non-constant) f64
-//! formatting.
+//! (`{d}`/`{s}`/`{c}`/`{x}`/`{X}`/`{b}`/`{o}`/`{}` with width/alignment padding),
+//! recursion, `>6`-arg and aggregate-by-value calls, enum `switch`, the
+//! `@no_*_overflow`/`narrow_fits` safety predicates, an escaped-error exit path,
+//! and — new in v0.16 — the **`*System` runtime** via raw Linux syscalls
+//! ([`runtime`]): an `mmap`-backed heap (`create`/`alloc`/`free`/`realloc`/
+//! `destroy`), the handle-based allocator registry with GPA leak + double-free
+//! detection (clean exit 134, matching the VM), the deterministic clock and
+//! splitmix64 PRNG, and offline-absent `env`. Still **out** — rejected up-front
+//! with a [`CodegenError::Unsupported`] message rather than miscompiled, with the
+//! VM path via `k2c run` available: the concurrency scheduler, the `*Build`
+//! capability, an *un-monomorphized generic heap container* (`ArrayList`/`List`,
+//! whose shared `deferred`-element methods cannot agree on an element stride with
+//! a concrete reader — see [`lower`]), and runtime (non-constant) f64 formatting.
 //!
 //! ## Public API
 //!
@@ -61,6 +67,7 @@ mod lower;
 mod mir_ids;
 mod reg;
 mod regalloc;
+mod runtime;
 
 #[cfg(test)]
 mod tests;
@@ -72,10 +79,10 @@ use k2_mir::MirProgram;
 /// A reason native code generation could not proceed for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodegenError {
-    /// The program uses a construct outside the v0.15 native subset (the heap
-    /// allocator, the scheduler, width/alignment `print` padding, runtime f64
-    /// formatting). The string names the offending feature so the driver can
-    /// print an actionable message and suggest `k2c run`.
+    /// The program uses a construct outside the v0.16 native subset (the
+    /// concurrency scheduler, the `*Build` capability, an un-monomorphized generic
+    /// heap container, runtime f64 formatting). The string names the offending
+    /// feature so the driver can print an actionable message and suggest `k2c run`.
     Unsupported(String),
     /// The program has no `main` entry point to compile.
     NoMain,
@@ -85,7 +92,7 @@ impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodegenError::Unsupported(msg) => {
-                write!(f, "unsupported by the v0.15 native backend: {msg}")
+                write!(f, "unsupported by the v0.16 native backend: {msg}")
             }
             CodegenError::NoMain => write!(f, "program has no `main` entry point"),
         }

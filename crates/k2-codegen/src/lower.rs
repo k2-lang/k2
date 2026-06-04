@@ -191,6 +191,35 @@ impl<'p> FnLower<'p> {
         layout::layout_of(&self.prog.arena, ty).unwrap_or(Layout::WORD)
     }
 
+    /// The error-union payload type + payload byte offset of `local`, when it is a
+    /// heap-allocation intrinsic result (`create`/`alloc`/`realloc`). These locals
+    /// are `deferred` in the MIR, so their `discr.ErrorUnion`/`.payload` consumers
+    /// are driven from this recovered payload type rather than the declared type.
+    fn eu_payload_of(&self, local: k2_mir::LocalId) -> Option<(TypeId, i32)> {
+        let pty = self.alloc.eu_result[local.index()]?;
+        let pl = self.layout(pty);
+        let off = layout::round_up(2, pl.align.max(1)) as i32;
+        Some((pty, off))
+    }
+
+    /// `true` if safety checks are stripped (ReleaseFast). Mirrors the VM's
+    /// `checks_off`: the GPA/testing leak + double-free trackers become no-ops.
+    fn checks_off(&self) -> bool {
+        matches!(self.prog.mode, k2_mir::BuildMode::ReleaseFast)
+    }
+
+    /// The runtime error tag for `error.OutOfMemory` (the value a bounded allocator
+    /// returns on exhaustion), resolved from the program's `err_names` table — the
+    /// same lookup the VM's `out_of_memory_value` performs.
+    fn oom_tag(&self) -> u16 {
+        self.prog
+            .err_names
+            .iter()
+            .find(|(_, name)| name.as_str() == "OutOfMemory")
+            .map(|(t, _)| t.0)
+            .unwrap_or(0)
+    }
+
     /// The aggregate type a `dst = rvalue` builds into a home, or `None` if `dst`
     /// is a scalar. Uses the declared type, or the per-local home-type override
     /// (a `deferred` tuple's concrete aggregate type) when `rvalue` is itself an
@@ -546,6 +575,13 @@ impl<'p> FnLower<'p> {
                 self.asm.mov_ri(dst, tag.0 as i64);
                 Ok(())
             }
+            // An `undef` scalar (a `deferred` temp initialized before a later real
+            // assignment, e.g. `_x = undef; _x = call ...`): the value is never read
+            // before its real definition, so materialize a harmless zero.
+            Const::Undef { .. } => {
+                self.asm.mov_ri(dst, 0);
+                Ok(())
+            }
             other => Err(CodegenError::Unsupported(format!(
                 "non-scalar constant {other:?} in `{}`",
                 self.func.name
@@ -643,9 +679,14 @@ impl<'p> FnLower<'p> {
         } else {
             return Err(self.unsup("projected place over a register-only local"));
         }
+        // Whether the projection chain has passed through a struct FIELD before an
+        // `Index` — the signal that an indexed slice is a generic container's
+        // backing store (`list.items[i]`) rather than a standalone/array-view slice.
+        let mut saw_field = false;
         for proj in projs {
             match proj {
                 Proj::Field { index, ty } => {
+                    saw_field = true;
                     let offs = layout::field_offsets(&self.prog.arena, cur_ty);
                     let off = offs.get(*index as usize).copied().unwrap_or(0);
                     if off != 0 {
@@ -657,15 +698,40 @@ impl<'p> FnLower<'p> {
                     // Indexing a SLICE first dereferences its fat pointer (the data
                     // pointer lives at slice offset +0); indexing an ARRAY uses the
                     // array's own address directly.
-                    if matches!(self.prog.arena.get(cur_ty), Type::Slice { .. }) {
+                    let is_slice = matches!(self.prog.arena.get(cur_ty), Type::Slice { .. });
+                    if is_slice {
                         self.asm.mov_load_mem(dst, dst, 0);
                     }
-                    let stride = self.layout(*ty).size.max(1);
-                    // index -> IDX_SCRATCH (R10), scale, add. R10 is deliberately
-                    // NOT a SysV argument register, so materializing an indexed
-                    // argument's address never clobbers an argument already placed
-                    // in an arg register (RCX is `ARG_REGS[3]` — see `IDX_SCRATCH`).
-                    self.operand_to(index, IDX_SCRATCH)?;
+                    // Element STRIDE. A slice reached through a struct FIELD is a
+                    // generic container's backing store (`list.items[i]`,
+                    // `(*self).f0[i]`): the shared `deferred`-element methods write it
+                    // at the word stride, so a concrete reader of the same field must
+                    // index at the same word stride for any word-sized scalar element.
+                    // A bare/local slice (an array view `a[1..3]`, a direct
+                    // `alloc(u32,n)` result) keeps its natural element stride — never
+                    // shared generically. Arrays always use their natural layout.
+                    let stride = if is_slice && saw_field {
+                        self.field_slice_stride(*ty)
+                    } else {
+                        // A standalone/array-view slice, or an array, uses the
+                        // element's natural layout stride.
+                        self.layout(*ty).size.max(1)
+                    };
+                    // index -> IDX_SCRATCH (R10), scale, add. Evaluating a *projected*
+                    // index operand (`a[(*p).field]`) recomputes an address through
+                    // ADDR (R11), which is usually `dst` — so the running base in
+                    // `dst` must be preserved across the index evaluation. Save it on
+                    // the stack when the index is a place; a bare local/const index
+                    // never touches ADDR, so it needs no save. (Earlier this clobber
+                    // silently redirected `items[i] = v` to the wrong base.)
+                    let index_is_place = matches!(index, Operand::Copy(p) if !p.is_local());
+                    if index_is_place {
+                        self.asm.push(dst);
+                        self.operand_to(index, IDX_SCRATCH)?;
+                        self.asm.pop(dst);
+                    } else {
+                        self.operand_to(index, IDX_SCRATCH)?;
+                    }
                     if stride.is_power_of_two() {
                         let sh = stride.trailing_zeros() as u8;
                         if sh != 0 {
@@ -690,12 +756,19 @@ impl<'p> FnLower<'p> {
                     cur_ty = *ty;
                 }
                 Proj::Payload { ty } => {
-                    // Error union: payload after the u16 tag; optional: at +0.
+                    // Error union: payload after the u16 tag; optional: at +0. A
+                    // heap-allocation result is a `deferred` local but a real error
+                    // union in memory — recover its payload offset from the payload
+                    // type when the base is such a local.
                     let off = match self.prog.arena.get(cur_ty) {
                         Type::ErrorUnion { .. } => {
                             layout::error_union_payload_off(&self.prog.arena, cur_ty)
                         }
-                        _ => 0,
+                        _ => self
+                            .eu_payload_of(place.base)
+                            .filter(|_| place.proj.len() == 1)
+                            .map(|(_, o)| o as u64)
+                            .unwrap_or(0),
                     };
                     if off != 0 {
                         self.asm.add_ri(dst, off as i32);
@@ -761,7 +834,7 @@ impl<'p> FnLower<'p> {
         match rvalue {
             Rvalue::Intrinsic { .. } => self.lower_intrinsic_into_rax(rvalue, rodata).map(|_| ()),
             Rvalue::Call { func, args, ty } => {
-                self.lower_call_raw(*func, args, *ty)?;
+                self.lower_call_raw(*func, args, *ty, rodata)?;
                 Ok(())
             }
             _ => Ok(()),
@@ -779,6 +852,22 @@ impl<'p> FnLower<'p> {
         if frame::is_memory_aggregate(&self.prog.arena, val_ty) {
             // Aggregate store: materialize the rvalue's address, memcpy to dest.
             return self.store_aggregate_rvalue_to_place(place, rvalue, val_ty, rodata);
+        }
+        // A store into a slice element that is itself an aggregate larger than a
+        // word (`[]const u8` / a struct element). When the element type is CONCRETE
+        // this is a faithful aggregate memcpy. When it would be reached through a
+        // GENERIC container (`List([]const u8).push`, element `deferred`) the value
+        // crosses the param/store boundary as a `deferred` 8-byte scalar — which the
+        // un-monomorphized MIR cannot represent — so that case is cleanly refused at
+        // the read site (`slice_index_aggregate_stride` returns `None` for a
+        // `deferred` element). Here we only handle a concrete aggregate element.
+        if let Some(stride) = self.slice_index_aggregate_stride(place) {
+            if let Rvalue::Use(Operand::Copy(src)) = rvalue {
+                self.place_addr_general(src, Gpr::Rax)?;
+                self.place_addr(place, ADDR)?;
+                self.memcpy(ADDR, Gpr::Rax, stride);
+                return Ok(());
+            }
         }
         // A 128-bit scalar into a projected place: compute the two-limb value, then
         // write both limbs at the place's address (a single `store_sized` would
@@ -873,8 +962,52 @@ impl<'p> FnLower<'p> {
                 self.memcpy(ADDR, Gpr::Rax, size);
                 Ok(())
             }
+            // `place = make_slice {ptr, offset, len}` (e.g. `self.items = ...` in
+            // `ArrayList.append`): build the `{ptr, len}` fat slice directly at the
+            // destination address. The data pointer and length are computed into
+            // registers, the destination address into ADDR, then stored.
+            Rvalue::MakeSlice {
+                ptr,
+                offset,
+                len,
+                ty: sty,
+            } => self.store_make_slice_to_place(place, ptr, offset, len, *sty),
             _ => Err(self.unsup("aggregate rvalue into a projected place")),
         }
+    }
+
+    /// Builds a `{ptr, len}` slice (from `ptr + offset*stride`, `len`) directly into
+    /// the projected destination `place`. Mirrors `build_make_slice` but writes to a
+    /// runtime address rather than an `rbp`-relative home.
+    fn store_make_slice_to_place(
+        &mut self,
+        place: &Place,
+        ptr: &Operand,
+        offset: &Operand,
+        len: &Operand,
+        sty: TypeId,
+    ) -> Result<(), CodegenError> {
+        let stride = layout::elem_size(&self.prog.arena, sty);
+        // data = ptr + offset * stride -> RAX (a callee-saved-safe scratch we keep
+        // until the store; the dest-address eval below avoids RAX).
+        self.slice_data_ptr(ptr, Gpr::Rax)?;
+        self.operand_to(offset, Gpr::Rcx)?;
+        if stride.is_power_of_two() {
+            let sh = stride.trailing_zeros() as u8;
+            if sh != 0 {
+                self.asm.shl_ri(Gpr::Rcx, sh);
+            }
+        } else {
+            self.asm.imul_rri(Gpr::Rcx, Gpr::Rcx, stride as i32);
+        }
+        self.asm.add_rr(Gpr::Rax, Gpr::Rcx);
+        // len -> RDX.
+        self.operand_to(len, Gpr::Rdx)?;
+        // dest address -> ADDR; store {ptr@0, len@8}.
+        self.place_addr(place, ADDR)?;
+        self.asm.mov_store_mem(ADDR, 0, Gpr::Rax);
+        self.asm.mov_store_mem(ADDR, 8, Gpr::Rdx);
+        Ok(())
     }
 
     // ---------------------------------------------------------------------
@@ -908,6 +1041,30 @@ impl<'p> FnLower<'p> {
                         .home(dst)
                         .ok_or_else(|| self.unsup("wide-int local without a home"))?;
                     return self.store_wide_int(h, op, dst_ty);
+                }
+                // Coercing an error union into a bare error-set scalar (`e = eu`,
+                // the catch-capture `|err|`) extracts the `u16` tag at +0 — the
+                // payload/padding eightbytes must not leak into the tag value (a
+                // `switch (err)` compares the bare tag). Load just the u16.
+                if matches!(
+                    self.prog.arena.get(dst_ty),
+                    Type::ErrorSet(_) | Type::AnyError
+                ) {
+                    if let Operand::Copy(p) = op {
+                        let src_ty = self
+                            .operand_type(op)
+                            .or_else(|| self.eu_payload_of(p.base).map(|_| dst_ty));
+                        let is_eu = src_ty
+                            .map(|t| matches!(self.prog.arena.get(t), Type::ErrorUnion { .. }))
+                            .unwrap_or(false)
+                            || self.eu_payload_of(p.base).is_some();
+                        if is_eu {
+                            self.place_addr_general(p, ADDR)?;
+                            self.asm.movzx16_mem(Gpr::Rax, ADDR, 0);
+                            self.store_scalar_result(dst);
+                            return Ok(());
+                        }
+                    }
                 }
                 self.operand_to(op, Gpr::Rax)?;
                 self.normalize(Gpr::Rax, dst_ty);
@@ -949,13 +1106,19 @@ impl<'p> FnLower<'p> {
                 }
                 self.lower_cast(dst, *kind, operand, *ty)
             }
-            Rvalue::Call { func, args, ty } => self.lower_call(dst, *func, args, *ty),
+            Rvalue::Call { func, args, ty } => self.lower_call(dst, *func, args, *ty, rodata),
             Rvalue::Ref { place, .. } => {
                 self.place_addr_general(place, Gpr::Rax)?;
                 self.store_scalar_result(dst);
                 Ok(())
             }
             Rvalue::Intrinsic { .. } => {
+                // A heap-allocation intrinsic (`create`/`alloc`/`realloc`) builds an
+                // error union into `dst`'s stack home; its `discr`/`.payload`
+                // consumers read it from there.
+                if self.eu_payload_of(dst).is_some() {
+                    return self.lower_alloc_op_into_home(dst, rvalue);
+                }
                 self.lower_intrinsic_into_rax(rvalue, rodata)?;
                 self.store_scalar_result(dst);
                 Ok(())
@@ -1246,10 +1409,15 @@ impl<'p> FnLower<'p> {
         dst: k2_mir::LocalId,
         operand: &Operand,
     ) -> Result<(), CodegenError> {
+        // A heap-allocation result (`deferred` in the MIR) is a real error union in
+        // memory: read its u16 tag at +0 exactly like a declared error union.
+        let is_alloc_eu = matches!(operand, Operand::Copy(p)
+            if p.is_local() && self.eu_payload_of(p.base).is_some());
         let ty = self.operand_type(operand);
-        let is_eu = ty
-            .map(|t| matches!(self.prog.arena.get(t), Type::ErrorUnion { .. }))
-            .unwrap_or(false);
+        let is_eu = is_alloc_eu
+            || ty
+                .map(|t| matches!(self.prog.arena.get(t), Type::ErrorUnion { .. }))
+                .unwrap_or(false);
         if is_eu {
             // Load the u16 tag at +0.
             self.aggregate_operand_addr(operand, ADDR)?;
@@ -1306,7 +1474,7 @@ impl<'p> FnLower<'p> {
             .ok_or_else(|| self.unsup("aggregate local without a home"))?;
         match rvalue {
             Rvalue::Aggregate { kind, fields, ty } => {
-                self.build_aggregate(home, *kind, fields, *ty)
+                self.build_aggregate(home, *kind, fields, *ty, rodata)
             }
             Rvalue::Use(op) => self.aggregate_use(home, op, ty, rodata),
             Rvalue::MakeSlice {
@@ -1315,11 +1483,18 @@ impl<'p> FnLower<'p> {
                 len,
                 ty,
             } => self.build_make_slice(home, ptr, offset, len, *ty),
-            Rvalue::MakeSome(op, oty) => self.build_make_some(home, op, *oty),
+            Rvalue::MakeSome(op, oty) => self.build_make_some(home, op, *oty, rodata),
             Rvalue::MakeNull(oty) => self.build_make_null(home, *oty),
-            Rvalue::MakeOk(op, ety) => self.build_make_ok(home, op, *ety),
+            Rvalue::MakeOk(op, ety) => self.build_make_ok(home, op, *ety, rodata),
             Rvalue::MakeErr(tag, ety) => self.build_make_err(home, tag.0, *ety),
-            Rvalue::Call { func, args, ty } => self.lower_call_aggregate(dst, *func, args, *ty),
+            Rvalue::Call { func, args, ty } => {
+                self.lower_call_aggregate(dst, *func, args, *ty, rodata)
+            }
+            // `@errorName(e)` produces a `[]const u8` name slice into the home: read
+            // the error tag and select the matching name string in `.rodata`.
+            Rvalue::Intrinsic { path, args, .. } if matches!(&path.root, IntrinsicRoot::Builtin(n) if n == "errorName") => {
+                self.build_error_name(home, args, rodata)
+            }
             // A scalar-producing rvalue (`Binary`/`Unary`/`Cast`) coerced into an
             // optional/error-union slot: compute the value, then wrap it as
             // `Some`/`Ok` (the MIR represents `return n * 2` into `?T`/`E!T` this
@@ -1399,9 +1574,9 @@ impl<'p> FnLower<'p> {
                         Type::Optional(inner)
                             if !matches!(self.prog.arena.get(*inner), Type::Pointer { .. }) =>
                         {
-                            return self.build_make_some(home, op, ty);
+                            return self.build_make_some(home, op, ty, rodata);
                         }
-                        Type::ErrorUnion { .. } => return self.build_make_ok(home, op, ty),
+                        Type::ErrorUnion { .. } => return self.build_make_ok(home, op, ty, rodata),
                         _ => {}
                     }
                 }
@@ -1468,9 +1643,20 @@ impl<'p> FnLower<'p> {
                     Type::Array { .. } => AggKind::Array,
                     _ => AggKind::Struct,
                 };
-                self.build_aggregate(home, kind, &fields, *aty)
+                self.build_aggregate(home, kind, &fields, *aty, rodata)
             }
             Const::Undef { .. } => Ok(()), // leave the home undefined
+            // `Const::Void` coerced into an error-union slot is the success value
+            // `Ok(void)` — a `!void` whose payload is empty: write tag 0 only. (A
+            // plain void target has no bytes; nothing to store.)
+            Const::Void => match self.prog.arena.get(ty) {
+                Type::ErrorUnion { .. } => {
+                    self.asm.mov_ri(Gpr::Rax, 0);
+                    self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
             Const::ErrVal { tag, .. } => {
                 // An error value coerced into an error-union slot -> Err(tag).
                 self.build_make_err(home, tag.0, ty)
@@ -1481,8 +1667,8 @@ impl<'p> FnLower<'p> {
             scalar @ (Const::Int { .. } | Const::Bool(_) | Const::Float { .. }) => {
                 let op = Operand::Const(scalar.clone());
                 match self.prog.arena.get(ty) {
-                    Type::Optional(_) => self.build_make_some(home, &op, ty),
-                    Type::ErrorUnion { .. } => self.build_make_ok(home, &op, ty),
+                    Type::Optional(_) => self.build_make_some(home, &op, ty, rodata),
+                    Type::ErrorUnion { .. } => self.build_make_ok(home, &op, ty, rodata),
                     _ => Err(self.unsup("scalar constant into a non-optional aggregate")),
                 }
             }
@@ -1501,18 +1687,31 @@ impl<'p> FnLower<'p> {
         kind: AggKind,
         fields: &[Operand],
         ty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
-        // When the declared type is not layoutable (a `deferred` tuple), compute a
-        // synthetic packed layout from the field operands' declared types.
+        // When the declared type is not layoutable (a `deferred` tuple, or an
+        // inferred-length `[_]T` array), compute a synthetic packed layout. For an
+        // array every field has the array's element type — a string-const field's
+        // `operand_type` is `None`, so falling back to the array type would
+        // mis-stride the elements (a `[]const u8` element must be 16 bytes, not the
+        // word fallback). For a tuple, use the field operands' own types.
         if layout::layout_of(&self.prog.arena, ty).is_none() {
+            let elem_ty = if matches!(kind, AggKind::Array) {
+                match self.prog.arena.get(ty) {
+                    Type::Array { elem, .. } => Some(*elem),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let field_tys: Vec<TypeId> = fields
                 .iter()
-                .map(|f| self.operand_type(f).unwrap_or(ty))
+                .map(|f| elem_ty.or_else(|| self.operand_type(f)).unwrap_or(ty))
                 .collect();
             let (_, _, offs) = regalloc::packed_layout(&self.prog.arena, &field_tys);
             for (i, f) in fields.iter().enumerate() {
                 let foff = home + offs[i] as i32;
-                self.store_field_operand(foff, f, field_tys[i])?;
+                self.store_field_operand(foff, f, field_tys[i], rodata)?;
             }
             return Ok(());
         }
@@ -1520,7 +1719,7 @@ impl<'p> FnLower<'p> {
         for (i, f) in fields.iter().enumerate() {
             let foff = home + offsets[i] as i32;
             let fty = self.aggregate_field_type(kind, i, ty);
-            self.store_field_operand(foff, f, fty)?;
+            self.store_field_operand(foff, f, fty, rodata)?;
         }
         Ok(())
     }
@@ -1585,6 +1784,7 @@ impl<'p> FnLower<'p> {
         off: i32,
         op: &Operand,
         fty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         if frame::is_memory_aggregate(&self.prog.arena, fty) {
             // Nested aggregate: memcpy from the operand's source address.
@@ -1596,15 +1796,22 @@ impl<'p> FnLower<'p> {
                     self.memcpy(ADDR, Gpr::Rax, size);
                     Ok(())
                 }
-                Operand::Const(c) => {
-                    // Materialize the nested const aggregate at this offset. Only a
-                    // string-literal slice / empty slice is expected here.
-                    let mut rodata_unused = RoData::new();
-                    // We cannot intern into the live rodata here without threading
-                    // it; nested const slices are rare — reject cleanly.
-                    let _ = &mut rodata_unused;
-                    let _ = c;
-                    Err(self.unsup("nested constant aggregate field"))
+                Operand::Const(_) => {
+                    // A nested `[]const u8` literal (a string in an array/struct):
+                    // write its `{ptr, len}` directly. Other nested const aggregates
+                    // are rejected cleanly.
+                    if let Some((ptr_off, len)) = self.slice_const_words(op, rodata) {
+                        match ptr_off {
+                            Some(o) => self.asm.mov_ri_data(Gpr::Rax, o),
+                            None => self.asm.mov_ri(Gpr::Rax, 0),
+                        }
+                        self.asm.mov_store_mem(Gpr::Rbp, off, Gpr::Rax);
+                        self.asm.mov_ri(Gpr::Rax, len as i64);
+                        self.asm.mov_store_mem(Gpr::Rbp, off + 8, Gpr::Rax);
+                        Ok(())
+                    } else {
+                        Err(self.unsup("nested constant aggregate field"))
+                    }
                 }
             }
         } else if self.is_float(fty) {
@@ -1692,6 +1899,7 @@ impl<'p> FnLower<'p> {
         home: i32,
         op: &Operand,
         oty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         let inner = match self.prog.arena.get(oty) {
             Type::Optional(i) => *i,
@@ -1704,7 +1912,7 @@ impl<'p> FnLower<'p> {
             return Ok(());
         }
         // Payload at +0.
-        self.store_field_operand(home, op, inner)?;
+        self.store_field_operand(home, op, inner, rodata)?;
         // Flag byte 1 at +inner.size.
         let flag_off = layout::optional_flag_off(&self.prog.arena, oty).unwrap_or(0) as i32;
         self.asm.mov_ri(Gpr::Rax, 1);
@@ -1731,7 +1939,13 @@ impl<'p> FnLower<'p> {
     }
 
     /// Builds an error union `Ok(v)` into a home (u16 tag 0, payload after).
-    fn build_make_ok(&mut self, home: i32, op: &Operand, ety: TypeId) -> Result<(), CodegenError> {
+    fn build_make_ok(
+        &mut self,
+        home: i32,
+        op: &Operand,
+        ety: TypeId,
+        rodata: &mut RoData,
+    ) -> Result<(), CodegenError> {
         let ok_ty = match self.prog.arena.get(ety) {
             Type::ErrorUnion { ok, .. } => *ok,
             _ => ety,
@@ -1744,7 +1958,7 @@ impl<'p> FnLower<'p> {
         if matches!(self.prog.arena.get(ok_ty), Type::Void) {
             return Ok(());
         }
-        self.store_field_operand(home + poff, op, ok_ty)
+        self.store_field_operand(home + poff, op, ok_ty, rodata)
     }
 
     /// Builds an error union `Err(tag)` into a home (u16 tag, payload undefined).
@@ -1752,6 +1966,92 @@ impl<'p> FnLower<'p> {
         self.asm.mov_ri(Gpr::Rax, tag as i64);
         self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
         Ok(())
+    }
+
+    /// Builds `@errorName(e)`'s `[]const u8` name slice into `home`: load the error
+    /// tag of `e`, then a compare chain selecting the matching name's `.rodata`
+    /// `{ptr, len}`. Mirrors the VM's `error_name_of` over the program's `err_names`
+    /// table. An unmatched tag yields the literal `"Unknown"` (the VM's fallback).
+    fn build_error_name(
+        &mut self,
+        home: i32,
+        args: &[Operand],
+        rodata: &mut RoData,
+    ) -> Result<(), CodegenError> {
+        let err_op = args
+            .first()
+            .ok_or_else(|| self.unsup("@errorName without an operand"))?;
+        // The error tag into RCX (a u16, zero-extended).
+        self.load_error_tag(err_op, Gpr::Rcx)?;
+        // Collect (tag, name) pairs in a stable order for a deterministic chain.
+        let mut pairs: Vec<(u16, String)> = self
+            .prog
+            .err_names
+            .iter()
+            .map(|(t, n)| (t.0, n.clone()))
+            .collect();
+        pairs.sort_by_key(|(t, _)| *t);
+        // Default ("Unknown") first; each matching tag overwrites via a forward jump.
+        let done = self.asm.new_local_label();
+        // Write the fallback name, then test each tag — on a match, overwrite the
+        // slice and jump to done.
+        let unknown_off = rodata.intern(b"Unknown");
+        self.asm.mov_ri_data(Gpr::Rax, unknown_off);
+        self.asm.mov_store_mem(Gpr::Rbp, home, Gpr::Rax);
+        self.asm.mov_ri(Gpr::Rax, "Unknown".len() as i64);
+        self.asm.mov_store_mem(Gpr::Rbp, home + 8, Gpr::Rax);
+        for (tag, name) in pairs {
+            let off = rodata.intern(name.as_bytes());
+            let next = self.asm.new_local_label();
+            self.asm.cmp_ri(Gpr::Rcx, tag as i32);
+            self.asm.jcc_local(Cc::Ne, next);
+            // Match: write {ptr, len} and finish.
+            self.asm.mov_ri_data(Gpr::Rax, off);
+            self.asm.mov_store_mem(Gpr::Rbp, home, Gpr::Rax);
+            self.asm.mov_ri(Gpr::Rax, name.len() as i64);
+            self.asm.mov_store_mem(Gpr::Rbp, home + 8, Gpr::Rax);
+            self.asm.jmp_local(done);
+            self.asm.bind_local(next);
+        }
+        self.asm.bind_local(done);
+        Ok(())
+    }
+
+    /// Loads the `u16` error tag of an error operand into `dst`: an error-union
+    /// place's tag at +0, a bare error scalar's value, or a static `Const::ErrVal`.
+    fn load_error_tag(&mut self, op: &Operand, dst: Gpr) -> Result<(), CodegenError> {
+        match op {
+            Operand::Const(Const::ErrVal { tag, .. }) => {
+                self.asm.mov_ri(dst, tag.0 as i64);
+                Ok(())
+            }
+            Operand::Copy(p) => {
+                let ty = self.place_type_of_operand(op);
+                if ty
+                    .map(|t| matches!(self.prog.arena.get(t), Type::ErrorUnion { .. }))
+                    .unwrap_or(false)
+                {
+                    // The tag is the u16 at +0 of the error union.
+                    self.place_addr_general(p, ADDR)?;
+                    self.asm.movzx16_mem(dst, ADDR, 0);
+                } else {
+                    // A bare error scalar carries the tag value directly.
+                    self.operand_to(op, dst)?;
+                }
+                Ok(())
+            }
+            _ => Err(self.unsup("@errorName operand is neither an error place nor a const")),
+        }
+    }
+
+    /// The type of an operand that is a place or an error const (helper for
+    /// `@errorName`'s tag extraction).
+    fn place_type_of_operand(&self, op: &Operand) -> Option<TypeId> {
+        match op {
+            Operand::Copy(p) if p.is_local() => Some(self.func.locals[p.base.index()].ty),
+            Operand::Copy(p) => Some(self.place_type(p)),
+            _ => None,
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2164,8 +2464,9 @@ impl<'p> FnLower<'p> {
         func: k2_mir::FnId,
         args: &[Operand],
         ty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
-        self.lower_call_raw(func, args, ty)?;
+        self.lower_call_raw(func, args, ty, rodata)?;
         if self.is_float(ty) {
             // Result in xmm0.
             self.store_float_xmm0(dst)?;
@@ -2183,6 +2484,7 @@ impl<'p> FnLower<'p> {
         func: k2_mir::FnId,
         args: &[Operand],
         ty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         let home = self
             .home(dst)
@@ -2192,16 +2494,44 @@ impl<'p> FnLower<'p> {
         if let ArgClass::Memory { .. } = class {
             // sret: pass &home as the hidden first integer arg.
             self.asm.lea_rbp(ADDR, home);
-            self.lower_call_with_sret(func, args, ADDR)?;
+            self.lower_call_with_sret(func, args, ADDR, rodata)?;
             Ok(())
         } else {
-            // Returned in RAX (and RDX for two eightbytes); store to home.
-            self.lower_call_raw(func, args, ty)?;
-            self.asm.mov_store(home, Gpr::Rax);
+            // Returned in RAX (and RDX for two eightbytes); store to home. A small
+            // aggregate (`< 8` bytes, e.g. a single-field `u32` handle struct) has a
+            // home only as wide as its layout, so the store must be size-exact — an
+            // 8-byte store would clobber the adjacent local's home.
+            self.lower_call_raw(func, args, ty, rodata)?;
+            self.store_eightbyte(home, Gpr::Rax, size.min(8));
             if size > 8 {
-                self.asm.mov_store(home + 8, Gpr::Rdx);
+                self.store_eightbyte(home + 8, Gpr::Rdx, size - 8);
             }
             Ok(())
+        }
+    }
+
+    /// Stores the low `nbytes` of `src` to `[rbp + off]`, sized exactly so a
+    /// sub-8-byte aggregate eightbyte never overruns its home into the next local.
+    /// Non-power-of-two widths (3/5/6/7) are split into power-of-two stores.
+    fn store_eightbyte(&mut self, off: i32, src: Gpr, nbytes: u64) {
+        match nbytes {
+            0 => {}
+            1 => self.asm.mov_store8_mem(Gpr::Rbp, off, src),
+            2 => self.asm.mov_store16_mem(Gpr::Rbp, off, src),
+            4 => self.asm.mov_store32_mem(Gpr::Rbp, off, src),
+            8 => self.asm.mov_store(off, src),
+            n => {
+                // Split: store the largest power-of-two prefix, then recurse on the
+                // remainder (shifted down). Rare — the corpus uses 1/2/4/8.
+                let p = 1u64 << (63 - (n.max(1)).leading_zeros());
+                self.store_eightbyte(off, src, p);
+                let rest = n - p;
+                if rest > 0 {
+                    self.asm.mov_rr(Gpr::Rcx, src);
+                    self.asm.shr_ri(Gpr::Rcx, (p * 8) as u8);
+                    self.store_eightbyte(off + p as i32, Gpr::Rcx, rest);
+                }
+            }
         }
     }
 
@@ -2211,9 +2541,62 @@ impl<'p> FnLower<'p> {
         func: k2_mir::FnId,
         args: &[Operand],
         _ty: TypeId,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
-        self.marshal_args(args, None)?;
+        self.reject_deferred_aggregate_args(func, args)?;
+        self.marshal_args(args, None, rodata)?;
         self.asm.call_fn(func);
+        Ok(())
+    }
+
+    /// Rejects a call that passes an aggregate (`> 8`-byte) argument into a callee
+    /// parameter that the backend classifies as a *scalar* eightbyte. This is the
+    /// un-monomorphized generic-container shape: the MIR shares one `push[List]`
+    /// across every `List(T)`, fixing the value parameter to a single scalar type
+    /// (e.g. `u8`), so a `List([]const u8).push("…")` would hand a 16-byte slice to
+    /// an 8-byte parameter slot and silently lose its upper bytes. Refusing keeps
+    /// the program on the VM rather than miscompiling it. (The common word-scalar
+    /// instantiation — `List(u32)` / `ArrayList(u32)` — is unaffected: a word
+    /// argument into a word parameter is exact.)
+    fn reject_deferred_aggregate_args(
+        &self,
+        func: k2_mir::FnId,
+        args: &[Operand],
+    ) -> Result<(), CodegenError> {
+        // A `test { … }` block is compiled but never *executed* by `run-native`
+        // (only `main` runs), so a generic `expectError(err, error_union)` shape
+        // inside a test — which passes an aggregate to an `anytype` parameter the
+        // test body never reads at a mismatched width — must not gate the whole
+        // program. Only refuse the mismatch in code on the live `main` path.
+        if self.func.name == "test" || self.func.name.starts_with("test ") {
+            return Ok(());
+        }
+        let callee = &self.prog.funcs[func.index()];
+        for (i, param) in callee.params.iter().enumerate() {
+            let pty = callee.locals[param.index()].ty;
+            // A parameter the ABI carries as a scalar eightbyte.
+            let param_is_scalar = !frame::is_memory_aggregate(&self.prog.arena, pty)
+                && !self.is_float(pty)
+                && self.layout(pty).size <= 8;
+            if !param_is_scalar {
+                continue;
+            }
+            let Some(arg) = args.get(i) else { continue };
+            let aty = match arg {
+                Operand::Const(Const::Str(_) | Const::EmptySlice { .. }) => {
+                    Some(self.prog.arena.t_str())
+                }
+                _ => self.operand_type(arg),
+            };
+            if let Some(aty) = aty {
+                if frame::is_memory_aggregate(&self.prog.arena, aty) && self.layout(aty).size > 8 {
+                    return Err(self.unsup(
+                        "generic call passing an aggregate argument to a scalar parameter \
+                         (un-monomorphized generic container of aggregates)",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2223,10 +2606,11 @@ impl<'p> FnLower<'p> {
         func: k2_mir::FnId,
         args: &[Operand],
         sret_reg: Gpr,
+        rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         // Save the sret pointer in a scratch home is unnecessary: marshal_args
         // does not clobber ADDR until after we move it into RDI. Move it first.
-        self.marshal_args(args, Some(sret_reg))?;
+        self.marshal_args(args, Some(sret_reg), rodata)?;
         self.asm.call_fn(func);
         Ok(())
     }
@@ -2240,7 +2624,12 @@ impl<'p> FnLower<'p> {
     /// arg register. To stay correct we evaluate every arg's *value* before
     /// loading arg registers: integer/stack args are placed last-to-first via a
     /// temporary spill to the outgoing region for the stack ones.
-    fn marshal_args(&mut self, args: &[Operand], sret: Option<Gpr>) -> Result<(), CodegenError> {
+    fn marshal_args(
+        &mut self,
+        args: &[Operand],
+        sret: Option<Gpr>,
+        rodata: &mut RoData,
+    ) -> Result<(), CodegenError> {
         // Classify and lay out each argument.
         let mut int_idx = 0usize;
         let mut sse_idx = 0usize;
@@ -2266,14 +2655,25 @@ impl<'p> FnLower<'p> {
         }
         let mut placements: Vec<(usize, Place2)> = Vec::new();
         for (ai, arg) in args.iter().enumerate() {
-            let ty = self.operand_type(arg).unwrap_or_else(|| {
-                self.func
-                    .locals
-                    .first()
-                    .map(|l| l.ty)
-                    .unwrap_or(self.func.ret)
-            });
-            let class = classify(self.prog, ty);
+            // A string / empty-slice literal argument is a `[]const u8` fat slice
+            // (`{ptr, len}`, two integer eightbytes) even though the bare constant
+            // carries no TypeId — classify it as a two-int aggregate.
+            let is_slice_const = matches!(
+                arg,
+                Operand::Const(Const::Str(_) | Const::EmptySlice { .. })
+            );
+            let class = if is_slice_const {
+                ArgClass::TwoInt
+            } else {
+                let ty = self.operand_type(arg).unwrap_or_else(|| {
+                    self.func
+                        .locals
+                        .first()
+                        .map(|l| l.ty)
+                        .unwrap_or(self.func.ret)
+                });
+                classify(self.prog, ty)
+            };
             match class {
                 ArgClass::Sse => {
                     if sse_idx < SSE_ARG_REGS.len() {
@@ -2294,11 +2694,17 @@ impl<'p> FnLower<'p> {
                     }
                 }
                 ArgClass::TwoInt => {
+                    // A slice const is 16 bytes; otherwise size from the arg type.
+                    let sz = if is_slice_const {
+                        16
+                    } else {
+                        let ty = self.operand_type(arg).unwrap_or(self.func.ret);
+                        self.layout(ty).size
+                    };
                     if int_idx + 2 <= ARG_REGS.len() {
-                        placements.push((ai, Place2::MemInt(int_idx, self.layout(ty).size)));
+                        placements.push((ai, Place2::MemInt(int_idx, sz)));
                         int_idx += 2;
                     } else {
-                        let sz = self.layout(ty).size;
                         placements.push((ai, Place2::MemStack(stack_off, sz)));
                         stack_off += round_up_i32(sz as i32, 8);
                     }
@@ -2331,6 +2737,15 @@ impl<'p> FnLower<'p> {
                         self.asm.mov_rr(ADDR, Gpr::Rsp);
                         self.asm.add_ri(ADDR, *off);
                         self.memcpy(ADDR, Gpr::Rax, *size);
+                    } else if let Some((ptr_off, len)) = self.slice_const_words(arg, rodata) {
+                        // A `[]const u8` literal on the stack: write {ptr, len}.
+                        match ptr_off {
+                            Some(o) => self.asm.mov_ri_data(Gpr::Rax, o),
+                            None => self.asm.mov_ri(Gpr::Rax, 0),
+                        }
+                        self.asm.mov_store_mem(Gpr::Rsp, *off, Gpr::Rax);
+                        self.asm.mov_ri(Gpr::Rax, len as i64);
+                        self.asm.mov_store_mem(Gpr::Rsp, *off + 8, Gpr::Rax);
                     } else {
                         return Err(self.unsup("memory aggregate argument from a constant"));
                     }
@@ -2358,6 +2773,14 @@ impl<'p> FnLower<'p> {
                         if *size > 8 {
                             self.asm.mov_load_mem(ARG_REGS[*ri + 1], ADDR, 8);
                         }
+                    } else if let Some((ptr_off, len)) = self.slice_const_words(arg, rodata) {
+                        // A `[]const u8` literal in two integer arg registers:
+                        // {ptr -> ARG_REGS[ri], len -> ARG_REGS[ri+1]}.
+                        match ptr_off {
+                            Some(o) => self.asm.mov_ri_data(ARG_REGS[*ri], o),
+                            None => self.asm.mov_ri(ARG_REGS[*ri], 0),
+                        }
+                        self.asm.mov_ri(ARG_REGS[*ri + 1], len as i64);
                     } else {
                         return Err(self.unsup("in-register aggregate argument from a constant"));
                     }
@@ -2366,6 +2789,28 @@ impl<'p> FnLower<'p> {
             }
         }
         Ok(())
+    }
+
+    /// The `(rodata offset of the bytes, len)` of a string / empty-slice literal
+    /// argument, or `None` for a non-slice constant. The pointer offset is `None`
+    /// for an empty slice (a null data pointer). Interns the bytes into `.rodata`.
+    fn slice_const_words(
+        &self,
+        arg: &Operand,
+        rodata: &mut RoData,
+    ) -> Option<(Option<u32>, usize)> {
+        match arg {
+            Operand::Const(Const::Str(id)) => match &self.prog.consts[id.0 as usize] {
+                ConstData::Bytes(b) => {
+                    let len = b.len();
+                    let off = rodata.intern(b);
+                    Some((Some(off), len))
+                }
+                ConstData::Aggregate(_) => None,
+            },
+            Operand::Const(Const::EmptySlice { .. }) => Some((None, 0)),
+            _ => None,
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2395,12 +2840,622 @@ impl<'p> FnLower<'p> {
                 Ok(())
             }
             ["print"] => self.lower_print_runtime(path, args, rodata),
+            // The default-allocator capability (`sys.heap`): handle id 0, matching
+            // the VM's `HeapCap -> Allocator(0)`.
+            ["heap"] => {
+                self.asm.mov_ri(Gpr::Rax, 0);
+                Ok(())
+            }
+            // `free`/`destroy` reached as `value(handle).op(ptr)`: a void result we
+            // drive through the runtime free routine (its `deferred` result is
+            // discarded by the caller).
+            ["free"] | ["destroy"] => {
+                self.lower_free_op(path, args)?;
+                self.asm.mov_ri(Gpr::Rax, 0);
+                Ok(())
+            }
+            // `create`/`alloc`/`realloc` are intercepted in `lower_rvalue` (they
+            // build an error union into a stack home). Reaching here means the
+            // result is consumed in a way the eu-result detection missed — refuse
+            // cleanly rather than miscompile.
+            ["create"] | ["alloc"] | ["realloc"] => Err(self
+                .unsup("heap allocation result consumed outside the recognized error-union shape")),
+            // The `*System` capability METHOD spellings (`sys.clock.now()`,
+            // `sys.random.int()`, `sys.env.get(...)`), reached as value-method calls
+            // — the same deterministic intrinsics as the `@clock*`/`@random*`/
+            // `@envGet` builtins (matching the VM's `["clock","now"]` routing).
+            ["clock"] | ["clock", "now" | "monotonicNanos" | "wallNanos"] => self.lower_clock_now(),
+            ["clock", "sleep"] => self.lower_clock_sleep(args),
+            ["random", "int" | "intRangeLessThan"] => self.lower_random_int(),
+            ["random", "bytes"] => self.lower_random_bytes(args),
+            ["env", "get"] => self.lower_env_get(),
             other => Err(CodegenError::Unsupported(format!(
                 "intrinsic value.{} in `{}`",
                 other.join("."),
                 self.func.name
             ))),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Heap allocator operations (see crate::runtime)
+    // ---------------------------------------------------------------------
+
+    /// Evaluates an intrinsic's allocator-handle receiver into `dst`. The handle is
+    /// a `u32`: an `Allocator` value (from `@allocHandle`) is the bare id; the
+    /// `sys.heap` capability is the default id `0`. The receiver is `path.root =
+    /// Value(op)`; we evaluate `op` (a local / projected place) as a scalar.
+    fn handle_to(&mut self, path: &k2_mir::IntrinsicPath, dst: Gpr) -> Result<(), CodegenError> {
+        match &path.root {
+            IntrinsicRoot::Value(op) => self.operand_to(op, dst),
+            _ => {
+                // A floor `@*Raw` form carries the id as the first operand instead;
+                // never reached for the value-method spelling.
+                self.asm.mov_ri(dst, 0);
+                Ok(())
+            }
+        }
+    }
+
+    /// The element type carried by an alloc-op `undef` operand (`create(undef)` /
+    /// `alloc(undef, n)`): the first `Const::Undef { ty }` argument. Falls back to a
+    /// byte when absent (a 1-byte element, matching a `[]u8` carve).
+    fn undef_carrier_ty(&self, args: &[Operand]) -> TypeId {
+        for a in args {
+            if let Operand::Const(Const::Undef { ty }) = a {
+                return *ty;
+            }
+        }
+        self.prog.arena.t_u8()
+    }
+
+    /// Lowers `value(handle).create(undef)` / `.alloc(undef, n)` / `.realloc(slice,
+    /// n)` by calling the runtime routine and building the resulting error union
+    /// into `dst`'s stack home: a `u16` tag at +0 (0 = Ok, or the `OutOfMemory` tag
+    /// on a bounded-allocator exhaustion) and the payload (`*T` or the `{ptr,len}`
+    /// fat slice) at the payload offset.
+    fn lower_alloc_op_into_home(
+        &mut self,
+        dst: k2_mir::LocalId,
+        rvalue: &Rvalue,
+    ) -> Result<(), CodegenError> {
+        let Rvalue::Intrinsic { path, args, .. } = rvalue else {
+            unreachable!("lower_alloc_op_into_home on non-intrinsic");
+        };
+        let op = path.members.last().map(|s| s.as_str()).unwrap_or("");
+        let home = self
+            .home(dst)
+            .ok_or_else(|| self.unsup("alloc result without a home"))?;
+        let (pty, payload_off) = self
+            .eu_payload_of(dst)
+            .ok_or_else(|| self.unsup("alloc result without a recovered payload type"))?;
+        // The payload shape is determined by the OPERATION, not the recovered
+        // payload type (the checker sometimes types `alloc`/`realloc`'s `.payload`
+        // as the element pointer `*T` rather than the slice `[]T`): `create` yields
+        // a `*T` pointer, `alloc`/`realloc` always yield a `[]T` fat slice.
+        let is_slice = !matches!(op, "create");
+        let _ = pty;
+
+        match op {
+            "create" => {
+                let elem = self.undef_carrier_ty(args);
+                let elem_size = self.layout(elem).size.max(1);
+                // __k2_alloc(handle=rdi, n=1, elem_size=rdx).
+                self.handle_to(path, Gpr::Rdi)?;
+                self.asm.mov_ri(Gpr::Rsi, 1);
+                self.asm.mov_ri(Gpr::Rdx, elem_size as i64);
+                self.asm.call_runtime(crate::runtime::RuntimeFn::Alloc);
+                // create never exhausts (it is unbounded): tag 0, payload = ptr.
+                self.write_eu_ok_ptr(home, payload_off, Gpr::Rax);
+                Ok(())
+            }
+            "alloc" => {
+                // The element size MUST equal the stride a reader will index the
+                // resulting `[]T` slice with (`slice_elem_stride`).
+                let elem = self.undef_carrier_ty(args);
+                let elem_size = self.slice_elem_stride(elem);
+                // n is the last non-undef operand.
+                let n = self.alloc_count_operand(args)?;
+                self.operand_to(n, Gpr::Rsi)?; // n
+                                               // Stash n across the handle eval (handle eval may touch rsi-free
+                                               // regs only; evaluate handle first into rdi to be safe).
+                self.asm.push(Gpr::Rsi);
+                self.handle_to(path, Gpr::Rdi)?;
+                self.asm.pop(Gpr::Rsi);
+                self.asm.mov_ri(Gpr::Rdx, elem_size as i64);
+                self.asm.call_runtime(crate::runtime::RuntimeFn::Alloc);
+                // alloc can exhaust on a FixedBuffer (rax == 0): write the
+                // OutOfMemory error arm; otherwise a {ptr, n} Ok slice.
+                self.write_alloc_slice_result(home, payload_off, n, is_slice)?;
+                Ok(())
+            }
+            "realloc" => {
+                let (slice_op, n_op) = self.realloc_operands(args)?;
+                // realloc(slice, n): the element byte size MUST equal the stride the
+                // `Index` codegen uses for this slice's element type, so the block is
+                // sized exactly as the elements are addressed. A realloc whose slice
+                // is a struct FIELD is a generic container's backing store growth
+                // (`ArrayList`/`List`'s `ensureCapacity`), addressed at the word
+                // stride; a standalone slice uses its natural element stride.
+                let elem_ty = self
+                    .operand_type(slice_op)
+                    .map(|t| self.slice_elem_ty(t))
+                    .unwrap_or_else(|| self.prog.arena.t_u8());
+                let elem_size = if self.operand_is_field(slice_op) {
+                    self.field_slice_stride(elem_ty)
+                } else {
+                    self.slice_elem_stride(elem_ty)
+                };
+                // Evaluate into the runtime ABI: rdi=handle, rsi=old_ptr,
+                // rdx=new_n, rcx=elem_size, r8=checks_off.
+                // old_ptr = slice.ptr (slice operand's +0 word).
+                self.load_slice_ptr(slice_op, Gpr::Rsi)?;
+                self.asm.push(Gpr::Rsi);
+                self.operand_to(n_op, Gpr::Rdx)?;
+                self.asm.push(Gpr::Rdx);
+                self.handle_to(path, Gpr::Rdi)?;
+                self.asm.pop(Gpr::Rdx);
+                self.asm.pop(Gpr::Rsi);
+                self.asm.mov_ri(Gpr::Rcx, elem_size as i64);
+                self.asm.mov_ri(Gpr::R8, i64::from(self.checks_off()));
+                self.asm.call_runtime(crate::runtime::RuntimeFn::Realloc);
+                // realloc of an unbounded allocator never exhausts in the corpus;
+                // write a {ptr, n} Ok slice (n is the realloc length operand).
+                self.write_alloc_slice_result(home, payload_off, n_op, is_slice)?;
+                Ok(())
+            }
+            _ => Err(self.unsup("unrecognized allocator operation")),
+        }
+    }
+
+    /// The byte stride of a `place` that ends in a SLICE index whose element is a
+    /// (possibly `deferred`) aggregate larger than a word — i.e. a generic-container
+    /// element store that must be a full memcpy, not a scalar store. Returns `None`
+    /// for a non-slice-index place or a word-or-smaller element.
+    fn slice_index_aggregate_stride(&self, place: &Place) -> Option<u64> {
+        let (last, prefix) = place.proj.split_last()?;
+        let Proj::Index { ty, .. } = last else {
+            return None;
+        };
+        // The container type the final `Index` applies to (the place without its
+        // trailing index): must be a slice.
+        let base_ty = self.prefix_type(place.base, prefix);
+        if !matches!(self.prog.arena.get(base_ty), Type::Slice { .. }) {
+            return None;
+        }
+        let stride = self.slice_elem_stride(*ty);
+        // A real aggregate element (the deferred fallback word is handled by the
+        // scalar path; only > 8 needs the memcpy).
+        if stride > 8 {
+            Some(stride)
+        } else {
+            None
+        }
+    }
+
+    /// `true` if `op` is a place reached through a struct FIELD projection — the
+    /// signal that a slice operand is a generic container's backing store (so it is
+    /// addressed at the word stride, matching `field_slice_stride`).
+    fn operand_is_field(&self, op: &Operand) -> bool {
+        matches!(op, Operand::Copy(p) if p.proj.iter().any(|pr| matches!(pr, Proj::Field { .. })))
+    }
+
+    /// The element type of a slice/array type (or the type itself for a non-
+    /// container — used to size a realloc's elements consistently with indexing).
+    fn slice_elem_ty(&self, ty: TypeId) -> TypeId {
+        match self.prog.arena.get(ty) {
+            Type::Slice { elem, .. } | Type::Array { elem, .. } => *elem,
+            _ => ty,
+        }
+    }
+
+    /// The byte STRIDE of a heap-backed slice's element `elem_ty`. A generic
+    /// container's methods (`ArrayList`/`List`) operate on a `deferred` element type
+    /// and so address + store each element at the word stride (8); a concrete reader
+    /// of the *same* slice (`list.items[i]`, typed `[]u32`) must use the *same*
+    /// stride, so every scalar element that fits a word is uniformly word-strided.
+    /// Sub-word scalars keep their natural stride (`[]u8` strings stay 1-byte,
+    /// matching string-literal data), and a real aggregate element uses its layout
+    /// size. This keeps the heap allocation, the store, and the read in agreement
+    /// across the monomorphization boundary the MIR does not specialize.
+    fn slice_elem_stride(&self, elem_ty: TypeId) -> u64 {
+        // The element stride of a standalone/array-view slice: the element's natural
+        // layout size, with a word fallback for a non-layoutable (`deferred`)
+        // element. This matches the array-element stride exactly, so an array-view
+        // slice (`a[1..3]`) and a direct heap slice (`alloc(u32, n)`) of the *same*
+        // concrete element type index identically.
+        layout::layout_of(&self.prog.arena, elem_ty)
+            .map(|l| l.size.max(1))
+            .unwrap_or(8)
+    }
+
+    /// The element stride of a slice that is a generic container's backing store
+    /// (reached through a struct field — `list.items[i]`, `(*self).f0[i]`). Because
+    /// the MIR does NOT monomorphize a container's methods, the shared
+    /// `deferred`-element body stores + indexes every element in a word-sized slot;
+    /// a concrete reader of the same field must use the same word stride. So a
+    /// word-or-smaller scalar element gets the word stride (8) — the scalar value
+    /// lives in the low bytes of the slot — while a `[]u8` byte element keeps its
+    /// natural 1-byte stride (string data is byte-addressed), and a real aggregate
+    /// element keeps its layout size. (The aggregate-element generic container is
+    /// still refused earlier, at the param boundary; this only makes the common
+    /// word-scalar `ArrayList(u32)` / `List(u32)` agree across the boundary.)
+    fn field_slice_stride(&self, elem_ty: TypeId) -> u64 {
+        match layout::layout_of(&self.prog.arena, elem_ty) {
+            None => 8, // a generic `deferred` element: the word slot
+            Some(l) if l.size <= 2 => l.size.max(1),
+            Some(l) if l.size <= 8 => 8,
+            Some(l) => l.size,
+        }
+    }
+
+    /// Writes an `Ok(ptr)` error union: tag 0 at +0, the pointer in `src` at the
+    /// payload offset. Used by `create`.
+    fn write_eu_ok_ptr(&mut self, home: i32, payload_off: i32, src: Gpr) {
+        // Stash the pointer (rax) before writing the tag clobbers nothing, but keep
+        // it explicit: store payload first, then the tag.
+        self.asm.mov_store_mem(Gpr::Rbp, home + payload_off, src);
+        self.asm.mov_ri(Gpr::Rax, 0);
+        self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
+    }
+
+    /// Writes an allocation's slice result into the error-union home: on success
+    /// (returned ptr != 0) a `tag 0` Ok with a `{ptr, len}` fat slice; on a bounded
+    /// allocator's exhaustion (ptr == 0) the `OutOfMemory` error tag. `len_op` is
+    /// the requested element count. `is_slice` guards the fat-slice write (a
+    /// non-slice payload would be a backend bug for `alloc`/`realloc`).
+    fn write_alloc_slice_result(
+        &mut self,
+        home: i32,
+        payload_off: i32,
+        len_op: &Operand,
+        is_slice: bool,
+    ) -> Result<(), CodegenError> {
+        if !is_slice {
+            return Err(self.unsup("alloc/realloc result payload is not a slice"));
+        }
+        // The runtime ptr is in rax. Branch on rax == 0 (exhaustion).
+        let oom = self.asm.new_local_label();
+        let done = self.asm.new_local_label();
+        self.asm.test_rr(Gpr::Rax, Gpr::Rax);
+        self.asm.jcc_local(Cc::E, oom);
+        // Ok: store ptr at payload_off, len at payload_off+8, tag 0 at +0.
+        self.asm
+            .mov_store_mem(Gpr::Rbp, home + payload_off, Gpr::Rax);
+        self.operand_to(len_op, Gpr::Rcx)?;
+        self.asm
+            .mov_store_mem(Gpr::Rbp, home + payload_off + 8, Gpr::Rcx);
+        self.asm.mov_ri(Gpr::Rax, 0);
+        self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
+        self.asm.jmp_local(done);
+        // OutOfMemory: tag = oom_tag at +0 (payload is left undefined).
+        self.asm.bind_local(oom);
+        self.asm.mov_ri(Gpr::Rax, self.oom_tag() as i64);
+        self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
+        self.asm.bind_local(done);
+        Ok(())
+    }
+
+    /// Lowers `value(handle).free(ptr)` / `.destroy(ptr)`: evaluate the handle and
+    /// the pointer/slice operand, then call the runtime free routine. A null
+    /// pointer / empty slice is handled inside the routine (a benign no-op).
+    fn lower_free_op(
+        &mut self,
+        path: &k2_mir::IntrinsicPath,
+        args: &[Operand],
+    ) -> Result<(), CodegenError> {
+        // The operand is a slice (`free([]T)`) or a pointer (`destroy(*T)`).
+        let ptr_op = args
+            .iter()
+            .find(|a| !matches!(a, Operand::Const(Const::Undef { .. })))
+            .ok_or_else(|| self.unsup("free without a pointer operand"))?;
+        self.load_ptr_operand(ptr_op, Gpr::Rsi)?;
+        self.asm.push(Gpr::Rsi);
+        self.handle_to(path, Gpr::Rdi)?;
+        self.asm.pop(Gpr::Rsi);
+        self.asm.mov_ri(Gpr::Rdx, i64::from(self.checks_off()));
+        self.asm.call_runtime(crate::runtime::RuntimeFn::Free);
+        Ok(())
+    }
+
+    /// Loads the data pointer of a free/destroy operand into `dst`: a slice's `+0`
+    /// word, or a bare pointer value.
+    fn load_ptr_operand(&mut self, op: &Operand, dst: Gpr) -> Result<(), CodegenError> {
+        let ty = self.operand_type(op);
+        if ty
+            .map(|t| matches!(self.prog.arena.get(t), Type::Slice { .. }))
+            .unwrap_or(false)
+        {
+            return self.load_slice_ptr(op, dst);
+        }
+        // A pointer (or pointer-niche optional) scalar.
+        self.operand_to(op, dst)
+    }
+
+    /// Loads a slice operand's data pointer (its `+0` word) into `dst`.
+    fn load_slice_ptr(&mut self, op: &Operand, dst: Gpr) -> Result<(), CodegenError> {
+        match op {
+            Operand::Copy(p) => {
+                self.place_addr_general(p, dst)?;
+                self.asm.mov_load_mem(dst, dst, 0);
+                Ok(())
+            }
+            _ => Err(self.unsup("slice operand of an allocator op is not a place")),
+        }
+    }
+
+    /// The element-count operand of `alloc(undef, n)`: the last non-undef operand.
+    fn alloc_count_operand<'a>(&self, args: &'a [Operand]) -> Result<&'a Operand, CodegenError> {
+        args.iter()
+            .rev()
+            .find(|a| !matches!(a, Operand::Const(Const::Undef { .. })))
+            .ok_or_else(|| self.unsup("alloc without a count operand"))
+    }
+
+    /// The `(slice, new_len)` operands of `realloc(slice, n)`: the slice is the
+    /// slice-typed operand, the length the last integer operand.
+    fn realloc_operands<'a>(
+        &self,
+        args: &'a [Operand],
+    ) -> Result<(&'a Operand, &'a Operand), CodegenError> {
+        let slice = args
+            .iter()
+            .find(|a| {
+                self.operand_type(a)
+                    .map(|t| matches!(self.prog.arena.get(t), Type::Slice { .. }))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| self.unsup("realloc without a slice operand"))?;
+        let len = args
+            .iter()
+            .rev()
+            .find(|a| {
+                !matches!(a, Operand::Const(Const::Undef { .. }))
+                    && !self
+                        .operand_type(a)
+                        .map(|t| matches!(self.prog.arena.get(t), Type::Slice { .. }))
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| self.unsup("realloc without a length operand"))?;
+        Ok((slice, len))
+    }
+
+    // ---------------------------------------------------------------------
+    //  Allocator-registry & *System capability leaves (the @-builtins)
+    // ---------------------------------------------------------------------
+
+    /// `@allocId(kind, 0[, buf])`: register a fresh allocator handle. `kind` is the
+    /// numeric std tag (0=Default 1=GPA 2=Arena 3=FixedBuffer 5=Testing); for a
+    /// FixedBuffer the third operand is the caller `[]u8` buffer (its ptr + len
+    /// become the FBA's backing range). Returns the new handle (`u32`) in RAX.
+    fn lower_alloc_id(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        // kind = first integer constant operand.
+        let kind = args
+            .iter()
+            .find_map(|a| match a {
+                Operand::Const(Const::Int { value, .. }) => Some(*value as usize),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let kind_tag = crate::runtime::kind_tag(kind);
+        // For a FixedBuffer, recover the backing buffer's ptr + cap.
+        if kind == 3 {
+            // The buffer operand is a slice (`[]u8`) or a pointer-to-array.
+            let buf = args
+                .iter()
+                .find(|a| {
+                    self.operand_type(a)
+                        .map(|t| {
+                            matches!(
+                                self.prog.arena.get(t),
+                                Type::Slice { .. } | Type::Pointer { .. }
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| self.unsup("@allocId(FixedBuffer) without a buffer operand"))?;
+            self.load_fba_buffer(buf, Gpr::Rsi, Gpr::Rdx)?;
+        } else {
+            self.asm.mov_ri(Gpr::Rsi, 0);
+            self.asm.mov_ri(Gpr::Rdx, 0);
+        }
+        self.asm.mov_ri(Gpr::Rdi, kind_tag);
+        self.asm.call_runtime(crate::runtime::RuntimeFn::AllocId);
+        Ok(())
+    }
+
+    /// Loads a FixedBuffer's backing `(ptr -> buf_reg, cap -> cap_reg)`. A `[]u8`
+    /// slice supplies ptr at +0 and len at +8; a `*[N]u8` supplies the array
+    /// address and its element count.
+    fn load_fba_buffer(
+        &mut self,
+        op: &Operand,
+        buf_reg: Gpr,
+        cap_reg: Gpr,
+    ) -> Result<(), CodegenError> {
+        let ty = self
+            .operand_type(op)
+            .ok_or_else(|| self.unsup("FBA buffer operand without a type"))?;
+        match self.prog.arena.get(ty) {
+            Type::Slice { .. } => match op {
+                Operand::Copy(p) => {
+                    self.place_addr_general(p, Gpr::Rax)?;
+                    self.asm.mov_load_mem(buf_reg, Gpr::Rax, 0); // ptr
+                    self.asm.mov_load_mem(cap_reg, Gpr::Rax, 8); // len
+                    Ok(())
+                }
+                _ => Err(self.unsup("FBA slice buffer is not a place")),
+            },
+            Type::Pointer { pointee, .. } => {
+                let pointee = *pointee;
+                // ptr = the array address (the pointer value); cap = the array's
+                // element count.
+                self.operand_to(op, buf_reg)?;
+                let cap = match self.prog.arena.get(pointee) {
+                    Type::Array {
+                        len: k2_types::ArrayLen::Known(n),
+                        ..
+                    } => *n as i64,
+                    _ => return Err(self.unsup("FBA pointer buffer without a known array length")),
+                };
+                self.asm.mov_ri(cap_reg, cap);
+                Ok(())
+            }
+            _ => Err(self.unsup("unrecognized FBA buffer type")),
+        }
+    }
+
+    /// `@allocHandle(id)`: the `Allocator` value IS the `u32` id. Identity move.
+    fn lower_alloc_handle(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        let id = args
+            .first()
+            .ok_or_else(|| self.unsup("@allocHandle without an id operand"))?;
+        self.operand_to(id, Gpr::Rax)
+    }
+
+    /// `@gpaDeinit(id)`: report whether the GPA leaked (a `bool` in RAX) and reclaim
+    /// its blocks. With checks off (ReleaseFast) the runtime returns 0.
+    fn lower_gpa_deinit(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        let id = args
+            .first()
+            .ok_or_else(|| self.unsup("@gpaDeinit without an id operand"))?;
+        self.operand_to(id, Gpr::Rdi)?;
+        self.asm.mov_ri(Gpr::Rsi, i64::from(self.checks_off()));
+        self.asm.call_runtime(crate::runtime::RuntimeFn::GpaDeinit);
+        Ok(())
+    }
+
+    /// `@arenaDeinit(id)`: free every block the arena handed out (bulk free).
+    fn lower_arena_deinit(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        let id = args
+            .first()
+            .ok_or_else(|| self.unsup("@arenaDeinit without an id operand"))?;
+        self.operand_to(id, Gpr::Rdi)?;
+        self.asm
+            .call_runtime(crate::runtime::RuntimeFn::ArenaDeinit);
+        // Unit result.
+        self.asm.mov_ri(Gpr::Rax, 0);
+        Ok(())
+    }
+
+    /// `@clockNow(...)`: the deterministic monotonic counter (nanoseconds) — read
+    /// the process-global `clock_nanos`, matching the VM's reproducible clock.
+    fn lower_clock_now(&mut self) -> Result<(), CodegenError> {
+        self.asm.mov_ri_state(ADDR, crate::runtime::ST_CLOCK_NANOS);
+        self.asm.mov_load_mem(Gpr::Rax, ADDR, 0);
+        Ok(())
+    }
+
+    /// `@clockSleep(ns)`: advance the deterministic clock by `max(ns, 0)`, matching
+    /// the VM (`clock_nanos += ns`).
+    fn lower_clock_sleep(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        let ns = args
+            .first()
+            .ok_or_else(|| self.unsup("@clockSleep without a duration operand"))?;
+        self.operand_to(ns, Gpr::Rcx)?;
+        // Clamp negatives to 0 (saturating add of a non-negative amount).
+        let nonneg = self.asm.new_local_label();
+        self.asm.test_rr(Gpr::Rcx, Gpr::Rcx);
+        self.asm.jcc_local(Cc::Ge, nonneg);
+        self.asm.mov_ri(Gpr::Rcx, 0);
+        self.asm.bind_local(nonneg);
+        self.asm.mov_ri_state(ADDR, crate::runtime::ST_CLOCK_NANOS);
+        self.asm.mov_load_mem(Gpr::Rax, ADDR, 0);
+        self.asm.add_rr(Gpr::Rax, Gpr::Rcx);
+        self.asm.mov_store_mem(ADDR, 0, Gpr::Rax);
+        // Unit result.
+        self.asm.mov_ri(Gpr::Rax, 0);
+        Ok(())
+    }
+
+    /// `@randomInt(...)`: advance the splitmix64 PRNG and return the 64-bit draw in
+    /// RAX, reproducing the VM's `next_random` byte-for-byte.
+    fn lower_random_int(&mut self) -> Result<(), CodegenError> {
+        self.emit_splitmix64_next();
+        Ok(())
+    }
+
+    /// `@randomBytes(buf)`: fill the `[]u8` (or `*[N]u8`) operand with one low PRNG
+    /// byte per draw, matching the VM's `random_bytes`.
+    fn lower_random_bytes(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        let buf = args
+            .first()
+            .ok_or_else(|| self.unsup("@randomBytes without a buffer operand"))?;
+        // Recover (ptr -> r12-free scratch, len) of the buffer. We use rsi=ptr,
+        // r8=remaining count; the splitmix helper clobbers rax/rcx/rdx/r11 only.
+        self.load_fba_buffer_like(buf, Gpr::Rsi, Gpr::R8)?;
+        // for (i = 0; i < len; i++) buf[i] = next() & 0xFF.
+        let top = self.asm.new_local_label();
+        let end = self.asm.new_local_label();
+        self.asm.bind_local(top);
+        self.asm.test_rr(Gpr::R8, Gpr::R8);
+        self.asm.jcc_local(Cc::E, end);
+        // Preserve rsi/r8 across the splitmix helper (it touches rax/rcx/rdx/r11).
+        self.emit_splitmix64_next(); // draw -> rax
+        self.asm.mov_store8_mem(Gpr::Rsi, 0, Gpr::Rax);
+        self.asm.add_ri(Gpr::Rsi, 1);
+        self.asm.add_ri(Gpr::R8, -1);
+        self.asm.jmp_local(top);
+        self.asm.bind_local(end);
+        // Unit result.
+        self.asm.mov_ri(Gpr::Rax, 0);
+        Ok(())
+    }
+
+    /// Recovers `(ptr -> ptr_reg, len -> len_reg)` of a `[]u8` slice or `*[N]u8`
+    /// buffer operand (the `randomBytes` shape, mirroring the VM's acceptance of
+    /// both spellings).
+    fn load_fba_buffer_like(
+        &mut self,
+        op: &Operand,
+        ptr_reg: Gpr,
+        len_reg: Gpr,
+    ) -> Result<(), CodegenError> {
+        self.load_fba_buffer(op, ptr_reg, len_reg)
+    }
+
+    /// Emits the splitmix64 step into RAX, advancing `rng_state`:
+    /// `state += GOLDEN; z = state; z = (z ^ z>>30) * C1; z = (z ^ z>>27) * C2;
+    /// z ^ z>>31`. Byte-identical to the VM's `next_random`. Clobbers rax/rcx/rdx/
+    /// r11.
+    fn emit_splitmix64_next(&mut self) {
+        const GOLDEN: i64 = 0x9E37_79B9_7F4A_7C15u64 as i64;
+        const C1: i64 = 0xBF58_476D_1CE4_E5B9u64 as i64;
+        const C2: i64 = 0x94D0_49BB_1331_11EBu64 as i64;
+        // r11 = &rng_state.
+        self.asm.mov_ri_state(ADDR, crate::runtime::ST_RNG_STATE);
+        // rax = state + GOLDEN; store back.
+        self.asm.mov_load_mem(Gpr::Rax, ADDR, 0);
+        self.asm.mov_ri(Gpr::Rcx, GOLDEN);
+        self.asm.add_rr(Gpr::Rax, Gpr::Rcx);
+        self.asm.mov_store_mem(ADDR, 0, Gpr::Rax);
+        // z = rax. z ^= z >> 30.
+        self.asm.mov_rr(Gpr::Rdx, Gpr::Rax);
+        self.asm.shr_ri(Gpr::Rdx, 30);
+        self.asm.xor_rr(Gpr::Rax, Gpr::Rdx);
+        // z *= C1.
+        self.asm.mov_ri(Gpr::Rcx, C1);
+        self.asm.imul_rr(Gpr::Rax, Gpr::Rcx);
+        // z ^= z >> 27.
+        self.asm.mov_rr(Gpr::Rdx, Gpr::Rax);
+        self.asm.shr_ri(Gpr::Rdx, 27);
+        self.asm.xor_rr(Gpr::Rax, Gpr::Rdx);
+        // z *= C2.
+        self.asm.mov_ri(Gpr::Rcx, C2);
+        self.asm.imul_rr(Gpr::Rax, Gpr::Rcx);
+        // z ^= z >> 31.
+        self.asm.mov_rr(Gpr::Rdx, Gpr::Rax);
+        self.asm.shr_ri(Gpr::Rdx, 31);
+        self.asm.xor_rr(Gpr::Rax, Gpr::Rdx);
+    }
+
+    /// `@envGet(name)`: offline-absent. The result is an optional `None`: a single
+    /// zero in RAX (a pointer-niche `?[]const u8`/`?*T` null, or the `0` flag of a
+    /// flagged optional — both read absence as zero), matching the VM's
+    /// `Optional(None)`.
+    fn lower_env_get(&mut self) -> Result<(), CodegenError> {
+        self.asm.mov_ri(Gpr::Rax, 0);
+        Ok(())
     }
 
     // ---- Runtime print formatting (see fmt_native) ----
@@ -2573,20 +3628,137 @@ impl<'p> FnLower<'p> {
                 return Err(self.unsup("print with fewer args than placeholders"));
             }
         };
-        if spec.align != Align::None && spec.width != 0 {
-            return Err(self.unsup("print width/alignment formatting"));
-        }
         let base = tuple_local.ok_or_else(|| self.unsup("print placeholder without a tuple"))?;
 
-        match spec.verb {
-            Verb::Str => self.render_string_field(base, foff, fty),
-            Verb::Decimal => self.render_decimal_field(base, foff, fty),
-            Verb::Default => self.render_default_field(base, foff, fty),
-            Verb::Hex { upper } => self.render_radix_field(base, foff, fty, 16, upper),
-            Verb::Bin => self.render_radix_field(base, foff, fty, 2, false),
-            Verb::Oct => self.render_radix_field(base, foff, fty, 8, false),
-            Verb::Char => self.render_char_field(base, foff, fty),
+        // Width / alignment padding (mirrors `fmt::pad`): render the field, then —
+        // if it is shorter than the requested width and an alignment is given —
+        // insert `fill` bytes before / after / around it. With no alignment, a
+        // width is a no-op (matching the VM's `pad`).
+        let pad = spec.align != Align::None && spec.width != 0;
+        // The cursor (ADDR) before rendering, captured into a scratch GPR.
+        if pad {
+            // Save the field-start cursor in the outgoing scratch slot so the
+            // render code (which freely clobbers caller-saved regs) cannot lose it.
+            let slot = self.plan.outgoing_args_base() + 112;
+            self.asm.mov_store_mem(Gpr::Rsp, slot, ADDR);
         }
+
+        match spec.verb {
+            Verb::Str => self.render_string_field(base, foff, fty)?,
+            Verb::Decimal => self.render_decimal_field(base, foff, fty)?,
+            Verb::Default => self.render_default_field(base, foff, fty)?,
+            Verb::Hex { upper } => self.render_radix_field(base, foff, fty, 16, upper)?,
+            Verb::Bin => self.render_radix_field(base, foff, fty, 2, false)?,
+            Verb::Oct => self.render_radix_field(base, foff, fty, 8, false)?,
+            Verb::Char => self.render_char_field(base, foff, fty)?,
+        }
+
+        if pad {
+            self.emit_field_padding(spec);
+        }
+        Ok(())
+    }
+
+    /// Applies width/alignment padding to the just-rendered field, mirroring
+    /// `fmt::pad`. On entry ADDR points just past the rendered field; the
+    /// field-start cursor was saved to a scratch slot. When the field is shorter
+    /// than `width`, `pad_count = width - field_len` fill bytes are inserted: Right
+    /// shifts the field right and prepends fill; Left appends fill; Center splits.
+    fn emit_field_padding(&mut self, spec: &fmt_native::Spec) {
+        let slot = self.plan.outgoing_args_base() + 112;
+        let fill = spec.fill as i64;
+        let width = spec.width as i64;
+        // rsi = field start, rdi = field end (ADDR), rcx = field_len.
+        self.asm.mov_load_mem(Gpr::Rsi, Gpr::Rsp, slot);
+        self.asm.mov_rr(Gpr::Rdi, ADDR);
+        self.asm.mov_rr(Gpr::Rcx, Gpr::Rdi);
+        self.asm.sub_rr(Gpr::Rcx, Gpr::Rsi); // rcx = field_len
+                                             // If field_len >= width: nothing to pad.
+        let done = self.asm.new_local_label();
+        self.asm.mov_ri(Gpr::Rax, width);
+        self.asm.cmp_rr(Gpr::Rcx, Gpr::Rax);
+        self.asm.jcc_local(Cc::Ae, done);
+        // pad_count = width - field_len -> r10.
+        self.asm.mov_ri(Gpr::R10, width);
+        self.asm.sub_rr(Gpr::R10, Gpr::Rcx);
+        match spec.align {
+            Align::Left => {
+                // Append `pad_count` fill bytes at ADDR.
+                self.emit_fill_run(ADDR, Gpr::R10, fill);
+            }
+            Align::Right => {
+                // Shift field right by pad_count, then prepend fill.
+                self.shift_field_right(Gpr::Rsi, Gpr::Rcx, Gpr::R10);
+                // Prepend fill at [field_start, field_start + pad_count); leave ADDR
+                // at field_start + pad_count + field_len.
+                self.asm.mov_load_mem(Gpr::Rdi, Gpr::Rsp, slot); // field start
+                self.emit_fill_run(Gpr::Rdi, Gpr::R10, fill);
+                // ADDR = field_start + width.
+                self.asm.mov_load_mem(ADDR, Gpr::Rsp, slot);
+                self.asm.add_ri(ADDR, width as i32);
+            }
+            Align::Center => {
+                // left = pad_count/2, right = pad_count - left.
+                // Shift field right by `left`, prepend `left` fill, append `right`.
+                self.asm.mov_rr(Gpr::R8, Gpr::R10);
+                self.asm.shr_ri(Gpr::R8, 1); // left = pad/2
+                self.shift_field_right(Gpr::Rsi, Gpr::Rcx, Gpr::R8);
+                self.asm.mov_load_mem(Gpr::Rdi, Gpr::Rsp, slot);
+                self.emit_fill_run(Gpr::Rdi, Gpr::R8, fill);
+                // ADDR = field_start + left + field_len.
+                self.asm.mov_load_mem(ADDR, Gpr::Rsp, slot);
+                self.asm.add_rr(ADDR, Gpr::R8);
+                self.asm.add_rr(ADDR, Gpr::Rcx);
+                // right = pad_count - left.
+                self.asm.mov_rr(Gpr::R9, Gpr::R10);
+                self.asm.sub_rr(Gpr::R9, Gpr::R8);
+                self.emit_fill_run(ADDR, Gpr::R9, fill);
+            }
+            Align::None => {}
+        }
+        self.asm.bind_local(done);
+    }
+
+    /// Emits `count` (in `count_reg`) `fill` bytes starting at `[dst_reg]`,
+    /// advancing `dst_reg` past them. Clobbers rax, the count register, and dst.
+    fn emit_fill_run(&mut self, dst_reg: Gpr, count_reg: Gpr, fill: i64) {
+        let top = self.asm.new_local_label();
+        let end = self.asm.new_local_label();
+        self.asm.bind_local(top);
+        self.asm.test_rr(count_reg, count_reg);
+        self.asm.jcc_local(Cc::E, end);
+        self.asm.mov_ri(Gpr::Rax, fill);
+        self.asm.mov_store8_mem(dst_reg, 0, Gpr::Rax);
+        self.asm.add_ri(dst_reg, 1);
+        self.asm.add_ri(count_reg, -1);
+        self.asm.jmp_local(top);
+        self.asm.bind_local(end);
+    }
+
+    /// Shifts the `len`-byte field at `[start]` right by `pad` bytes (a backward
+    /// copy so the source and destination ranges may overlap), making room for
+    /// leading fill. `start` in `start_reg`, `len` in `len_reg`, `pad` in
+    /// `pad_reg`. Clobbers rax/rdx/r11 and reads (does not modify) the inputs.
+    fn shift_field_right(&mut self, start_reg: Gpr, len_reg: Gpr, pad_reg: Gpr) {
+        // i = len; while (i-- > 0) dst[i+pad] = src[i].  Copy from the high end down
+        // so overlapping ranges are preserved.
+        // rax = i = len.
+        self.asm.mov_rr(Gpr::Rax, len_reg);
+        let top = self.asm.new_local_label();
+        let end = self.asm.new_local_label();
+        self.asm.bind_local(top);
+        self.asm.test_rr(Gpr::Rax, Gpr::Rax);
+        self.asm.jcc_local(Cc::E, end);
+        self.asm.add_ri(Gpr::Rax, -1); // i
+                                       // src = start + i ; load byte.
+        self.asm.mov_rr(ADDR, start_reg);
+        self.asm.add_rr(ADDR, Gpr::Rax);
+        self.asm.movzx8_mem(Gpr::Rdx, ADDR, 0);
+        // dst = start + i + pad ; store byte.
+        self.asm.add_rr(ADDR, pad_reg);
+        self.asm.mov_store8_mem(ADDR, 0, Gpr::Rdx);
+        self.asm.jmp_local(top);
+        self.asm.bind_local(end);
     }
 
     /// Renders an integer field in `radix` (2/8/16), masking the magnitude to the
@@ -2843,6 +4015,16 @@ impl<'p> FnLower<'p> {
                 self.emit_bool_digit();
                 Ok(())
             }
+            // A `deferred`-typed scalar field is a `*System` capability result that
+            // the checker left open (`sys.clock.now()` / `sys.random.int()` are
+            // `usize`); render it as an unsigned 64-bit decimal.
+            Type::Deferred => {
+                let h = self
+                    .home(base)
+                    .ok_or_else(|| self.unsup("print tuple without a home"))?;
+                self.asm.mov_load(Gpr::Rax, h + foff as i32);
+                self.render_decimal_64(false)
+            }
             _ => Err(self.unsup("decimal format of a non-integer field")),
         }
     }
@@ -3033,8 +4215,25 @@ impl<'p> FnLower<'p> {
 
     // ---- Safety predicates (unchanged from v0.14, rerouted operands) ----
 
-    /// Lowers a `@no_*_overflow` / `narrow_fits` predicate into a bool in RAX.
+    /// Lowers a `@`-builtin intrinsic into RAX: a safety predicate (overflow /
+    /// narrow checks), an allocator-registry / capability-floor leaf
+    /// (`@allocId`/`@allocHandle`/`@gpaDeinit`/`@arenaDeinit`), or a `*System`
+    /// capability reader (`@clockNow`/`@clockSleep`/`@randomInt`/`@randomBytes`/
+    /// `@envGet`). The `@*Raw` leaf forms route to the same runtime routines as the
+    /// allocator method spellings.
     fn lower_safety_predicate(&mut self, name: &str, args: &[Operand]) -> Result<(), CodegenError> {
+        match name {
+            "allocId" => return self.lower_alloc_id(args),
+            "allocHandle" => return self.lower_alloc_handle(args),
+            "gpaDeinit" => return self.lower_gpa_deinit(args),
+            "arenaDeinit" => return self.lower_arena_deinit(args),
+            "clockNow" => return self.lower_clock_now(),
+            "clockSleep" => return self.lower_clock_sleep(args),
+            "randomInt" => return self.lower_random_int(),
+            "randomBytes" => return self.lower_random_bytes(args),
+            "envGet" => return self.lower_env_get(),
+            _ => {}
+        }
         let ty = self.predicate_type(args);
         match name {
             "no_add_overflow" => self.overflow_predicate(args, ty, ArithKind::Add),
@@ -3315,7 +4514,7 @@ impl<'p> FnLower<'p> {
                 targets,
                 default,
             } => {
-                self.operand_to(scrutinee, Gpr::Rax)?;
+                self.load_switch_scrutinee(scrutinee, Gpr::Rax)?;
                 for (value, t) in targets {
                     if let Ok(imm) = i32::try_from(*value) {
                         self.asm.cmp_ri(Gpr::Rax, imm);
@@ -3332,6 +4531,27 @@ impl<'p> FnLower<'p> {
             Terminator::Trap { reason } => self.lower_trap(*reason, rodata),
             Terminator::Unreachable => self.lower_trap(TrapReason::Unreachable, rodata),
         }
+    }
+
+    /// Loads a `switch` scrutinee into `dst`. When the scrutinee is an error union
+    /// (the captured error of a `catch |err| switch (err)` whose error set the
+    /// checker kept as the full union), the tag is the `u16` at +0 — the
+    /// payload/padding eightbytes must not leak into the compared value. Load just
+    /// the tag. A plain integer/enum scrutinee loads normally.
+    fn load_switch_scrutinee(&mut self, op: &Operand, dst: Gpr) -> Result<(), CodegenError> {
+        if let Operand::Copy(p) = op {
+            let is_eu = self
+                .operand_type(op)
+                .map(|t| matches!(self.prog.arena.get(t), Type::ErrorUnion { .. }))
+                .unwrap_or(false)
+                || self.eu_payload_of(p.base).is_some();
+            if is_eu {
+                self.place_addr_general(p, ADDR)?;
+                self.asm.movzx16_mem(dst, ADDR, 0);
+                return Ok(());
+            }
+        }
+        self.operand_to(op, dst)
     }
 
     /// Lowers a `Return`.
@@ -3478,6 +4698,24 @@ impl<'p> FnLower<'p> {
                         if self.layout(ty).size > 8 {
                             self.asm.mov_load_mem(Gpr::Rdx, ADDR, 8);
                         }
+                    } else if matches!(value, Operand::Const(Const::Void))
+                        && matches!(self.prog.arena.get(ty), Type::ErrorUnion { .. })
+                    {
+                        // `return ()` from a `!void` helper: the success value is
+                        // `Ok(void)`, whose entire register image is the zero tag.
+                        // (Without this, the register-class return path would leave
+                        // RAX with stale garbage, and the caller's `discr` on the
+                        // returned error union would see a spurious non-zero tag.)
+                        self.asm.xor_rr(Gpr::Rax, Gpr::Rax);
+                        if self.layout(ty).size > 8 {
+                            self.asm.xor_rr(Gpr::Rdx, Gpr::Rdx);
+                        }
+                    } else {
+                        // Any other non-place operand into a register-class aggregate
+                        // return: build the bytes into the print scratch then load.
+                        // The corpus only hits the `Const::Void` case above; refuse
+                        // anything else cleanly rather than return garbage.
+                        return Err(self.unsup("register-class aggregate return from a non-place"));
                     }
                 }
                 ArgClass::Sse => {
@@ -3632,10 +4870,10 @@ fn outgoing_args_bytes(prog: &MirProgram, func: &MirFunction) -> i32 {
     }
     let mut total = max_stack;
     if func_prints(func) {
-        // Reserve scratch for the decimal renderers: 24-byte u64 digit buffer +
-        // 16-byte 128-bit working value + 40-byte 128-bit digit buffer. 64 covers
-        // the largest (the 128-bit path uses [base..base+56]).
-        total = total.max(64);
+        // Reserve scratch for the decimal/radix renderers (the 128-bit path uses
+        // [base..base+80]) plus the width/alignment padding save slot at base+112.
+        // 128 covers all of them with margin.
+        total = total.max(128);
     }
     round_up_i32(total, 16)
 }

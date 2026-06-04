@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use crate::reg::{is_caller_saved, Gpr, ALLOC_REGS};
 use crate::{frame, layout};
-use k2_mir::{LocalId, MirFunction, Operand, Rvalue, Statement, Terminator};
+use k2_mir::{LocalId, MirFunction, Operand, Place, Rvalue, Statement, Terminator};
 use k2_types::{Type, TypeArena, TypeId};
 
 /// Where a vreg's value lives.
@@ -68,6 +68,13 @@ pub struct RegAlloc {
     /// inferred-length (`[_]T`) array assigned an array literal — the type carries
     /// no `Known` length, so `.len` reads this. `None` otherwise.
     pub array_len: Vec<Option<u64>>,
+    /// `eu_result[i]` = the *payload* type of local `i`, when local `i` is the
+    /// `deferred`-typed result of a heap allocation intrinsic (`create`/`alloc`/
+    /// `realloc`) — an error union `error{…}!Payload` whose layout the MIR leaves
+    /// open. The native backend builds the error-union home directly from this
+    /// payload type (a `u16` tag at +0, the payload after) and treats the local's
+    /// `discr.ErrorUnion`/`.payload` consumers as error-union ops. `None` otherwise.
+    pub eu_result: Vec<Option<TypeId>>,
     /// The callee-saved registers the allocator assigned (prologue save set).
     pub callee_saved: Vec<Gpr>,
 }
@@ -112,6 +119,7 @@ pub fn allocate(func: &MirFunction, arena: &TypeArena) -> RegAlloc {
     let mut home_size: Vec<Option<(u64, u64)>> = vec![None; n];
     let mut agg_fields: Vec<Option<Vec<(TypeId, u64)>>> = vec![None; n];
     let mut array_len: Vec<Option<u64>> = vec![None; n];
+    let mut eu_result: Vec<Option<TypeId>> = vec![None; n];
     let forced_home = forced_home_locals(
         func,
         arena,
@@ -120,6 +128,16 @@ pub fn allocate(func: &MirFunction, arena: &TypeArena) -> RegAlloc {
         &mut agg_fields,
         &mut array_len,
     );
+    // A heap allocation intrinsic (`create`/`alloc`/`realloc`) yields a
+    // `deferred`-typed error-union result; size its home from the recovered payload
+    // type and record the payload so the lowering can drive its tag/payload ops.
+    let mut forced_home = forced_home;
+    detect_alloc_results(func, &mut eu_result, &mut home_size);
+    for (i, p) in eu_result.iter().enumerate() {
+        if p.is_some() {
+            forced_home[i] = true;
+        }
+    }
 
     // Decide which locals are vregs (register-allocatable scalars). Aggregates and
     // address-taken locals always need a home and never get a register.
@@ -252,7 +270,139 @@ pub fn allocate(func: &MirFunction, arena: &TypeArena) -> RegAlloc {
         home_size,
         agg_fields,
         array_len,
+        eu_result,
         callee_saved,
+    }
+}
+
+/// Detects locals that are the result of a heap allocation intrinsic
+/// (`create`/`alloc`/`realloc` reached as a `value(handle).op` method) and records
+/// each one's recovered error-union *payload* type in `eu_result`, plus a
+/// type-derived `home_size` for the error union (`u16` tag at +0, payload at
+/// `round_up(2, payload_align)`). The result local is `deferred` in the MIR; the
+/// payload type is recovered from the local's own `.payload` projection consumers
+/// (whose `Proj::Payload { ty }` carries the concrete `*T` / `[]T`).
+fn detect_alloc_results(
+    func: &MirFunction,
+    eu_result: &mut [Option<TypeId>],
+    home_size: &mut [Option<(u64, u64)>],
+) {
+    use k2_mir::{IntrinsicRoot, Proj};
+    // First pass: which locals are alloc-op intrinsic results, and whether the
+    // result payload is a fat slice (`alloc`/`realloc` -> `[]T`) or a bare pointer
+    // (`create` -> `*T`). The payload *shape* is fixed by the operation, so the home
+    // is sized correctly even when the checker types the `.payload` projection
+    // imprecisely (e.g. as the element pointer rather than the slice).
+    let mut is_alloc_result = vec![false; func.locals.len()];
+    let mut result_is_slice = vec![false; func.locals.len()];
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let Statement::Assign { place, rvalue, .. } = stmt else {
+                continue;
+            };
+            if !place.is_local() {
+                continue;
+            }
+            if let Rvalue::Intrinsic { path, .. } = rvalue {
+                if matches!(path.root, IntrinsicRoot::Value(_)) {
+                    if let Some(op @ ("create" | "alloc" | "realloc")) =
+                        path.members.last().map(|s| s.as_str())
+                    {
+                        is_alloc_result[place.base.index()] = true;
+                        result_is_slice[place.base.index()] = op != "create";
+                    }
+                }
+            }
+        }
+    }
+    if !is_alloc_result.iter().any(|&b| b) {
+        return;
+    }
+    // Second pass: recover each result's payload type from a `.payload` consumer.
+    let payload_ty_of = |p: &Place| -> Option<(usize, TypeId)> {
+        if let Some(Proj::Payload { ty }) = p.proj.last() {
+            // Only a single-projection `_x = _result.payload` (the alloc result is a
+            // bare local base, no intervening deref).
+            if p.proj.len() == 1 && is_alloc_result[p.base.index()] {
+                return Some((p.base.index(), *ty));
+            }
+        }
+        None
+    };
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            // A `.payload` read can appear as an rvalue's source place or the lhs.
+            let places: Vec<&Place> = match stmt {
+                Statement::Assign { place, rvalue, .. } => {
+                    let mut v = vec![place];
+                    collect_rvalue_places(rvalue, &mut v);
+                    v
+                }
+                Statement::Eval { rvalue, .. } => {
+                    let mut v = Vec::new();
+                    collect_rvalue_places(rvalue, &mut v);
+                    v
+                }
+                _ => Vec::new(),
+            };
+            for p in places {
+                if let Some((idx, pty)) = payload_ty_of(p) {
+                    eu_result[idx] = Some(pty);
+                }
+            }
+        }
+    }
+    // Size each detected result's home as an error union over its payload: a fat
+    // slice (`{ptr, len}`, 16 bytes / align 8) for `alloc`/`realloc`, or a bare
+    // pointer (8 bytes) for `create`. Both have align 8, so the tag sits at +0 and
+    // the payload at +8 — matching `eu_payload_of`'s offset.
+    for i in 0..eu_result.len() {
+        if eu_result[i].is_some() {
+            let payload_size: u64 = if result_is_slice[i] { 16 } else { 8 };
+            let align = 8u64;
+            let payload_off = layout::round_up(2, align);
+            let size = layout::round_up(payload_off + payload_size, align);
+            home_size[i] = Some((size, align));
+        }
+    }
+}
+
+/// Appends every `Place` referenced by an rvalue's operands/places into `out`.
+fn collect_rvalue_places<'a>(rvalue: &'a Rvalue, out: &mut Vec<&'a Place>) {
+    let push_op = |op: &'a Operand, out: &mut Vec<&'a Place>| {
+        if let Operand::Copy(p) = op {
+            out.push(p);
+        }
+    };
+    match rvalue {
+        Rvalue::Use(op) => push_op(op, out),
+        Rvalue::Ref { place, .. } => out.push(place),
+        Rvalue::Discriminant { operand, .. } => push_op(operand, out),
+        Rvalue::Binary { lhs, rhs, .. } => {
+            push_op(lhs, out);
+            push_op(rhs, out);
+        }
+        Rvalue::Unary { operand, .. } => push_op(operand, out),
+        Rvalue::Cast { operand, .. } => push_op(operand, out),
+        Rvalue::Call { args, .. } | Rvalue::Intrinsic { args, .. } => {
+            for a in args {
+                push_op(a, out);
+            }
+        }
+        Rvalue::Aggregate { fields, .. } => {
+            for f in fields {
+                push_op(f, out);
+            }
+        }
+        Rvalue::MakeSlice {
+            ptr, offset, len, ..
+        } => {
+            push_op(ptr, out);
+            push_op(offset, out);
+            push_op(len, out);
+        }
+        Rvalue::MakeSome(op, _) | Rvalue::MakeOk(op, _) => push_op(op, out),
+        Rvalue::MakeNull(_) | Rvalue::MakeErr(_, _) => {}
     }
 }
 

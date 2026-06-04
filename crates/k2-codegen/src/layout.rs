@@ -99,6 +99,13 @@ fn layout_depth(arena: &TypeArena, ty: TypeId, depth: u32) -> Option<Layout> {
         Type::Bool => Some(Layout { size: 1, align: 1 }),
         Type::Void | Type::NoReturn => Some(Layout { size: 0, align: 1 }),
         Type::Pointer { .. } => Some(Layout { size: 8, align: 8 }),
+        // A capability / opaque handle (`Allocator`, a `*System`-derived token) is a
+        // word-sized scalar in the native model — the handle id flows through a
+        // register and is stored as an 8-byte value. Giving it a layout lets a
+        // monomorphized container that *holds* an allocator (e.g. `ArrayList`'s
+        // `alloc: Allocator` field) compute its struct layout, so the container is
+        // classified MEMORY (sret) rather than mistakenly returned in one register.
+        Type::Opaque(_) | Type::AnyOpaque => Some(Layout { size: 8, align: 8 }),
         Type::Slice { .. } => Some(Layout { size: 16, align: 8 }),
         Type::Optional(inner) => {
             let il = layout_depth(arena, inner, depth + 1)?;

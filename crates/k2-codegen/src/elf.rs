@@ -54,6 +54,10 @@ pub struct ElfImage {
     /// The virtual address of the `.rodata` blob (meaningful only when the
     /// program has read-only data; equals the text-segment end page otherwise).
     pub rodata_vaddr: u64,
+    /// The virtual address of the writable state segment (the allocator registry,
+    /// the deterministic clock counter, and the PRNG state), or `0` when the
+    /// program needs no state segment.
+    pub state_vaddr: u64,
 }
 
 /// Rounds `v` up to the next multiple of `align` (a power of two).
@@ -75,22 +79,41 @@ pub fn rodata_vaddr_for(text_len: usize) -> u64 {
     LOAD_BASE + rodata_off
 }
 
-/// Builds the complete ELF image from the finalized `.text` machine code and the
-/// concatenated `.rodata` bytes. When `rodata` is empty a single executable
-/// `PT_LOAD` is emitted (`e_phnum == 1`); otherwise a second read-only `PT_LOAD`
-/// maps `.rodata` (`e_phnum == 2`).
-pub fn write_elf(text: &[u8], rodata: &[u8]) -> ElfImage {
+/// Computes the virtual address the writable **state segment** loads at: the next
+/// page boundary after the end of `.rodata`. The state segment is a `.bss`-like
+/// `PT_LOAD` (`p_filesz = 0`, zero-mapped by the kernel) holding the allocator
+/// registry, the deterministic clock counter, and the PRNG state. Like the rodata
+/// address, it is computable up-front from the text + rodata lengths so the
+/// runtime routines' absolute `mov r64, imm64` state pointers can be patched.
+pub fn state_vaddr_for(text_len: usize, rodata_len: usize) -> u64 {
+    let rodata_off = round_up(PAGE + text_len as u64, PAGE);
+    let rodata_end_off = rodata_off + rodata_len as u64;
+    let state_off = round_up(rodata_end_off, PAGE);
+    LOAD_BASE + state_off
+}
+
+/// Builds the complete ELF image from the finalized `.text` machine code, the
+/// concatenated `.rodata` bytes, and the writable state segment size (the
+/// allocator registry / clock / RNG `.bss`). A single executable `PT_LOAD` is
+/// always emitted; a read-only `PT_LOAD` for `.rodata` and a read-write `PT_LOAD`
+/// for the zero-mapped state segment are added when nonzero. `e_phnum` is sized
+/// accordingly.
+pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
     let has_rodata = !rodata.is_empty();
-    let phnum: u16 = if has_rodata { 2 } else { 1 };
+    let has_state = state_size > 0;
+    let phnum: u16 = 1 + u16::from(has_rodata) + u16::from(has_state);
 
     // File offsets / virtual addresses. The headers occupy the first page; the
     // text begins at the second page; rodata (if any) at the next page after
-    // the text body.
+    // the text body; the state .bss on the next page after rodata.
     let text_off = PAGE;
     let text_vaddr = TEXT_VADDR;
     let text_end_off = text_off + text.len() as u64;
     let rodata_off = round_up(text_end_off, PAGE);
     let rodata_vaddr = LOAD_BASE + rodata_off;
+    let rodata_end_off = rodata_off + rodata.len() as u64;
+    let state_off = round_up(rodata_end_off, PAGE);
+    let state_vaddr = if has_state { LOAD_BASE + state_off } else { 0 };
 
     // The text segment maps the file from offset 0 (so the headers are in the
     // image) through the end of the text bytes.
@@ -143,6 +166,22 @@ pub fn write_elf(text: &[u8], rodata: &[u8]) -> ElfImage {
             /* p_memsz  */ rodata.len() as u64,
         );
     }
+    if has_state {
+        // State segment (R + W), a zero-mapped `.bss`: `p_filesz = 0`, so the
+        // kernel maps `p_memsz` zero-filled bytes with no file bytes added. Holds
+        // the allocator registry, the clock counter, and the PRNG state. The
+        // `p_offset` is page-aligned and equal mod PAGE to `p_vaddr` (both land on a
+        // page boundary), satisfying the kernel's alignment invariant.
+        push_phdr(
+            &mut bytes,
+            /* p_type   */ 1, // PT_LOAD
+            /* p_flags  */ 6, // PF_R | PF_W
+            /* p_offset */ state_off,
+            /* p_vaddr  */ state_vaddr,
+            /* p_filesz */ 0,
+            /* p_memsz  */ state_size,
+        );
+    }
 
     // ---- Pad to the text file offset, then emit .text ----
     debug_assert!(
@@ -162,6 +201,7 @@ pub fn write_elf(text: &[u8], rodata: &[u8]) -> ElfImage {
         bytes,
         text_vaddr,
         rodata_vaddr,
+        state_vaddr,
     }
 }
 

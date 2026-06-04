@@ -540,7 +540,7 @@ fn layout_oracle_scalar_sizes() {
 #[test]
 fn elf_header_invariants_text_only() {
     // A single `nop` with no rodata -> one PT_LOAD.
-    let img = crate::elf::write_elf(&[0x90], &[]);
+    let img = crate::elf::write_elf(&[0x90], &[], 0);
     let b = &img.bytes;
     // Magic + class/data/version/osabi.
     assert_eq!(&b[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -563,7 +563,7 @@ fn elf_header_invariants_text_only() {
 #[test]
 fn elf_program_headers_two_segments() {
     // Code + a rodata string -> two PT_LOADs.
-    let img = crate::elf::write_elf(&[0x90, 0x90], b"hi\n");
+    let img = crate::elf::write_elf(&[0x90, 0x90], b"hi\n", 0);
     let b = &img.bytes;
     assert_eq!(u16::from_le_bytes([b[56], b[57]]), 2); // e_phnum == 2
 
@@ -717,8 +717,27 @@ mod exec {
             }
         };
         let _ = std::fs::remove_file(&path);
-        let code = out.status.code().unwrap_or(-1);
+        // Mirror the `k2c run-native` driver's exit-code convention: a normal exit
+        // yields its code, while a signal death yields `128 + signo` (the shell
+        // convention) so a SIGSEGV (139) is distinguishable from a clean k2
+        // panic-trap (134) — otherwise `ExitStatus::code()` is `None` for a
+        // signalled child and the harness would report `-1`, hiding the signal.
+        let code = native_exit_code(&out.status);
         (code, out.stdout, out.stderr)
+    }
+
+    /// The exit code a native run reports, matching `k2c`'s `native_exit_code`: a
+    /// normal exit is its code; a signal-killed child is `128 + signo` (so a
+    /// SIGSEGV is `139`, a SIGFPE `136`, etc.).
+    fn native_exit_code(st: &std::process::ExitStatus) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = st.code() {
+            code
+        } else if let Some(signo) = st.signal() {
+            128 + signo
+        } else {
+            134
+        }
     }
 
     /// Runs `prog` on the VM, returning `(exit_code, stdout, stderr)`.
@@ -1778,5 +1797,400 @@ mod exec {
         assert_eq!(assert_native_eq_vm(&prog), 0);
         let (_c, out, _e) = run_native(&prog);
         assert_eq!(out, b"x=43\n");
+    }
+
+    // =====================================================================
+    //  v0.16 — the native `*System` runtime (heap / clock / random / env)
+    // =====================================================================
+
+    /// Reads an `examples/*.k2` source file relative to this crate.
+    fn read_example(name: &str) -> String {
+        let path = format!("{}/../../examples/{}.k2", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
+
+    #[test]
+    fn diff_errors_k2_exact_output() {
+        // HARD ACCEPTANCE: examples/errors.k2 native == VM (stdout + exit), driven
+        // by the native heap (`create`/`destroy` via the mmap allocator), the
+        // error-union try/catch/errdefer machinery, `@errorName`, and `{s:>14}`
+        // width/alignment formatting.
+        let prog = lower(&read_example("errors"));
+        let (n_code, n_out, _n_err) = run_native(&prog);
+        let (v_code, v_out, _v_err) = run_vm(&prog);
+        assert_eq!(n_out, v_out, "errors.k2 stdout native==VM");
+        assert_eq!(n_code, v_code, "errors.k2 exit native==VM");
+        assert_eq!(n_code, 0);
+        assert!(
+            String::from_utf8_lossy(&n_out).contains("doubled(\"21\") = 42"),
+            "errors.k2 produced its expected first line"
+        );
+    }
+
+    #[test]
+    fn diff_heap_create_destroy_roundtrip() {
+        // `create(T)` returns a real heap pointer (mmap-backed); store, deref, free.
+        let prog = lower(&main_io(
+            "const a = sys.heap; const p: *u64 = try a.create(u64); \
+             p.* = 0xDEAD_BEEF; try o.print(\"v={d}\\n\", .{p.*}); a.destroy(p);",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, format!("v={}\n", 0xDEAD_BEEFu64).into_bytes());
+    }
+
+    #[test]
+    fn diff_heap_alloc_free_roundtrip() {
+        // A `[]u64` slice from the default allocator: fill `i*i`, sum, print, free.
+        let prog = lower(&main_io(
+            "const a = sys.heap; const xs: []u64 = try a.alloc(u64, 16); \
+             defer a.free(xs); \
+             for (xs, 0..) |*slot, i| { const v: u64 = @intCast(i); slot.* = v * v; } \
+             var sum: u64 = 0; for (xs) |x| sum += x; \
+             try o.print(\"sum={d} last={d}\\n\", .{ sum, xs[15] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 0^2+..+15^2 = 1240, 15^2 = 225.
+        assert_eq!(out, b"sum=1240 last=225\n");
+    }
+
+    #[test]
+    fn diff_gpa_no_leak_clean() {
+        // The GPA's no-leak path: alloc + free everything, `deinit()` reports
+        // `false`, no panic, exit 0 — native == VM.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const a = gpa.allocator(); \
+             const p: *u32 = try a.create(u32); p.* = 7; \
+             try o.print(\"v={d}\\n\", .{p.*}); a.destroy(p); \
+             const leaked = gpa.deinit(); \
+             try o.print(\"leaked={d}\\n\", .{leaked});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"v=7\nleaked=0\n");
+    }
+
+    #[test]
+    fn diff_gpa_leak_detected_panics() {
+        // The GPA's leak path: an allocation escapes the free (guarded by a
+        // runtime-false branch so the static leak checker admits it), so
+        // `gpa.deinit()` reports `true` and `@panic` traps (exit 134) — native ==
+        // VM. This exercises the runtime leak counter end-to-end.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const a = gpa.allocator(); \
+             const p: *u32 = try a.create(u32); p.* = 1; \
+             var keep: bool = (p.* == 1); \
+             if (not keep) { a.destroy(p); } \
+             const leaked = gpa.deinit(); \
+             if (leaked) @panic(\"memory leak detected at shutdown\"); \
+             try o.print(\"unreached\\n\", .{});",
+        ));
+        let (n_code, _n_out, _n_err) = run_native(&prog);
+        let (v_code, _v_out, _v_err) = run_vm(&prog);
+        assert_eq!(n_code, v_code, "leak panic exit native==VM");
+        assert_eq!(n_code, 134, "a detected leak @panics (exit 134)");
+    }
+
+    #[test]
+    fn diff_double_free_traps() {
+        // Freeing the same GPA pointer twice traps (exit 134) on both backends.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const a = gpa.allocator(); \
+             const p: *u32 = try a.create(u32); p.* = 1; \
+             a.destroy(p); a.destroy(p); \
+             const leaked = gpa.deinit(); _ = leaked; \
+             try o.print(\"unreached\\n\", .{});",
+        ));
+        let (n_code, _n_out, _n_err) = run_native(&prog);
+        let (v_code, _v_out, _v_err) = run_vm(&prog);
+        assert_eq!(v_code, 134, "VM double-free traps");
+        assert_eq!(n_code, 134, "native double-free traps == VM");
+    }
+
+    #[test]
+    fn diff_clock_and_random_are_deterministic() {
+        // The deterministic clock (advanced only by sleep) and the reproducible
+        // splitmix64 PRNG must produce the exact same values native == VM.
+        let prog = lower(&main_io(
+            "const t0 = sys.clock.now(); sys.clock.sleep(1000); \
+             const t1 = sys.clock.now(); \
+             const r0 = sys.random.int(); const r1 = sys.random.int(); \
+             try o.print(\"t0={d} t1={d} r0={d} r1={d}\\n\", .{ t0, t1, r0, r1 });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_random_bytes_match_vm() {
+        // `sys.random.bytes(&buf)` fills a buffer with the same reproducible bytes.
+        let prog = lower(&main_io(
+            "var buf: [8]u8 = undefined; sys.random.bytes(&buf); \
+             var sum: u32 = 0; for (buf) |b| sum += @intCast(b); \
+             try o.print(\"sum={d} b0={d} b7={d}\\n\", .{ sum, buf[0], buf[7] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_env_get_absent() {
+        // Offline-absent env: `sys.env.get(...)` yields `null` on both backends.
+        let prog = lower(&main_io(
+            "const v = sys.env.get(\"PATH\"); \
+             const present: u8 = if (v == null) 0 else 1; \
+             try o.print(\"present={d}\\n\", .{present});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"present=0\n");
+    }
+
+    #[test]
+    fn diff_arraylist_u32_growth() {
+        // A word-scalar generic container DOES run natively: `ArrayList(u32)` grows
+        // its heap backing via `realloc` and the field-slice word stride keeps the
+        // shared `deferred`-element methods and the concrete reader in agreement.
+        let prog = lower(&main_io(
+            "var list = std.ArrayList(u32).init(sys.heap); \
+             defer list.deinit(); \
+             var i: u32 = 0; while (i < 10) : (i += 1) { try list.append(i * i); } \
+             try o.print(\"len={d} a3={d} a9={d}\\n\", \
+                .{ list.items.len, list.items[3], list.items[9] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 3*3=9, 9*9=81.
+        assert_eq!(out, b"len=10 a3=9 a9=81\n");
+    }
+
+    #[test]
+    fn refuse_generic_aggregate_container_cleanly() {
+        // A generic container that grows a heap slice (`ArrayList`/`List`) is the
+        // un-monomorphized case the v0.16 backend cleanly REFUSES (so the program
+        // runs on the VM) rather than miscompiling. A generic container of an
+        // *aggregate* element (`ArrayList([]const u8)`) cannot ride the shared
+        // scalar `deferred` value-parameter ABI losslessly, so it is refused. The
+        // refusal is an `Err`, never a panic or a wrong ELF.
+        let prog = lower(&main_io(
+            "var list = std.ArrayList([]const u8).init(sys.heap); \
+             defer list.deinit(); \
+             try list.append(\"hello\"); \
+             try o.print(\"len={d}\\n\", .{list.items.len});",
+        ));
+        let r = crate::compile_program_to_elf(&prog);
+        assert!(
+            matches!(r, Err(crate::CodegenError::Unsupported(_))),
+            "a generic aggregate-element heap container must be cleanly refused"
+        );
+        assert!(r.is_err());
+        // And it still runs on the VM.
+        let (v_code, _v_out, _v_err) = run_vm(&prog);
+        assert_eq!(v_code, 0, "the refused program runs fine on the VM");
+    }
+
+    // ---------------------------------------------------------------------
+    //  v0.16 native-runtime defect regressions (realloc/deinit live-list,
+    //  the @allocId registry cap, and full-fidelity use-after-free)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn diff_gpa_realloc_then_deinit_no_segfault() {
+        // REGRESSION: a non-null `realloc` under a TRACKED GeneralPurposeAllocator
+        // followed by `gpa.deinit()` used to print the correct value then SIGSEGV
+        // (native exit 139) while the VM exits 0 — the freed old block was
+        // munmap-ed eagerly but left threaded on the slot's `live_head`, so the
+        // deinit reclamation walk dereferenced unmapped memory. After the fix the
+        // old block is unlinked (and kept mapped) on free, so teardown is clean.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             defer { const l = gpa.deinit(); if (l) @panic(\"leak\"); } \
+             const al = gpa.allocator(); \
+             var xs: []u64 = try al.alloc(u64, 4); \
+             xs = try al.realloc(xs, 10); \
+             xs[9] = 99; \
+             try o.print(\"xs[9]={d}\\n\", .{xs[9]}); \
+             al.free(xs);",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"xs[9]=99\n");
+    }
+
+    #[test]
+    fn diff_arraylist_u32_growth_on_gpa_deinit() {
+        // REGRESSION: the canonical `std.ArrayList` growth + leak-checking GPA
+        // pattern. `ArrayList(u32)` on a *GeneralPurposeAllocator* (not the
+        // untracked `sys.heap`) grown well past its first `realloc` (multiple
+        // reallocs), then `list.deinit()` + `gpa.deinit()`. This is the exact
+        // shape that the v0.16 teardown SIGSEGV broke; it must now exit 0
+        // native == VM (the old `diff_arraylist_u32_growth` used `sys.heap` and
+        // missed the tracked-allocator path entirely).
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             defer { const l = gpa.deinit(); if (l) @panic(\"leak\"); } \
+             var list = std.ArrayList(u32).init(gpa.allocator()); \
+             defer list.deinit(); \
+             var i: u32 = 0; while (i < 40) : (i += 1) { try list.append(i * i); } \
+             try o.print(\"len={d} a3={d} a39={d}\\n\", \
+                .{ list.items.len, list.items[3], list.items[39] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 3*3=9, 39*39=1521.
+        assert_eq!(out, b"len=40 a3=9 a39=1521\n");
+    }
+
+    #[test]
+    fn diff_arena_realloc_then_deinit_no_segfault() {
+        // REGRESSION: the same dangling-live-list crash on an ArenaAllocator —
+        // `alloc` then `realloc` then `arena.deinit()` used to SIGSEGV (139) vs
+        // VM 0. The arena realloc-old block is now unlinked from the bulk-free
+        // list (mirroring the VM's `retrack_realloc`) before teardown.
+        let prog = lower(&main_io(
+            "var arena = std.heap.ArenaAllocator.init(sys.heap); \
+             const a = arena.allocator(); \
+             var xs: []u64 = try a.alloc(u64, 4); \
+             xs = try a.realloc(xs, 10); \
+             xs[9] = 7; \
+             try o.print(\"xs[9]={d}\\n\", .{xs[9]}); \
+             arena.deinit();",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"xs[9]=7\n");
+    }
+
+    #[test]
+    fn diff_gpa_realloc_then_leak_still_detected() {
+        // The realloc fix must not weaken leak detection: a `realloc`-ed block left
+        // unfreed (guarded by a runtime-false branch so the static leak checker
+        // admits it) must still make `gpa.deinit()` report `true` — native == VM.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const al = gpa.allocator(); \
+             var xs: []u64 = try al.alloc(u64, 4); \
+             xs = try al.realloc(xs, 10); \
+             var keep: bool = (xs[0] == 0); \
+             if (not keep) { al.free(xs); } \
+             const l = gpa.deinit(); \
+             try o.print(\"leaked={d}\\n\", .{l});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"leaked=1\n");
+    }
+
+    #[test]
+    fn diff_double_free_after_realloc_traps() {
+        // The realloc fix must not weaken double-free detection: freeing a
+        // realloc-ed block twice must trap cleanly (exit 134) — native == VM.
+        let prog = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const al = gpa.allocator(); \
+             var xs: []u64 = try al.alloc(u64, 4); \
+             xs = try al.realloc(xs, 10); \
+             al.free(xs); al.free(xs); \
+             try o.print(\"unreached\\n\", .{}); \
+             _ = gpa.deinit();",
+        ));
+        let (n_code, _n_out, _n_err) = run_native(&prog);
+        let (v_code, _v_out, _v_err) = run_vm(&prog);
+        assert_eq!(n_code, v_code, "double-free-after-realloc exit native==VM");
+        assert_eq!(n_code, 134, "double free traps (exit 134)");
+    }
+
+    #[test]
+    fn alloc_id_registry_cap_traps_cleanly() {
+        // REGRESSION: `@allocId` minted handles via `reg_next++` with no bound
+        // check, so the 256th+ allocator scribbled past the writable state PT_LOAD
+        // and eventually SIGSEGV'd (139). A program creating more allocators than
+        // the registry holds must now TRAP CLEANLY (a deterministic non-139 refusal
+        // with a message) rather than corrupt memory / segfault. (The VM is
+        // unbounded; this is a documented native cap, so the exit codes differ —
+        // the contract here is "no scribble, no segfault", which we assert.)
+        let prog = lower(&main_io(
+            "var acc: u64 = 0; var i: u64 = 0; \
+             while (i < 400) : (i += 1) { \
+                var arena = std.heap.ArenaAllocator.init(sys.heap); \
+                const a = arena.allocator(); \
+                const p: *u64 = try a.create(u64); p.* = i; acc += p.*; \
+                arena.deinit(); } \
+             try o.print(\"acc={d}\\n\", .{acc});",
+        ));
+        let (n_code, _n_out, n_err) = run_native(&prog);
+        assert_eq!(
+            n_code, 134,
+            "exceeding the registry cap traps cleanly (exit 134), never segfaults (139)"
+        );
+        assert_ne!(n_code, 139, "must not segfault");
+        assert!(
+            String::from_utf8_lossy(&n_err).contains("too many allocators"),
+            "the cap trap reports its cause"
+        );
+        // The VM, being unbounded, runs the same program to completion.
+        let (v_code, v_out, _v_err) = run_vm(&prog);
+        assert_eq!(v_code, 0, "the VM has no registry cap");
+        assert_eq!(v_out, b"acc=79800\n");
+    }
+
+    #[test]
+    fn alloc_id_registry_just_under_cap_ok() {
+        // The bound must not be over-eager: 250 short-lived allocators (well under
+        // REG_MAX = 256) still run to completion, native == VM, exit 0.
+        let prog = lower(&main_io(
+            "var acc: u64 = 0; var i: u64 = 0; \
+             while (i < 250) : (i += 1) { \
+                var arena = std.heap.ArenaAllocator.init(sys.heap); \
+                const a = arena.allocator(); \
+                const p: *u64 = try a.create(u64); p.* = i; acc += p.*; \
+                arena.deinit(); } \
+             try o.print(\"acc={d}\\n\", .{acc});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"acc=31125\n");
+    }
+
+    #[test]
+    fn uaf_read_traps_full_payload_native() {
+        // REGRESSION + documented-behavior assertion: a use-after-free read of a
+        // freed GPA payload must now FAULT for any block size and any offset (the
+        // payload is page-isolated and mprotected PROT_NONE in full). Previously a
+        // read of the first payload page (e.g. `xs[0]`) returned stale data with
+        // exit 0; now it traps. The native fault maps to 139 and the VM's clean
+        // `use after free` panic to 134 (the documented exit-code narrowing) — both
+        // die, neither returns stale data with exit 0.
+        //
+        // Small block (4 u32): the historically-untrapped case.
+        let small = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const al = gpa.allocator(); \
+             var xs: []u32 = try al.alloc(u32, 4); \
+             xs[0] = 48; al.free(xs); \
+             try o.print(\"v={d}\\n\", .{xs[0]}); \
+             const l = gpa.deinit(); _ = l;",
+        ));
+        let (n_small, _no, _ne) = run_native(&small);
+        let (v_small, _vo, _ve) = run_vm(&small);
+        assert_eq!(n_small, 139, "native UAF on a small block faults (139)");
+        assert_eq!(v_small, 134, "VM UAF panics (134)");
+
+        // Multi-page block (2000 u64), read at offset 0 — the case the old
+        // narrowing left readable.
+        let big = lower(&main_io(
+            "var gpa = std.heap.GeneralPurposeAllocator.init(sys); \
+             const al = gpa.allocator(); \
+             var xs: []u64 = try al.alloc(u64, 2000); \
+             xs[0] = 5; al.free(xs); \
+             try o.print(\"v={d}\\n\", .{xs[0]}); \
+             const l = gpa.deinit(); _ = l;",
+        ));
+        let (n_big, _no, _ne) = run_native(&big);
+        let (v_big, _vo, _ve) = run_vm(&big);
+        assert_eq!(n_big, 139, "native UAF on a multi-page block faults (139)");
+        assert_eq!(v_big, 134, "VM UAF panics (134)");
     }
 }

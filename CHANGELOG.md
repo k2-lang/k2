@@ -148,12 +148,100 @@ is being designed in the open and nothing is stable yet.
   exit code + stdout, **differentially against `k2c run`**) are gated to
   `x86_64`-Linux so CI exercises them while other hosts still build.
 
+- **Native `*System` runtime — heap / clock / random / env via raw syscalls
+  (v0.16).** `k2-codegen` now implements the `*System` capability floor in native
+  machine code over **raw Linux x86-64 syscalls** (no libc, no crates), so
+  heap-using programs run native == VM. A new `runtime` module emits hand-written
+  support routines appended to `.text` (reached through a new `FixupKind::Runtime`
+  relocation) plus a third, zero-mapped writable `PT_LOAD` (`p_filesz = 0`)
+  holding the allocator registry, the deterministic clock counter, and the PRNG
+  state (addressed via a new `FixupKind::State`):
+  - an **`mmap`-backed heap** (`mmap`/`munmap`/`mprotect`, syscalls 9/11/10): one
+    page-rounded region per allocation, prefixed by a **page-sized header**
+    (`magic`/`total_len`/`payload_len`/`owner`/`live`/`next` in its first 40 bytes)
+    so the payload starts on its own page boundary, handing back a real
+    page-aligned payload address the existing pointer/slice codegen uses unchanged;
+  - the **handle-based allocator registry** exactly mirroring the VM
+    (`Default`/`GPA`/`Arena`/`FixedBuffer`): `@allocId`/`@allocHandle` mint and
+    name handles, `create`/`alloc`/`free`/`realloc`/`destroy` dispatch on the
+    handle, the `FixedBuffer` bumps a caller buffer (returning a real
+    `error.OutOfMemory` on exhaustion), and the `Arena` bulk-frees on deinit. The
+    registry has a fixed **`REG_MAX = 256`** slots (it lives in one page-rounded
+    writable `PT_LOAD`); minting beyond it **traps cleanly** (`panic: too many
+    allocators` + exit 134) rather than scribbling past the mapping. (The VM grows
+    its allocator table unboundedly, so this hard cap is a documented native
+    narrowing — never a wrong result, only a deterministic refusal.)
+  - **GPA leak + double-free + use-after-free detection** matching the VM
+    *observably*: `gpa.deinit()` returns whether anything leaked (so a leaking
+    variant `@panic`s in Debug → clean exit 134), a double / invalid free traps
+    (clean `panic: …` + exit 134); on free the whole payload is page-isolated and
+    `mprotect`-ed `PROT_NONE`, so a use-after-free read or write — **at any offset,
+    for any block size** — faults (**narrowing:** native UAF dies on `SIGSEGV` →
+    exit 139 rather than the VM's clean 134; the acceptance corpus never commits a
+    UAF on its success path, so its exit codes still match). A tracked-allocator
+    `free`/`realloc` **unlinks** the freed block from the slot's live list and
+    keeps it mapped (mirroring the VM's `retain`), so the single `deinit`
+    reclamation walk is consistent and teardown never faults;
+  - the **deterministic clock** (a monotonic counter advanced only by `sleep`, not
+    `clock_gettime`) and the **reproducible splitmix64 PRNG** (re-implemented from
+    the VM's seed, not `getrandom`), plus **offline-absent `env`** — all
+    byte-identical native == VM;
+  - the `_start` shim seeds the PRNG and the default-allocator slot before `main`;
+    `ReleaseFast` strips the GPA tracking exactly like the VM's `checks_off`.
+  Also new on the native path: `print` width/alignment padding (`{s:>14}`),
+  `@errorName` (a `.rodata` name table), nested `[]const u8` array/struct literals,
+  `MakeSlice` into a projected place, and a **field-slice word stride** that lets a
+  *word-scalar generic container* — `std.ArrayList(u32)` / `List(u32)` — run
+  natively: because the MIR shares one `deferred`-element method body across every
+  `T`, the container's backing-store slice (reached through a struct field) is
+  addressed in word-sized slots in both the generic methods and the concrete
+  reader, so they agree (a standalone / array-view slice keeps its natural stride).
+  **Acceptance:** `examples/errors.k2` (heap `create`/`destroy` + try/errdefer),
+  `examples/allocators.k2` (leak-checking GPA + `ArrayList` + arena + a raw slice),
+  and `examples/hello.k2` run **byte-identically native == VM** (verified by
+  running the emitted binaries); the GPA leak detector works natively in both
+  directions; and a differential corpus (alloc/free/create/destroy round-trips,
+  `ArrayList(u32)` growth, leak / double-free traps, clock/random determinism, env)
+  matches the VM. **Documented refusals (never miscompiled, fall to `k2c run`):** a
+  generic container of an *aggregate* element — `List([]const u8)`, whose `> 8`-byte
+  element cannot ride the shared scalar `deferred` value-parameter ABI losslessly
+  (so `examples/generic_list.k2`, which instantiates `List([]const u8)`, stays
+  VM-only this milestone) — plus the concurrency scheduler and the `*Build`
+  capability, each surfaced as a clean `Unsupported` naming the construct.
+
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security
   policies, dual MIT / Apache-2.0 licensing, and a development roadmap.
 
 ### Fixed
 
+- **Native heap: `realloc`/`free` + `deinit` teardown SIGSEGV (v0.16
+  blocker).** A non-null `realloc` (or a `free`) through a TRACKED allocator
+  (`GeneralPurposeAllocator` / `ArenaAllocator`) `munmap`-ed the old block
+  immediately but left it threaded on the slot's intrusive `live_head` list; the
+  single `deinit` reclamation walk then dereferenced that already-unmapped node
+  and faulted (native exit 139) while the VM exited 0. The block is now **unlinked
+  from `live_head` before reclamation and kept mapped** (matching the VM's
+  `st.live.retain(...)` in `alloc_free`/`retrack_realloc`), so a freed/realloc-old
+  block never feeds the teardown walk. The canonical pattern — `std.ArrayList`
+  grown on a `GeneralPurposeAllocator` past its first `realloc`, then
+  `list.deinit()` + `gpa.deinit()` — now exits 0 native == VM (the same fix covers
+  the `ArenaAllocator` realloc + `arena.deinit()` path); leak and double-free
+  detection across a `realloc` are unaffected.
+- **Native `@allocId` registry overflow (v0.16 blocker).** `@allocId` minted
+  handles via `reg_next++` with no bound check against the fixed `REG_MAX = 256`
+  registry, so the 256th+ allocator scribbled past the writable state `PT_LOAD`
+  and eventually segfaulted. `emit_alloc_id` now **bound-checks** the handle and
+  traps cleanly (`panic: too many allocators` + exit 134) before writing out of
+  bounds, converting silent corruption into a deterministic refusal.
+- **Native use-after-free now traps for every freed payload.** Previously the
+  freed payload was `mprotect`-ed `PROT_NONE` only over `[hdr+PAGE, hdr+total_len)`
+  (and skipped entirely for sub-2-page blocks), leaving the first ~4 KB of payload
+  readable — so a UAF read of `xs[0]` (or of any block ≤ 1 page) returned stale
+  data with exit 0 instead of faulting like the VM. The header now occupies a full
+  page so the payload is page-isolated, and `free` `mprotect`s the **entire**
+  payload span: any UAF read/write, at any offset and any size, now faults (native
+  139 vs the VM's clean 134), as the documented narrowing claims.
 - **`k2-opt` inlining compile-time blow-up on cyclic call graphs.** Inlining
   accounting is now program-global: the recursion / global / per-caller inline
   budgets are threaded across every outer pass-manager iteration (previously the
