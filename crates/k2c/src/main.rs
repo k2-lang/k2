@@ -41,6 +41,7 @@ mod build_cmd;
 mod imports;
 mod lock;
 mod multi;
+mod render;
 
 use std::env;
 use std::fs;
@@ -52,15 +53,15 @@ use std::path::Path;
 use k2_codegen::Target;
 use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
-use k2_mir::{dump_mir, lower_program, BuildMode, MirProgram, Severity as MirSeverity};
+use k2_mir::{dump_mir, lower_program, BuildMode, MirProgram};
 use k2_opt::{optimize, OptLevel, OptStats};
-use k2_parse::{parse, to_sexpr, ParseResult, Severity};
+use k2_parse::{parse, to_sexpr, ParseResult};
 use k2_resolve::{
     dump_resolution, dump_scopes, resolve_file, resolve_module, FileLoader, LoadError,
-    ResolvedModule, Severity as ResolveSeverity,
+    ResolvedModule,
 };
 use k2_syntax::{Expr, Item, SourceFile, Span};
-use k2_types::{check_file, dump_signatures, dump_types, Severity as TypeSeverity};
+use k2_types::{check_file, dump_signatures, dump_types};
 use k2_vm::{run_metered, run_program, RunArgs, RunOutcome};
 
 /// Program name used in diagnostics and the usage text.
@@ -145,9 +146,107 @@ fn parse_program(source: &str) -> ParseResult {
     }
     combined.push_str(&k2_std::std_root_item_source());
 
+    // The user/std boundary: any diagnostic whose span starts at/after this char
+    // offset is about the *appended* std prelude, not the user's code — its raw
+    // line/col and `found <std-token>` text would leak std internals into a
+    // user-facing message. We re-anchor every such diagnostic to end-of-user-input.
+    let boundary = source.chars().count() as u32;
+
     let mut result = k2_parse::parse(&combined);
+    clamp_diagnostics_to_user_source(&mut result.diagnostics, source, boundary);
     rewrite_std_imports(&mut result.file);
     result
+}
+
+/// Re-anchors every diagnostic that points into the *appended* std prelude back
+/// into the user's source, so a parse error at end-of-user-input never leaks std
+/// line numbers or internal names ([`k2_std::STD_ROOT_NAME`]).
+///
+/// A diagnostic whose primary span starts at/after `boundary` arose because the
+/// parser ran off the end of the user's (truncated) source into the std body. We
+/// treat it as the end-of-input error it really is: clamp its span (and every
+/// label's span) to the end of the user source, and rewrite any message/label
+/// text that names a std token so the user sees a clean "unexpected end of input"
+/// instead of `` found identifier `__k2_std_root` `` at a phantom line.
+fn clamp_diagnostics_to_user_source(
+    diags: &mut [k2_parse::Diagnostic],
+    source: &str,
+    boundary: u32,
+) {
+    let (end_line, end_col) = end_of_source_line_col(source);
+    let end_span = Span::point(boundary, end_line, end_col);
+    for d in diags.iter_mut() {
+        let leaks = d.span.start >= boundary
+            || d.message.contains(k2_std::STD_ROOT_NAME)
+            || d.labels.iter().any(|l| l.span.start >= boundary);
+        if !leaks {
+            continue;
+        }
+        // Re-anchor the primary span to end-of-user-input.
+        if d.span.start >= boundary {
+            d.span = end_span;
+        }
+        // Drop labels that point into the std region; clamp any that straddle.
+        d.labels.retain(|l| l.span.start < boundary);
+        for l in &mut d.labels {
+            if l.span.end > boundary {
+                l.span.end = boundary;
+            }
+        }
+        // Scrub any std-internal token name from the visible text.
+        d.message = clean_eof_message(&d.message);
+        scrub_std_name(&mut d.primary_label);
+        for l in &mut d.labels {
+            scrub_std_name(&mut l.message);
+        }
+        for n in &mut d.notes {
+            scrub_std_name(n);
+        }
+        if let Some(h) = &mut d.help {
+            scrub_std_name(h);
+        }
+    }
+}
+
+/// The 1-based `(line, col)` of the position just past the last char of `source`
+/// (the end-of-input caret position): one past the final line's last column.
+fn end_of_source_line_col(source: &str) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for c in source.chars() {
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Rewrites a parser message that ran into the std prelude into a clean
+/// end-of-input message. Parser messages have the shape
+/// `expected <X> <ctx>, found <token>`; the `found <token>` part now names a std
+/// token, so we replace it with `found end of input`. Messages with no `, found`
+/// clause that still mention the std root are replaced wholesale.
+fn clean_eof_message(message: &str) -> String {
+    if let Some(idx) = message.rfind(", found ") {
+        let mut out = message[..idx].to_string();
+        out.push_str(", found end of input");
+        return out;
+    }
+    if message.contains(k2_std::STD_ROOT_NAME) {
+        return "unexpected end of input".to_string();
+    }
+    message.to_string()
+}
+
+/// Replaces any occurrence of the internal std-root name with a neutral
+/// `end of input` so it never surfaces in a user-facing label/note.
+fn scrub_std_name(text: &mut String) {
+    if text.contains(k2_std::STD_ROOT_NAME) {
+        *text = text.replace(k2_std::STD_ROOT_NAME, "end of input");
+    }
 }
 
 /// Re-points every user `const X = @import("std")` binding to the synthetic std
@@ -245,26 +344,11 @@ fn cmd_parse(args: &[String]) -> Result<ExitCode, String> {
         print!("{tree}");
     }
 
-    // Diagnostics go to stderr, formatted `label:line:col: severity: message`.
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &result.diagnostics {
-        let sev = match diag.severity {
-            Severity::Error => {
-                error_count += 1;
-                "error"
-            }
-            Severity::Warning => "warning",
-        };
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
+    // Diagnostics go to stderr, rendered in the rich caret format.
+    let error_count = render::emit_diags(&label, &source, &result.diagnostics);
 
     if quiet {
+        let mut err = io::stderr().lock();
         let _ = writeln!(
             err,
             "# {} item(s), {} diagnostic(s)",
@@ -317,16 +401,11 @@ fn cmd_fmt(args: &[String]) -> Result<ExitCode, String> {
     let (source, label) = read_source(path)?;
     match format_source(&source) {
         Err(diags) => {
-            let stderr = io::stderr();
-            let mut err = stderr.lock();
-            for diag in &diags {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-            let _ = writeln!(err, "error: cannot format {label}: it has parse errors");
+            render::emit_diags(&label, &source, &diags);
+            let _ = writeln!(
+                io::stderr(),
+                "error: cannot format {label}: it has parse errors"
+            );
             Ok(ExitCode::FAILURE)
         }
         Ok(formatted) => {
@@ -391,23 +470,7 @@ fn cmd_ast(args: &[String]) -> Result<ExitCode, String> {
     };
     print!("{tree}");
 
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &result.diagnostics {
-        let sev = match diag.severity {
-            Severity::Error => {
-                error_count += 1;
-                "error"
-            }
-            Severity::Warning => "warning",
-        };
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
+    let error_count = render::emit_diags(&label, &source, &result.diagnostics);
 
     if error_count == 0 {
         Ok(ExitCode::SUCCESS)
@@ -462,28 +525,21 @@ fn cmd_resolve(args: &[String]) -> Result<ExitCode, String> {
 
     // Parse errors gate resolution: report them and stop, like `fmt`.
     if !pres.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &pres.diagnostics {
-            if diag.severity == Severity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot resolve {label}: it has parse errors");
+        render::emit_errors(&label, &source, &pres.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot resolve {label}: it has parse errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Resolve, either single-file or across the module graph.
     if modules {
         let rm = resolve_module(Path::new(path), &FsFileLoader);
-        finish_modules(&label, &rm, show_uses, quiet)
+        finish_modules(&label, &source, &rm, show_uses, quiet)
     } else {
         let r = resolve_file(&pres.file);
-        finish_single(&label, &r, show_uses, quiet)
+        finish_single(&label, &source, &r, show_uses, quiet)
     }
 }
 
@@ -491,25 +547,12 @@ fn cmd_resolve(args: &[String]) -> Result<ExitCode, String> {
 /// exit code.
 fn finish_single(
     label: &str,
+    source: &str,
     r: &k2_resolve::Resolved,
     show_uses: bool,
     quiet: bool,
 ) -> Result<ExitCode, String> {
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &r.diagnostics {
-        if diag.severity == ResolveSeverity::Error {
-            error_count += 1;
-        }
-        let sev = sev_word(diag.severity);
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
-    drop(err);
+    let error_count = render::emit_diags(label, source, &r.diagnostics);
 
     if error_count == 0 && !quiet {
         let dump = if show_uses {
@@ -537,46 +580,25 @@ fn finish_single(
 }
 
 /// Prints diagnostics + summary for a multi-file module resolution.
+///
+/// Graph-level diagnostics (missing files, import cycles) are rendered against
+/// the root source; each module's own diagnostics are rendered against *that*
+/// module's source, re-read from disk so the caret lands in the right file.
 fn finish_modules(
     label: &str,
+    source: &str,
     rm: &ResolvedModule,
     show_uses: bool,
     quiet: bool,
 ) -> Result<ExitCode, String> {
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
     let mut error_count = 0usize;
     // Graph-level diagnostics first, then each module's own.
-    for diag in &rm.diagnostics {
-        if diag.severity == ResolveSeverity::Error {
-            error_count += 1;
-        }
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {}: {}",
-            diag.span.line,
-            diag.span.col,
-            sev_word(diag.severity),
-            diag.message
-        );
-    }
+    error_count += render::emit_diags(label, source, &rm.diagnostics);
     for m in &rm.modules {
-        for diag in &m.resolved.diagnostics {
-            if diag.severity == ResolveSeverity::Error {
-                error_count += 1;
-            }
-            let _ = writeln!(
-                err,
-                "{}:{}:{}: {}: {}",
-                m.path.display(),
-                diag.span.line,
-                diag.span.col,
-                sev_word(diag.severity),
-                diag.message
-            );
-        }
+        let mod_label = m.path.display().to_string();
+        let mod_src = fs::read_to_string(&m.path).unwrap_or_default();
+        error_count += render::emit_diags(&mod_label, &mod_src, &m.resolved.diagnostics);
     }
-    drop(err);
 
     if error_count == 0 && !quiet {
         if let Some(root) = rm.root() {
@@ -601,15 +623,6 @@ fn finish_modules(
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::FAILURE)
-    }
-}
-
-/// The lowercase severity word used in the `label:line:col: sev: msg` format,
-/// for resolution diagnostics.
-fn sev_word(sev: ResolveSeverity) -> &'static str {
-    match sev {
-        ResolveSeverity::Error => "error",
-        ResolveSeverity::Warning => "warning",
     }
 }
 
@@ -651,59 +664,28 @@ fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
 
     // Parse errors gate type-checking: report them and stop, like `resolve`.
     if !pres.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &pres.diagnostics {
-            if diag.severity == Severity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot check {label}: it has parse errors");
+        render::emit_errors(&label, &source, &pres.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot check {label}: it has parse errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Resolution errors also gate type-checking.
     let resolved = resolve_file(&pres.file);
     if !resolved.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &resolved.diagnostics {
-            if diag.severity == ResolveSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot check {label}: it has resolution errors");
+        render::emit_errors(&label, &source, &resolved.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot check {label}: it has resolution errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     let typed = check_file(&pres.file, &resolved);
 
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &typed.diagnostics {
-        if diag.severity == TypeSeverity::Error {
-            error_count += 1;
-        }
-        let sev = match diag.severity {
-            TypeSeverity::Error => "error",
-            TypeSeverity::Warning => "warning",
-        };
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
-    drop(err);
+    let error_count = render::emit_diags(&label, &source, &typed.diagnostics);
 
     if error_count == 0 && !quiet {
         let dump = if show_uses {
@@ -812,54 +794,33 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
 
     // Parse errors gate lowering: report them and stop, like `check`.
     if !pres.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &pres.diagnostics {
-            if diag.severity == Severity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot lower {label}: it has parse errors");
+        render::emit_errors(&label, &source, &pres.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot lower {label}: it has parse errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Resolution errors also gate lowering.
     let resolved = resolve_file(&pres.file);
     if !resolved.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &resolved.diagnostics {
-            if diag.severity == ResolveSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot lower {label}: it has resolution errors");
+        render::emit_errors(&label, &source, &resolved.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot lower {label}: it has resolution errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Type errors also gate lowering.
     let typed = check_file(&pres.file, &resolved);
     if !typed.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &typed.diagnostics {
-            if diag.severity == TypeSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot lower {label}: it has type errors");
+        render::emit_errors(&label, &source, &typed.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot lower {label}: it has type errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
@@ -867,39 +828,14 @@ fn cmd_mir(args: &[String]) -> Result<ExitCode, String> {
     let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
         Ok(p) => p,
         Err(diags) => {
-            let stderr = io::stderr();
-            let mut err = stderr.lock();
-            for diag in &diags {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-            let _ = writeln!(err, "error: cannot lower {label}: lowering failed");
+            render::emit_errors(&label, &source, &diags);
+            let _ = writeln!(io::stderr(), "error: cannot lower {label}: lowering failed");
             return Ok(ExitCode::FAILURE);
         }
     };
 
     // Report lowering + leak diagnostics to stderr.
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &prog.diagnostics {
-        if diag.severity == MirSeverity::Error {
-            error_count += 1;
-        }
-        let sev = match diag.severity {
-            MirSeverity::Error => "error",
-            MirSeverity::Warning => "warning",
-        };
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
-    drop(err);
+    let error_count = render::emit_diags(&label, &source, &prog.diagnostics);
 
     // Apply the optimizer once the front-end is clean. Debug is unoptimized
     // unless `--opt` is passed; ReleaseSafe/ReleaseFast always optimize.
@@ -1000,54 +936,33 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 
     // Parse errors gate execution: report them and stop, like `mir`.
     if !pres.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &pres.diagnostics {
-            if diag.severity == Severity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot run {label}: it has parse errors");
+        render::emit_errors(&label, &source, &pres.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot run {label}: it has parse errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Resolution errors gate execution.
     let resolved = resolve_file(&pres.file);
     if !resolved.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &resolved.diagnostics {
-            if diag.severity == ResolveSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot run {label}: it has resolution errors");
+        render::emit_errors(&label, &source, &resolved.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot run {label}: it has resolution errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
     // Type errors gate execution.
     let typed = check_file(&pres.file, &resolved);
     if !typed.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &typed.diagnostics {
-            if diag.severity == TypeSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot run {label}: it has type errors");
+        render::emit_errors(&label, &source, &typed.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot run {label}: it has type errors"
+        );
         return Ok(ExitCode::FAILURE);
     }
 
@@ -1055,40 +970,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
         Ok(p) => p,
         Err(diags) => {
-            let stderr = io::stderr();
-            let mut err = stderr.lock();
-            for diag in &diags {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-            let _ = writeln!(err, "error: cannot run {label}: lowering failed");
+            render::emit_errors(&label, &source, &diags);
+            let _ = writeln!(io::stderr(), "error: cannot run {label}: lowering failed");
             return Ok(ExitCode::FAILURE);
         }
     };
 
     // Error-severity lowering/leak diagnostics gate execution; warnings are
     // printed but do not stop the run.
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    let mut error_count = 0usize;
-    for diag in &prog.diagnostics {
-        if diag.severity == MirSeverity::Error {
-            error_count += 1;
-        }
-        let sev = match diag.severity {
-            MirSeverity::Error => "error",
-            MirSeverity::Warning => "warning",
-        };
-        let _ = writeln!(
-            err,
-            "{label}:{}:{}: {sev}: {}",
-            diag.span.line, diag.span.col, diag.message
-        );
-    }
-    drop(err);
+    let error_count = render::emit_diags(&label, &source, &prog.diagnostics);
     if error_count > 0 {
         let _ = writeln!(
             io::stderr(),
@@ -1119,11 +1009,14 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
 
     // Execute `main`; the VM streams program output and propagates the exit code.
+    // The label is threaded so an escaping error's return trace points at real
+    // source locations.
     Ok(run_program(
         &prog,
         RunArgs {
             mode,
             argv: forwarded,
+            trace_label: Some(label.clone()),
         },
     ))
 }
@@ -1187,6 +1080,7 @@ fn run_multi_file(
         RunArgs {
             mode,
             argv: forwarded,
+            trace_label: Some(label.to_string()),
         },
     ))
 }
@@ -1217,36 +1111,19 @@ fn front_end_to_mir(path: &str, mode: BuildMode, opt_flag: bool) -> Result<MirPr
 
     let pres = parse_program(&source);
     if !pres.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &pres.diagnostics {
-            if diag.severity == Severity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot compile {label}: it has parse errors");
+        render::emit_errors(&label, &source, &pres.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot compile {label}: it has parse errors"
+        );
         return Err(ExitCode::FAILURE);
     }
 
     let resolved = resolve_file(&pres.file);
     if !resolved.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &resolved.diagnostics {
-            if diag.severity == ResolveSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
+        render::emit_errors(&label, &source, &resolved.diagnostics);
         let _ = writeln!(
-            err,
+            io::stderr(),
             "error: cannot compile {label}: it has resolution errors"
         );
         return Err(ExitCode::FAILURE);
@@ -1254,57 +1131,27 @@ fn front_end_to_mir(path: &str, mode: BuildMode, opt_flag: bool) -> Result<MirPr
 
     let typed = check_file(&pres.file, &resolved);
     if !typed.is_ok() {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &typed.diagnostics {
-            if diag.severity == TypeSeverity::Error {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-        }
-        let _ = writeln!(err, "error: cannot compile {label}: it has type errors");
+        render::emit_errors(&label, &source, &typed.diagnostics);
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot compile {label}: it has type errors"
+        );
         return Err(ExitCode::FAILURE);
     }
 
     let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
         Ok(p) => p,
         Err(diags) => {
-            let stderr = io::stderr();
-            let mut err = stderr.lock();
-            for diag in &diags {
-                let _ = writeln!(
-                    err,
-                    "{label}:{}:{}: error: {}",
-                    diag.span.line, diag.span.col, diag.message
-                );
-            }
-            let _ = writeln!(err, "error: cannot compile {label}: lowering failed");
+            render::emit_errors(&label, &source, &diags);
+            let _ = writeln!(
+                io::stderr(),
+                "error: cannot compile {label}: lowering failed"
+            );
             return Err(ExitCode::FAILURE);
         }
     };
 
-    let mut error_count = 0usize;
-    {
-        let stderr = io::stderr();
-        let mut err = stderr.lock();
-        for diag in &prog.diagnostics {
-            if diag.severity == MirSeverity::Error {
-                error_count += 1;
-            }
-            let sev = match diag.severity {
-                MirSeverity::Error => "error",
-                MirSeverity::Warning => "warning",
-            };
-            let _ = writeln!(
-                err,
-                "{label}:{}:{}: {sev}: {}",
-                diag.span.line, diag.span.col, diag.message
-            );
-        }
-    }
+    let error_count = render::emit_diags(&label, &source, &prog.diagnostics);
     if error_count > 0 {
         let _ = writeln!(
             io::stderr(),

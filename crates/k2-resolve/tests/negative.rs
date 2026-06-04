@@ -280,3 +280,56 @@ fn out_of_root_path_import_that_is_missing_is_rejected() {
         errs[0].message
     );
 }
+
+// ---- Rich-diagnostic content (v0.20): labels / notes / help -------------
+
+#[test]
+fn undeclared_identifier_suggests_nearby_name() {
+    // `valeu` is one transposition away from the in-scope `value`.
+    let src = "fn f() i32 { const value = 1; return valeu; }\n";
+    let r = resolve(src);
+    let err = r.errors().next().unwrap();
+    assert_eq!(err.message, "use of undeclared identifier `valeu`");
+    assert_eq!(err.primary_label, "not found in this scope");
+    assert_eq!(
+        err.help.as_deref(),
+        Some("a binding named `value` exists — did you mean it?")
+    );
+}
+
+#[test]
+fn undeclared_identifier_no_suggestion_when_far() {
+    let src = "fn f() i32 { return wxyzqrst; }\n";
+    let r = resolve(src);
+    let err = r.errors().next().unwrap();
+    // No nearby name → no help.
+    assert!(err.help.is_none(), "unexpected help: {:?}", err.help);
+}
+
+#[test]
+fn redeclaration_carries_secondary_under_original() {
+    let src = "const x = 1;\nconst x = 2;\n";
+    let r = resolve(src);
+    let err = r.errors().next().unwrap();
+    assert_eq!(err.message, "redeclaration of `x` in this scope");
+    assert_eq!(err.primary_label, "redeclared here");
+    assert_eq!(err.labels.len(), 1, "a secondary under the first decl");
+    assert_eq!(err.labels[0].message, "first declared here");
+    // The secondary points at the first declaration (line 1).
+    assert_eq!(err.labels[0].span.line, 1);
+}
+
+#[test]
+fn shadow_moves_origin_into_secondary_label() {
+    let src = "const g = 1;\nfn f() void { const g = 2; _ = g; }\n";
+    let r = resolve(src);
+    let err = r.errors().next().unwrap();
+    // The header no longer carries the "(first declared on line N)" tail.
+    assert_eq!(
+        err.message,
+        "declaration of `g` shadows an existing binding"
+    );
+    assert!(!err.message.contains("line"), "origin must move to a label");
+    assert_eq!(err.labels.len(), 1);
+    assert_eq!(err.labels[0].span.line, 1);
+}

@@ -227,23 +227,27 @@ impl Resolver {
                 return Some(new_id);
             }
 
-            self.diags.push(Diagnostic::error(
-                span,
-                format!("redeclaration of `{name}` in this scope"),
-            ));
+            let orig_span = self.defs[existing.index()].span;
+            self.diags.push(
+                Diagnostic::error(span, format!("redeclaration of `{name}` in this scope"))
+                    .with_primary_label("redeclared here")
+                    .with_secondary(orig_span, "first declared here"),
+            );
             return None;
         }
 
         // R1: an illegal shadow of an enclosing *user* scope. We do not walk
         // into the current scope itself (that is the duplicate case above).
         if let Some(orig) = self.lookup_enclosing_user(scope, name) {
-            let orig_line = self.defs[orig.index()].span.line;
-            self.diags.push(Diagnostic::error(
-                span,
-                format!(
-                    "declaration of `{name}` shadows an existing binding (first declared on line {orig_line})"
-                ),
-            ));
+            let orig_span = self.defs[orig.index()].span;
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("declaration of `{name}` shadows an existing binding"),
+                )
+                .with_primary_label("shadows an outer binding")
+                .with_secondary(orig_span, "the outer binding is declared here"),
+            );
             return None;
         }
 
@@ -1020,11 +1024,41 @@ impl Resolver {
             return;
         }
 
-        self.diags.push(Diagnostic::error(
-            span,
-            format!("use of undeclared identifier `{name}`"),
-        ));
+        // Build the rich diagnostic: a primary label under the ident, plus a
+        // best-effort "did you mean" help drawn from the names actually visible
+        // in scope (cheap edit-distance, pure std).
+        let mut diag = Diagnostic::error(span, format!("use of undeclared identifier `{name}`"))
+            .with_primary_label("not found in this scope");
+        if let Some(near) = self.nearest_in_scope(name) {
+            diag = diag.with_help(format!(
+                "a binding named `{near}` exists — did you mean it?"
+            ));
+        }
+        self.diags.push(diag);
         self.uses.record(name, span, Resolution::Error);
+    }
+
+    /// Finds the nearest in-scope binding name to `name` by Levenshtein edit
+    /// distance, returning it only when the distance is small (`<= 2` and at most
+    /// half the name's length). Used to power the "did you mean" suggestion on an
+    /// undeclared identifier. Pure std, no external crate.
+    fn nearest_in_scope(&self, name: &str) -> Option<String> {
+        let max = (name.chars().count() / 2).clamp(1, 2);
+        let mut best: Option<(usize, &str)> = None;
+        let mut cur = Some(self.current_scope());
+        while let Some(s) = cur {
+            for (cand, _id) in &self.scopes[s.index()].names {
+                if cand == name || cand == "_" {
+                    continue;
+                }
+                let d = edit_distance(name, cand);
+                if d <= max && best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, cand.as_str()));
+                }
+            }
+            cur = self.scopes[s.index()].parent;
+        }
+        best.map(|(_, n)| n.to_string())
     }
 
     // =====================================================================
@@ -1171,6 +1205,33 @@ fn primitive_int_width(name: &str) -> Option<u32> {
     // overflows the parse or exceeds the cap, and is rejected as not-a-primitive.
     let width: u32 = std::str::from_utf8(digits).ok()?.parse().ok()?;
     (width <= MAX_INT_WIDTH).then_some(width)
+}
+
+/// The Levenshtein edit distance between two strings (insertions, deletions,
+/// substitutions all cost 1), computed over Unicode scalars with the classic
+/// two-row dynamic-programming table. Pure std; used to power the undeclared-
+/// identifier "did you mean" suggestion. O(len(a) * len(b)) time, O(len(b))
+/// space.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Strips one layer of surrounding double quotes from a string-literal lexeme,

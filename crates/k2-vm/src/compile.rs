@@ -11,12 +11,12 @@
 //! `BlockId`. The second patches every such reference to the recorded offset.
 
 use k2_mir::{
-    AggKind, Const, ConstData, IntrinsicPath, IntrinsicRoot, MirFunction, MirProgram, Operand,
-    Place, Proj, Rvalue, Statement, Terminator,
+    AggKind, BuildMode, Const, ConstData, IntrinsicPath, IntrinsicRoot, MirFunction, MirProgram,
+    Operand, Place, Proj, Rvalue, Statement, Terminator,
 };
 use k2_types::{ArrayLen, IntBits, Type, TypeArena, TypeId};
 
-use crate::isa::{AggregateKind, CompiledFn, Instr, IntrinsicId, KIdx, Reg, StoreStep};
+use crate::isa::{AggregateKind, CompiledFn, Instr, IntrinsicId, KIdx, Reg, StoreStep, TraceSite};
 use crate::value::{IntRepr, Value};
 
 /// Resolves the [`IntRepr`] of an integer type. A non-integer type (it should not
@@ -108,6 +108,10 @@ struct FnCompiler<'p> {
     /// operand slot, and the frame is sized to cover them all. See
     /// [`max_operand_scratch`] and [`FnCompiler::op_scratch`].
     op_window: usize,
+    /// The error-return-trace sites this function references (one per
+    /// `try`-propagating `Return` it compiled, in emission order). Empty in
+    /// ReleaseFast, where the trace machinery is stripped at compile time.
+    trace_sites: Vec<TraceSite>,
 }
 
 impl<'p> FnCompiler<'p> {
@@ -797,6 +801,7 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
         consts: Vec::new(),
         block_offsets: vec![usize::MAX; func.blocks.len()],
         op_window,
+        trace_sites: Vec::new(),
     };
 
     // Records of control-flow instructions needing a BlockId -> offset patch.
@@ -852,9 +857,25 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
                     default.index(),
                 ));
             }
-            Terminator::Return { value } => {
+            Terminator::Return { value, err_trace } => {
                 let src = c.operand_to_reg(value, c.op_scratch(0));
-                c.emit(Instr::Return { src });
+                // An error-propagating return records a trace frame — but only in
+                // Debug/ReleaseSafe. In ReleaseFast we strip the whole mechanism:
+                // a plain `Return`, no `trace_sites` growth, no per-return cost.
+                match err_trace {
+                    Some(span) if prog.mode != BuildMode::ReleaseFast => {
+                        let site = c.trace_sites.len() as u32;
+                        c.trace_sites.push(TraceSite {
+                            fn_name: func.name.clone(),
+                            line: span.line,
+                            col: span.col,
+                        });
+                        c.emit(Instr::ReturnErr { src, site });
+                    }
+                    _ => {
+                        c.emit(Instr::Return { src });
+                    }
+                }
             }
             Terminator::Trap { reason } => {
                 c.emit(Instr::Trap { reason: *reason });
@@ -905,6 +926,7 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
         consts: c.consts,
         num_regs,
         addr_taken,
+        trace_sites: c.trace_sites,
     }
 }
 

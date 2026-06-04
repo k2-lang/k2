@@ -9,7 +9,7 @@
 //! rather than depend on `k2-parse`, keeping the resolver a leaf crate over
 //! `k2-syntax` alone.
 
-use k2_syntax::Span;
+use k2_syntax::{Label, RichDiagnostic, RichSeverity, Span};
 
 /// The severity of a [`Diagnostic`]. Only [`Severity::Error`] entries make a
 /// resolution "fail"; warnings are advisory and never block the build.
@@ -24,39 +24,108 @@ pub enum Severity {
     Warning,
 }
 
+impl From<Severity> for RichSeverity {
+    fn from(s: Severity) -> RichSeverity {
+        match s {
+            Severity::Error => RichSeverity::Error,
+            Severity::Warning => RichSeverity::Warning,
+        }
+    }
+}
+
 /// A single resolution diagnostic: where it occurred and what went wrong.
+///
+/// The `labels`/`notes`/`help` fields are *additive* (default empty), so every
+/// existing construction and every `.message`/`.span` assertion keeps working;
+/// a phase opts into richer output via the chainable `with_*` builders.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     /// The source span the diagnostic points at. Its `line`/`col` give the
-    /// human-readable location reused by the CLI.
+    /// human-readable location reused by the CLI. This is the *primary* span.
     pub span: Span,
     /// The severity (error vs. warning).
     pub severity: Severity,
     /// A human-readable message, e.g. `use of undeclared identifier `zzz``.
     pub message: String,
+    /// Optional inline label drawn under the primary span (empty = none).
+    pub primary_label: String,
+    /// Zero or more secondary labels (own span + message).
+    pub labels: Vec<Label>,
+    /// Zero or more `note: …` lines.
+    pub notes: Vec<String>,
+    /// An optional `help: …` suggestion.
+    pub help: Option<String>,
 }
 
 impl Diagnostic {
-    /// Builds an error-severity diagnostic.
+    /// Builds an error-severity diagnostic (no labels/notes/help).
     pub fn error(span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
             span,
             severity: Severity::Error,
             message: message.into(),
+            primary_label: String::new(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            help: None,
         }
     }
 
-    /// Builds a warning-severity diagnostic.
+    /// Builds a warning-severity diagnostic (no labels/notes/help).
     pub fn warning(span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
             span,
             severity: Severity::Warning,
             message: message.into(),
+            primary_label: String::new(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            help: None,
         }
     }
 
     /// `true` if this diagnostic is an error.
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
+    }
+
+    /// Sets the inline label drawn under the primary span's underline.
+    #[must_use]
+    pub fn with_primary_label(mut self, message: impl Into<String>) -> Diagnostic {
+        self.primary_label = message.into();
+        self
+    }
+
+    /// Appends a secondary label (its own span + message).
+    #[must_use]
+    pub fn with_secondary(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
+        self.labels.push(Label::secondary(span, message));
+        self
+    }
+
+    /// Appends a `note: …` line.
+    #[must_use]
+    pub fn with_note(mut self, message: impl Into<String>) -> Diagnostic {
+        self.notes.push(message.into());
+        self
+    }
+
+    /// Sets the `help: …` suggestion line.
+    #[must_use]
+    pub fn with_help(mut self, message: impl Into<String>) -> Diagnostic {
+        self.help = Some(message.into());
+        self
+    }
+
+    /// Converts into the shared [`RichDiagnostic`] rendering shape.
+    pub fn to_rich(&self) -> RichDiagnostic {
+        RichDiagnostic {
+            severity: self.severity.into(),
+            message: self.message.clone(),
+            primary: Label::primary(self.span, self.primary_label.clone()),
+            secondary: self.labels.clone(),
+            notes: self.notes.clone(),
+            help: self.help.clone(),
+        }
     }
 }

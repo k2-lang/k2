@@ -138,7 +138,8 @@ fn errdefer_fires_only_on_error_path() {
         let returns_err = matches!(
             &b.term,
             Terminator::Return {
-                value: Operand::Copy(_)
+                value: Operand::Copy(_),
+                ..
             }
         ) && b.stmts.iter().any(|s| {
             matches!(
@@ -1174,6 +1175,7 @@ fn verify_catches_unreachable_block() {
     let orphan = f.new_block();
     f.blocks[orphan.index()].term = Terminator::Return {
         value: Operand::Const(Const::Void),
+        err_trace: None,
     };
     let problems = prog.verify();
     assert!(

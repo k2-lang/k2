@@ -126,7 +126,7 @@ fn returned_locals(func: &MirFunction) -> HashSet<LocalId> {
     let mut seed: HashSet<LocalId> = HashSet::new();
     seed.insert(LocalId(0));
     for b in &func.blocks {
-        if let Terminator::Return { value } = &b.term {
+        if let Terminator::Return { value, .. } = &b.term {
             collect_operand_locals(value, &mut seed);
         }
     }

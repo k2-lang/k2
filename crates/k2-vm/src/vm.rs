@@ -239,6 +239,10 @@ pub struct Vm<'p> {
     /// The build-recording context, present only while `build(b)` runs (the
     /// `*Build` capability floor writes into it). `None` for ordinary runs.
     build: Option<BuildContext>,
+    /// The error-return trace captured from the root fiber when an error escaped
+    /// `main` (newest-first). Empty in ReleaseFast and for non-error exits. Read
+    /// via [`Vm::escaped_trace`] after `run_main`.
+    escaped_trace: Vec<crate::trace::TraceFrame>,
 }
 
 impl<'p> Vm<'p> {
@@ -264,7 +268,15 @@ impl<'p> Vm<'p> {
             instr_count: 0,
             started: std::time::Instant::now(),
             build: None,
+            escaped_trace: Vec::new(),
         }
+    }
+
+    /// The error-return trace captured when an error escaped `main` (newest
+    /// first). Empty unless `run_main` returned [`Halt::ProgramError`] in a
+    /// Debug/ReleaseSafe build with `try`-propagated errors.
+    pub fn escaped_trace(&self) -> &[crate::trace::TraceFrame] {
+        &self.escaped_trace
     }
 
     /// The number of instructions executed so far — the deterministic metric the
@@ -296,7 +308,13 @@ impl<'p> Vm<'p> {
         self.event_loop()?;
         // Inspect the root fiber's result.
         match self.sched.fibers[root as usize].result.take() {
-            Some(Value::ErrVal(tag)) => Err(Halt::ProgramError(tag)),
+            Some(Value::ErrVal(tag)) => {
+                // Capture the propagation trace accumulated on the root fiber so
+                // the driver can print it after the `error: <name>` header.
+                self.escaped_trace =
+                    std::mem::take(&mut self.sched.fibers[root as usize].err_trace);
+                Err(Halt::ProgramError(tag))
+            }
             // `pub fn main(...) <Int>`: exit with the integer result (low 8 bits),
             // agreeing with native's integer-main exit-code convention.
             Some(v) if int_main => {
@@ -681,6 +699,23 @@ impl<'p> Vm<'p> {
                 let v = self.get(src);
                 Ok(Flow::Returned(v))
             }
+            Instr::ReturnErr { src, site } => {
+                // Record an error-return-trace frame for this `try` site on the
+                // current fiber, then return exactly like `Instr::Return`. The
+                // frame is appended (newest first), building the propagation
+                // chain as the error unwinds the stack.
+                let fnid = self.cur_fnid();
+                let s = &self.compiled[fnid.index()].trace_sites[site as usize];
+                let frame = crate::trace::TraceFrame {
+                    fn_name: s.fn_name.clone(),
+                    line: s.line,
+                    col: s.col,
+                };
+                let cur = self.sched.current;
+                self.sched.fibers[cur as usize].err_trace.push(frame);
+                let v = self.get(src);
+                Ok(Flow::Returned(v))
+            }
             Instr::Trap { reason } => Err(Halt::Panic(PanicInfo {
                 reason,
                 detail: None,
@@ -823,6 +858,11 @@ impl<'p> Vm<'p> {
                 Ok(Flow::Next)
             }
             Instr::MakeErr { dst, tag } => {
+                // A fresh error origin reseeds this fiber's error-return trace, so
+                // a brand-new error never inherits a previously-caught error's
+                // propagation chain. The subsequent `try` sites append onto it.
+                let cur = self.sched.current;
+                self.sched.fibers[cur as usize].err_trace.clear();
                 self.set_cur(dst, Value::ErrVal(tag));
                 Ok(Flow::Next)
             }

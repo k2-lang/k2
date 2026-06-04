@@ -353,7 +353,14 @@ fn step_run(
         } else {
             Vec::new()
         };
-        let code = run_program_code(&prog, RunArgs { mode, argv });
+        let code = run_program_code(
+            &prog,
+            RunArgs {
+                mode,
+                argv,
+                trace_label: None,
+            },
+        );
         // The FIRST nonzero sub-run fails the whole step; remaining runs still
         // execute so their output is never silently dropped.
         if code != 0 && first_failure == 0 {
@@ -474,7 +481,14 @@ fn run_user_step(
         } else {
             Vec::new()
         };
-        let code = run_program_code(&prog, RunArgs { mode, argv });
+        let code = run_program_code(
+            &prog,
+            RunArgs {
+                mode,
+                argv,
+                trace_label: None,
+            },
+        );
         if code != 0 && first_failure == 0 {
             first_failure = code;
         }

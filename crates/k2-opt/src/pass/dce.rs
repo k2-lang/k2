@@ -237,7 +237,7 @@ fn terminator_reads(term: &Terminator) -> Vec<LocalId> {
     match term {
         Terminator::Branch { cond, .. } => op(cond),
         Terminator::Switch { scrutinee, .. } => op(scrutinee),
-        Terminator::Return { value } => op(value),
+        Terminator::Return { value, .. } => op(value),
         Terminator::Goto(_) | Terminator::Trap { .. } | Terminator::Unreachable => {}
     }
     out
@@ -452,7 +452,7 @@ fn remap_terminator_locals(term: &mut Terminator, remap: &[Option<u32>]) {
     match term {
         Terminator::Branch { cond, .. } => remap_operand(cond, &map),
         Terminator::Switch { scrutinee, .. } => remap_operand(scrutinee, &map),
-        Terminator::Return { value } => remap_operand(value, &map),
+        Terminator::Return { value, .. } => remap_operand(value, &map),
         Terminator::Goto(_) | Terminator::Trap { .. } | Terminator::Unreachable => {}
     }
 }

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use k2_syntax::{Expr, Span, SwitchArm, SwitchItem, SwitchPattern};
 
 use crate::ty::{Type, TypeId};
+use crate::Diagnostic;
 
 impl crate::check::Checker<'_> {
     /// Types a `switch` expression/statement: type the scrutinee, bind each arm's
@@ -211,15 +212,14 @@ impl crate::check::Checker<'_> {
         let missing: Vec<String> = all
             .iter()
             .filter(|n| !covered.contains(*n))
-            .map(|n| format!(".{n}"))
+            .map(|n| format!("`.{n}`"))
             .collect();
         if !missing.is_empty() {
-            self.error(
-                span,
-                format!(
-                    "switch on {what} is not exhaustive: missing {}",
-                    missing.join(", ")
-                ),
+            self.error_rich(
+                Diagnostic::error(span, format!("switch on {what} is not exhaustive"))
+                    .with_primary_label("this switch does not cover all cases")
+                    .with_note(format!("missing cases: {}", missing.join(", ")))
+                    .with_help("add the missing arm(s) or an `else =>` branch"),
             );
         }
     }
@@ -258,15 +258,14 @@ impl crate::check::Checker<'_> {
         let missing: Vec<String> = all
             .iter()
             .filter(|n| !covered.contains(*n))
-            .map(|n| format!("error.{n}"))
+            .map(|n| format!("`error.{n}`"))
             .collect();
         if !missing.is_empty() {
-            self.error(
-                span,
-                format!(
-                    "switch over error set is not exhaustive: missing {}",
-                    missing.join(", ")
-                ),
+            self.error_rich(
+                Diagnostic::error(span, "switch over error set is not exhaustive")
+                    .with_primary_label("this switch does not cover all errors")
+                    .with_note(format!("missing cases: {}", missing.join(", ")))
+                    .with_help("add the missing arm(s) or an `else =>` branch"),
             );
         }
     }

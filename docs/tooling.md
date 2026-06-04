@@ -373,6 +373,56 @@ obvious allocate-and-return-without-ownership leak — all surfaced as
 **compile-time diagnostics**, located precisely in source, exactly as the
 charter's comptime leak/escape analysis promises.
 
+### 5.1 Rich diagnostics (v0.20)
+
+Every diagnostic the toolchain emits is rendered in a rustc/ariadne-style
+report: a `severity: message` header, a `--> file:line:col` locator, the
+offending source line(s) with a line-number gutter, a `^^^` caret under the
+primary span (with an inline label), secondary `---` underlines for related
+spans, and `note:` / `help:` lines below. For example:
+
+```text
+error: switch on enum `C` is not exhaustive
+  --> game.k2:2:19
+  |
+2 | fn f(c: C) void { switch (c) { .red => {}, .green => {} } }
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this switch does not cover all cases
+  |
+  = note: missing cases: `.blue`
+  = help: add the missing arm(s) or an `else =>` branch
+```
+
+The caret is aligned by **display column**, not byte offset: multi-byte UTF-8
+counts the right number of cells, CJK/emoji are width-2, combining marks are
+width-0, and tabs are reproduced verbatim so alignment holds at any terminal tab
+width. Color is emitted only on a tty and is suppressed by `NO_COLOR` (or
+`K2_NO_COLOR`); `K2_COLOR=always|never|auto` and `K2_TAB_WIDTH` override the
+defaults. The renderer is pure-std and never panics on any input.
+
+### 5.2 Error-return traces (v0.20)
+
+When an error escapes `main` in a **Debug** or **ReleaseSafe** build, `k2c run`
+prints an *error return trace* — the origin where the error first appeared
+(`return error.X`) plus the chain of `try` sites it propagated through,
+newest-first (Zig-style, per spec §6.9):
+
+```text
+error: Boom
+error return trace:
+    at b (program.k2:4:5)
+    at a (program.k2:8:15)
+    at main (program.k2:13:15)
+```
+
+The trace is seeded at the origin `return error.X` (the deepest/last frame) and
+appended at each `try` that re-throws (a `@errorReturnTrace()` builtin exposes an
+opaque handle for future use). In **ReleaseFast** the whole mechanism is stripped
+at compile time — no instruction, no buffer, no cost — and only the
+`error: <name>` header prints. Error-return traces are **VM-only** in
+v0.20 (`k2c run`); the native backend's trace is **best-effort / deferred** — the
+runtime-shim ABI (`__k2_err_trace_push(line, col, fn_name)` + a main-epilogue
+flush) is specified for a later milestone.
+
 ---
 
 ## 6. `k2c test` — the built-in test runner

@@ -18,6 +18,10 @@
 
 use k2_lexer::Token;
 
+pub mod diag;
+
+pub use diag::{Label, LabelStyle, RichDiagnostic, Severity as RichSeverity};
+
 /// A half-open source range, used to attach every AST node to the bytes it came
 /// from for diagnostics. Offsets are scalar indices into the source; `line` and
 /// `col` (1-based) record the start position for human-readable messages.

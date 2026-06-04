@@ -294,6 +294,17 @@ pub enum Instr {
     },
     /// Return the value in `src` from the current frame.
     Return { src: Reg },
+    /// Return the value in `src`, *and* record an error-return-trace frame for
+    /// the `try` site identified by `site` (an index into the [`CompiledFn`]'s
+    /// `trace_sites`). Emitted only in Debug/ReleaseSafe for a `try`-propagating
+    /// return; in ReleaseFast the compiler lowers the same MIR to a plain
+    /// [`Instr::Return`], so the trace machinery has zero cost there.
+    ReturnErr {
+        /// The register holding the returned (error-union) value.
+        src: Reg,
+        /// Index into [`CompiledFn::trace_sites`] for this propagation point.
+        site: u32,
+    },
     /// Diverge into a clean panic with the given reason.
     Trap { reason: TrapReason },
     /// Statically-unreachable fall-through (treated as a defensive panic).
@@ -435,4 +446,20 @@ pub struct CompiledFn {
     pub num_regs: usize,
     /// The registers (by index) that are `address_taken` and so need a heap home.
     pub addr_taken: Vec<bool>,
+    /// The error-return-trace sites referenced by [`Instr::ReturnErr`] in this
+    /// function's `code`. Empty in ReleaseFast (the trace machinery is stripped).
+    pub trace_sites: Vec<TraceSite>,
+}
+
+/// One error-return-trace site: the source location of a `try` that re-throws.
+/// Recorded per [`CompiledFn`] and pushed onto the running fiber's trace buffer
+/// when the corresponding [`Instr::ReturnErr`] executes.
+#[derive(Clone, Debug)]
+pub struct TraceSite {
+    /// The display name of the function the `try` is in.
+    pub fn_name: String,
+    /// 1-based source line of the `try` site.
+    pub line: u32,
+    /// 1-based source column of the `try` site.
+    pub col: u32,
 }

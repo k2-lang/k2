@@ -677,7 +677,7 @@ fn term_point(term: &Terminator) -> Point {
     match term {
         Terminator::Branch { cond, .. } => operand_uses(cond, &mut uses),
         Terminator::Switch { scrutinee, .. } => operand_uses(scrutinee, &mut uses),
-        Terminator::Return { value } => operand_uses(value, &mut uses),
+        Terminator::Return { value, .. } => operand_uses(value, &mut uses),
         Terminator::Goto(_) | Terminator::Trap { .. } | Terminator::Unreachable => {}
     }
     Point {

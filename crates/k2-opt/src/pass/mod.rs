@@ -84,7 +84,7 @@ pub(crate) fn for_each_terminator_operand_mut<F: FnMut(&mut Operand)>(
     match term {
         Terminator::Branch { cond, .. } => f(cond),
         Terminator::Switch { scrutinee, .. } => f(scrutinee),
-        Terminator::Return { value } => f(value),
+        Terminator::Return { value, .. } => f(value),
         Terminator::Goto(_) | Terminator::Trap { .. } | Terminator::Unreachable => {}
     }
 }

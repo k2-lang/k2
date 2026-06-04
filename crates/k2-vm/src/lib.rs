@@ -42,6 +42,7 @@ mod fmt;
 mod heap;
 mod isa;
 mod sched;
+pub mod trace;
 mod value;
 mod vm;
 
@@ -128,6 +129,10 @@ pub struct RunArgs {
     pub mode: BuildMode,
     /// The program arguments (forwarded; unused by the current `main` shape).
     pub argv: Vec<String>,
+    /// The file label used in an error-return trace (`<file>:line:col`). `None`
+    /// falls back to a generic `<source>` label. Set by the driver from the
+    /// source path so the trace points at real locations.
+    pub trace_label: Option<String>,
 }
 
 impl RunArgs {
@@ -136,6 +141,7 @@ impl RunArgs {
         RunArgs {
             mode,
             argv: Vec::new(),
+            trace_label: None,
         }
     }
 }
@@ -168,9 +174,15 @@ pub fn run_program(prog: &MirProgram, args: RunArgs) -> ExitCode {
 /// sub-run's success/failure and propagate the first nonzero code. `0` means
 /// success; `134` is the internal-VM-error backstop.
 pub fn run_program_code(prog: &MirProgram, args: RunArgs) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(prog, args)));
+    let label = args
+        .trace_label
+        .clone()
+        .unwrap_or_else(|| "<source>".to_string());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_inner_traced(prog, args)
+    }));
     match result {
-        Ok((outcome, code, out, err)) => {
+        Ok((outcome, code, out, err, trace)) => {
             // Flush the program's captured streams before any diagnostic line.
             let _ = std::io::stdout().write_all(&out);
             let _ = std::io::stdout().flush();
@@ -179,6 +191,13 @@ pub fn run_program_code(prog: &MirProgram, args: RunArgs) -> i32 {
                 RunOutcome::Ok => {}
                 RunOutcome::Errored(name) => {
                     let _ = writeln!(std::io::stderr(), "error: {name}");
+                    // In Debug/ReleaseSafe, print the error-return trace (the
+                    // chain of `try` sites the error propagated through). It is
+                    // empty in ReleaseFast, so nothing extra prints there.
+                    let block = crate::trace::format_trace(&trace, &label);
+                    if !block.is_empty() {
+                        let _ = std::io::stderr().write_all(block.as_bytes());
+                    }
                 }
                 RunOutcome::Panicked(msg) => {
                     let _ = writeln!(std::io::stderr(), "panic: {msg}");
@@ -198,14 +217,24 @@ pub fn run_program_code(prog: &MirProgram, args: RunArgs) -> i32 {
 /// assert exact output and exit codes without spawning a process.
 pub fn run_captured(prog: &MirProgram, args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Vec<u8>) {
     let _ = args;
-    run_inner(prog, RunArgs::new(prog.mode))
+    let (outcome, code, out, err, _trace) = run_inner_traced(prog, RunArgs::new(prog.mode));
+    (outcome, code, out, err)
 }
 
-/// The shared core: builds a VM, runs `main`, and maps the [`Halt`] to an outcome
-/// + exit code. Returns the captured stdout/stderr buffers.
-fn run_inner(prog: &MirProgram, _args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Vec<u8>) {
-    let (outcome, code, out, err, _count) = run_inner_metered(prog);
-    (outcome, code, out, err)
+/// Like [`run_captured`], but also returns the error-return trace (newest-first;
+/// empty unless an error escaped `main` in Debug/ReleaseSafe). Used by tests that
+/// assert on the propagation chain without spawning a process.
+pub fn run_captured_traced(
+    prog: &MirProgram,
+    args: RunArgs,
+) -> (
+    RunOutcome,
+    i32,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<crate::trace::TraceFrame>,
+) {
+    run_inner_traced(prog, args)
 }
 
 /// Like [`run_captured`], but also returns the number of VM instructions
@@ -216,12 +245,39 @@ fn run_inner(prog: &MirProgram, _args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Ve
 /// The existing `run_captured`/`run_program` signatures are intentionally left
 /// unchanged so no caller breaks; this is an additive entry point.
 pub fn run_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64) {
-    run_inner_metered(prog)
+    let (outcome, code, out, err, count, _trace) = run_inner_metered(prog);
+    (outcome, code, out, err, count)
 }
 
-/// The metered shared core: identical to [`run_inner`] but also reports the
-/// executed-instruction count.
-fn run_inner_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64) {
+/// The shared core that also surfaces the error-return trace: builds a VM, runs
+/// `main`, maps the [`Halt`], and returns the captured streams plus the
+/// (possibly empty) propagation trace.
+fn run_inner_traced(
+    prog: &MirProgram,
+    _args: RunArgs,
+) -> (
+    RunOutcome,
+    i32,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<crate::trace::TraceFrame>,
+) {
+    let (outcome, code, out, err, _count, trace) = run_inner_metered(prog);
+    (outcome, code, out, err, trace)
+}
+
+/// The metered shared core: runs `main` and reports the outcome, exit code,
+/// captured streams, executed-instruction count, and the error-return trace.
+fn run_inner_metered(
+    prog: &MirProgram,
+) -> (
+    RunOutcome,
+    i32,
+    Vec<u8>,
+    Vec<u8>,
+    u64,
+    Vec<crate::trace::TraceFrame>,
+) {
     let mut vm = Vm::new(prog);
     let halt = vm.run_main();
     let (outcome, code) = match halt {
@@ -242,7 +298,8 @@ fn run_inner_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u
         Err(Halt::Exit(c)) => (RunOutcome::Ok, c),
     };
     let count = vm.instr_count();
-    (outcome, code, vm.stdout, vm.stderr, count)
+    let trace = vm.escaped_trace().to_vec();
+    (outcome, code, vm.stdout, vm.stderr, count, trace)
 }
 
 /// Maps an `i32` exit code to a process [`ExitCode`], clamping to a `u8`.

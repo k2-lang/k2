@@ -259,6 +259,11 @@ impl<'a> Checker<'a> {
         self.diags.push(Diagnostic::error(span, message));
     }
 
+    /// Records a fully-built (labels/notes/help-bearing) error diagnostic.
+    pub(crate) fn error_rich(&mut self, diag: Diagnostic) {
+        self.diags.push(diag);
+    }
+
     /// Records a warning diagnostic.
     pub(crate) fn warn(&mut self, span: Span, message: impl Into<String>) {
         self.diags.push(Diagnostic::warning(span, message));
@@ -1079,13 +1084,16 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 } else if !self.numeric(vt) || self.try_unify_numeric(target_ty, vt).is_none() {
-                    self.error(
-                        value.span(),
-                        format!(
-                            "expected `{}`, found `{}`",
-                            self.arena.fmt(target_ty),
-                            self.arena.fmt(vt)
-                        ),
+                    let found_s = self.arena.fmt(vt);
+                    self.error_rich(
+                        Diagnostic::error(
+                            value.span(),
+                            format!(
+                                "expected `{}`, found `{found_s}`",
+                                self.arena.fmt(target_ty)
+                            ),
+                        )
+                        .with_primary_label(format!("this is `{found_s}`")),
                     );
                 }
             }

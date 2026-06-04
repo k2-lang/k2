@@ -144,8 +144,20 @@ fn dump_term(out: &mut String, t: &Terminator) {
                 default.0
             );
         }
-        Terminator::Return { value } => {
-            let _ = writeln!(out, "    return {}", fmt_operand(value));
+        Terminator::Return { value, err_trace } => {
+            // Annotate an error-propagating return so the MIR dump shows where a
+            // `try` re-threw (the source of an error-return-trace frame).
+            if let Some(s) = err_trace {
+                let _ = writeln!(
+                    out,
+                    "    return {} [try @ {}:{}]",
+                    fmt_operand(value),
+                    s.line,
+                    s.col
+                );
+            } else {
+                let _ = writeln!(out, "    return {}", fmt_operand(value));
+            }
         }
         Terminator::Trap { reason } => {
             let _ = writeln!(out, "    trap {reason:?}");

@@ -127,6 +127,13 @@ pub struct Fiber {
     /// The register in *this* fiber's top frame that a resume must fill (the dst
     /// of the blocking intrinsic). Set on block, consumed on wake.
     pub resume_reg: Option<Reg>,
+    /// The error-return trace accumulated as an error propagates up *this*
+    /// fiber's stack via `try`. Each `ReturnErr` appends one frame (newest
+    /// first); a fresh error origin (`MakeErr`) reseeds it. `None` until the
+    /// first error-propagation. Per-fiber so concurrent fibers never
+    /// cross-contaminate. Always empty in ReleaseFast (the machinery is
+    /// stripped at compile time).
+    pub err_trace: Vec<crate::trace::TraceFrame>,
 }
 
 impl Fiber {
@@ -138,6 +145,7 @@ impl Fiber {
             result: None,
             joiners: Vec::new(),
             resume_reg: None,
+            err_trace: Vec::new(),
         }
     }
 }

@@ -210,6 +210,117 @@ pub fn main(sys: *System) !void {
     );
 }
 
+// An error propagated through several `try` sites out of `main` produces an
+// error-return trace listing the ORIGIN (`return Boom.Boom`) plus those sites,
+// newest-first (origin deepest/last).
+#[test]
+fn error_return_trace_lists_origin_and_try_sites_newest_first() {
+    let src = r#"
+const Boom = error{ Boom };
+fn b() Boom!u32 {
+    return Boom.Boom;
+}
+fn a() Boom!u32 {
+    const x = try b();
+    return x;
+}
+pub fn main(sys: *System) !void {
+    _ = sys;
+    const y = try a();
+    _ = y;
+}
+"#;
+    let prog = lower(src, BuildMode::Debug);
+    let (outcome, code, _out, _err, trace) =
+        k2_vm::run_captured_traced(&prog, RunArgs::new(BuildMode::Debug));
+    assert!(matches!(&outcome, RunOutcome::Errored(n) if n == "Boom"));
+    assert_ne!(code, 0);
+    // The trace records the origin (`return Boom.Boom` in b), then the `try b()`
+    // (in a) and `try a()` (in main) sites, newest-first: the innermost frame
+    // (the origin in `b`) is first; `main`'s `try` is last.
+    assert_eq!(trace.len(), 3, "trace frames: {trace:?}");
+    assert_eq!(trace[0].fn_name, "b", "origin frame missing/misordered");
+    assert_eq!(trace[1].fn_name, "a");
+    assert_eq!(trace[2].fn_name, "main");
+    // The locations are real source positions (origin + the two `try` sites).
+    assert!(trace.iter().all(|f| f.line > 0 && f.col > 0));
+}
+
+// A direct `return error.X` with no `try` above it still records its ORIGIN
+// frame: the trace is exactly one frame at the creation site.
+#[test]
+fn error_return_trace_records_origin_with_no_try() {
+    let src = r#"
+const Boom = error{ Boom };
+pub fn main(sys: *System) !void {
+    _ = sys;
+    return Boom.Boom;
+}
+"#;
+    let prog = lower(src, BuildMode::Debug);
+    let (outcome, code, _out, _err, trace) =
+        k2_vm::run_captured_traced(&prog, RunArgs::new(BuildMode::Debug));
+    assert!(matches!(&outcome, RunOutcome::Errored(n) if n == "Boom"));
+    assert_ne!(code, 0);
+    assert_eq!(trace.len(), 1, "expected one origin frame: {trace:?}");
+    assert_eq!(trace[0].fn_name, "main");
+    assert!(trace[0].line > 0 && trace[0].col > 0);
+}
+
+// In ReleaseFast the trace machinery is stripped: the error still escapes with
+// the right name and exit code, but no trace frames are recorded.
+#[test]
+fn error_return_trace_stripped_in_release_fast() {
+    let src = r#"
+const Boom = error{ Boom };
+fn b() Boom!u32 {
+    return Boom.Boom;
+}
+fn a() Boom!u32 {
+    const x = try b();
+    return x;
+}
+pub fn main(sys: *System) !void {
+    _ = sys;
+    const y = try a();
+    _ = y;
+}
+"#;
+    let prog = lower(src, BuildMode::ReleaseFast);
+    let (outcome, code, _out, _err, trace) =
+        k2_vm::run_captured_traced(&prog, RunArgs::new(BuildMode::ReleaseFast));
+    assert!(matches!(&outcome, RunOutcome::Errored(n) if n == "Boom"));
+    assert_ne!(code, 0);
+    assert!(
+        trace.is_empty(),
+        "ReleaseFast must strip the trace: {trace:?}"
+    );
+}
+
+// A `catch` that handles the error stops propagation: the caught error never
+// reaches the escape printer, so a *clean* program prints no trace.
+#[test]
+fn caught_error_does_not_escape_or_trace() {
+    let src = r#"
+const Boom = error{ Boom };
+fn b() Boom!u32 {
+    return Boom.Boom;
+}
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const v = b() catch 7;
+    try out.print("v = {d}\n", .{v});
+}
+"#;
+    let prog = lower(src, BuildMode::Debug);
+    let (outcome, code, out, _err, trace) =
+        k2_vm::run_captured_traced(&prog, RunArgs::new(BuildMode::Debug));
+    assert_eq!(outcome, RunOutcome::Ok);
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out), "v = 7\n");
+    assert!(trace.is_empty(), "a handled error must not leave a trace");
+}
+
 #[test]
 fn catch_default_value() {
     let src = r#"

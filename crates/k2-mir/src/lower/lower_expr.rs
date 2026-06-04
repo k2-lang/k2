@@ -1222,8 +1222,11 @@ impl FnBuilder<'_, '_> {
             Rvalue::Use(Operand::local(err_tmp)),
             span,
         );
+        // The error-path return carries the `try` site's span so the VM records
+        // an error-return-trace frame as the error propagates out of this fn.
         self.set_term(Terminator::Return {
             value: Operand::local(err_tmp),
+            err_trace: Some(span),
         });
         // ok_bb: continue here; the try value is the ok payload.
         self.cur = ok_bb;
@@ -1454,6 +1457,16 @@ impl FnBuilder<'_, '_> {
                 self.set_term(Terminator::Trap {
                     reason: TrapReason::Panic,
                 });
+            }
+            // `@errorReturnTrace()` yields an opaque `?*StackTrace` handle. For
+            // v0.20 the *value* is always `null` (the program can null-check it /
+            // pass it around); the real product — the error-return trace — is
+            // printed automatically by the runtime when an error escapes `main`
+            // in Debug/ReleaseSafe (recorded at each `try` site, see the VM's
+            // `ReturnErr`). Lowering to a null optional keeps the surface honest
+            // while the trace machinery does the work.
+            "@errorReturnTrace" => {
+                self.assign(dst, Rvalue::MakeNull(ty), span);
             }
             "@errorName" | "@typeName"
             // The std capability/allocator floor: thin `@builtin` leaf intrinsics

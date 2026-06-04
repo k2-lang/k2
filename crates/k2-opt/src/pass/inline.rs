@@ -370,7 +370,7 @@ fn inline_one(prog: &mut MirProgram, ci: usize, site: CallSite) {
             stmts.push(s2);
         }
         let term = match &cb.term {
-            Terminator::Return { value } => {
+            Terminator::Return { value, .. } => {
                 // Write the returned value into the call's destination, then jump
                 // to the continuation.
                 let mut v = value.clone();
@@ -523,7 +523,7 @@ fn remap_terminator_operands(term: &mut Terminator, f: &impl Fn(LocalId) -> Loca
     match term {
         Terminator::Branch { cond, .. } => remap_operand(cond, f),
         Terminator::Switch { scrutinee, .. } => remap_operand(scrutinee, f),
-        Terminator::Return { value } => remap_operand(value, f),
+        Terminator::Return { value, .. } => remap_operand(value, f),
         Terminator::Goto(_) | Terminator::Trap { .. } | Terminator::Unreachable => {}
     }
 }

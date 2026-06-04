@@ -2003,7 +2003,7 @@ impl<'p> Aarch64FnLower<'p> {
                 self.asm.b(LabelId(default.index() as u32));
                 Ok(())
             }
-            Terminator::Return { value } => self.lower_return(value, rodata),
+            Terminator::Return { value, .. } => self.lower_return(value, rodata),
             Terminator::Trap { reason } => self.lower_trap(*reason, rodata),
             Terminator::Unreachable => self.lower_trap(TrapReason::Unreachable, rodata),
         }

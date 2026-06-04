@@ -300,21 +300,38 @@ impl Parser {
             self.bump()
         } else {
             let span = self.here();
-            self.error(
-                span,
-                format!("expected {} {ctx}, found {}", describe(k), self.cur_desc()),
+            // A primary label points at the error site naming what was expected,
+            // and a note records the construct being parsed (the `ctx`).
+            let point = Span::point(span.start, span.line, span.col);
+            let kind_desc = describe(k);
+            self.diags.push(
+                Diagnostic::error(
+                    point,
+                    format!("expected {kind_desc} {ctx}, found {}", self.cur_desc()),
+                )
+                .with_primary_label(format!("expected {kind_desc} here"))
+                .with_note(format!("while parsing {ctx}")),
             );
-            Span::point(span.start, span.line, span.col)
+            point
         }
     }
 
     /// A short human-readable description of the current token for messages.
+    ///
+    /// For kinds whose [`describe`] is already the literal glyph wrapped in
+    /// backticks (punctuation, operators, keywords), that string *is* the
+    /// description — appending the raw token text would double the glyph (e.g.
+    /// `` found `}` `}` ``). Only the generic-category kinds (identifier, the
+    /// literals, builtins) get the offending text quoted after the category word
+    /// (e.g. `` found identifier `foo` ``).
     fn cur_desc(&self) -> String {
         let tok = self.cur();
         if tok.kind == TokenKind::Eof {
             "end of input".to_string()
-        } else {
+        } else if describe_quotes_text(tok.kind) {
             format!("{} `{}`", describe(tok.kind), render_text(&tok.text))
+        } else {
+            describe(tok.kind).to_string()
         }
     }
 
@@ -461,6 +478,16 @@ fn assign_op_of(k: TokenKind) -> Option<k2_syntax::AssignOp> {
     })
 }
 
+/// `true` when [`describe`] returns a generic category word (e.g.
+/// `"identifier"`, `"integer literal"`, `"token"`) rather than a backtick-quoted
+/// literal glyph (e.g. `` "`}`" ``). The caller appends the offending token's
+/// text — `` `foo` `` — only for the former; appending it to a glyph arm would
+/// double the glyph (`` found `}` `}` ``). Keyed off the leading backtick so it
+/// stays correct as `describe`'s arms grow.
+fn describe_quotes_text(k: TokenKind) -> bool {
+    !describe(k).starts_with('`')
+}
+
 /// A short, stable, human-readable name for a token kind, for diagnostics.
 fn describe(k: TokenKind) -> &'static str {
     use TokenKind::*;
@@ -598,6 +625,41 @@ mod tests {
         let res = parse(&src);
         assert!(!res.is_ok(), "deep block nesting should be a parse error");
         let _ = to_sexpr(&res.file);
+    }
+
+    #[test]
+    fn punctuation_token_glyph_is_not_doubled() {
+        // A missing `;` before `}` makes the parser report the `}` it found. The
+        // glyph must appear exactly once (`found `}``), not doubled (`found `}`
+        // `}``), because `describe(RBrace)` already wraps the glyph in backticks.
+        let res = parse("pub fn main() void {\n    const x: i32 = 1\n}\n");
+        assert!(!res.is_ok());
+        let msg = &res
+            .errors()
+            .find(|d| d.message.contains("found `}`"))
+            .expect("expected a `found `}`` diagnostic")
+            .message;
+        assert!(
+            msg.contains("found `}`") && !msg.contains("`}` `}`"),
+            "punctuation glyph doubled: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn category_token_still_quotes_its_text() {
+        // An identifier-category token keeps its text quoted after the category
+        // word: `found identifier `__keep_text``. (Regression guard so the
+        // de-doubling fix did not also strip the useful text for word kinds.)
+        let res = parse("const x = 1 oops;\n");
+        assert!(!res.is_ok());
+        let any = res
+            .errors()
+            .any(|d| d.message.contains("identifier `oops`"));
+        assert!(
+            any,
+            "expected `identifier `oops`` in: {:?}",
+            res.diagnostics
+        );
     }
 
     #[test]

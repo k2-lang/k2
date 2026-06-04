@@ -357,6 +357,34 @@ fn check_type_error_exits_nonzero() {
         stderr.contains("error:") && stderr.contains("expected `u8`, found `bool`"),
         "stderr should carry the type diagnostic, got: {stderr}"
     );
+    // The diagnostic is rendered in the rich caret format: a header, a `-->`
+    // locator, the source line, and a `^` underline beneath the offending token.
+    assert!(
+        stderr.contains("-->"),
+        "rich locator missing, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("const x: u8 = true;"),
+        "source line missing, got: {stderr}"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    let src_idx = lines
+        .iter()
+        .position(|l| l.contains("const x: u8 = true;"))
+        .expect("source line present");
+    let underline = lines[src_idx + 1];
+    let caret = underline.find('^').expect("caret row follows the source");
+    let bar = underline.find('|').expect("gutter bar on caret row");
+    // The caret column (relative to the source text start) must land under
+    // `true` — the offending value.
+    let src_line = lines[src_idx];
+    let src_bar = src_line.find('|').unwrap();
+    let true_col = src_line.find("true").unwrap() - (src_bar + 2);
+    assert_eq!(
+        caret - (bar + 2),
+        true_col,
+        "caret must sit under `true`\n{stderr}"
+    );
     assert!(
         stdout.is_empty(),
         "no signature dump should be printed on error, got: {stdout}"
@@ -2159,5 +2187,206 @@ fn freestanding_native_still_works_without_libc() {
         out.status.success(),
         "freestanding run-native must still work, got:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn check_eof_unterminated_const_no_std_leak() {
+    // A truncated `const` initializer makes the parser run off the end of the
+    // user source into the appended std prelude. The diagnostic must point at the
+    // user's real last line (line 2), show a clean `found end of input`, and never
+    // leak the internal `__k2_std_root` name or a phantom std line number.
+    let (ok, _out, err) =
+        run_with_stdin(&["check", "-"], b"pub fn main() void {\n    const x: i32 =");
+    assert!(!ok, "an unterminated const must fail to check");
+    assert!(
+        !err.contains("__k2_std_root"),
+        "std-root name leaked into a user diagnostic:\n{err}"
+    );
+    // No phantom std line numbers (std is ~590 lines; phantom lines were ~595).
+    assert!(
+        !err.contains("<stdin>:595:") && !err.contains("<stdin>:597:"),
+        "phantom std line number leaked:\n{err}"
+    );
+    assert!(
+        err.contains("found end of input"),
+        "expected a clean end-of-input message:\n{err}"
+    );
+    // The locator points at the user's real last line (line 2) and shows it.
+    assert!(
+        err.contains("<stdin>:2:"),
+        "locator not on user line 2:\n{err}"
+    );
+    assert!(
+        err.contains("const x: i32 ="),
+        "snippet must show the user's last line:\n{err}"
+    );
+}
+
+#[test]
+fn check_eof_unclosed_brace_no_std_leak() {
+    // An unclosed function body brace runs the parser into std at EOF. Same
+    // contract: real user line (line 1), clean message, no std leak.
+    let (ok, _out, err) = run_with_stdin(&["check", "-"], b"pub fn f() void {");
+    assert!(!ok, "an unclosed brace must fail to check");
+    assert!(
+        !err.contains("__k2_std_root"),
+        "std-root name leaked:\n{err}"
+    );
+    assert!(
+        !err.contains("<stdin>:595:"),
+        "phantom std line leaked:\n{err}"
+    );
+    // The caret/locator points at the user's only line (line 1).
+    assert!(
+        err.contains("<stdin>:1:"),
+        "locator not on user line 1:\n{err}"
+    );
+    assert!(
+        err.contains("pub fn f() void {"),
+        "snippet must show the user's line:\n{err}"
+    );
+}
+
+#[test]
+fn run_prints_error_return_trace_through_try_sites() {
+    // A program propagating an error through `try a()` (in main) and `try b()`
+    // (in a) out of main prints an error-return trace listing those sites,
+    // newest-first, via `k2c run`.
+    let dir = std::env::temp_dir().join(format!("k2_trace_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = r#"const std = @import("std");
+const Boom = error{ Boom };
+fn b() Boom!u32 {
+    return Boom.Boom;
+}
+fn a() Boom!u32 {
+    const x = try b();
+    return x;
+}
+pub fn main(sys: *System) !void {
+    _ = sys;
+    const y = try a();
+    _ = y;
+}
+"#;
+    let path = dir.join("trace.k2");
+    std::fs::write(&path, src).unwrap();
+
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the error must escape nonzero");
+    assert!(stderr.contains("error: Boom"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("error return trace:"),
+        "expected a trace block, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("at b ("),
+        "trace must list the origin `b` (return Boom.Boom), got: {stderr}"
+    );
+    assert!(
+        stderr.contains("at a ("),
+        "trace must list `a`, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("at main ("),
+        "trace must list `main`, got: {stderr}"
+    );
+    // Newest-first: the origin `b` frame is deepest (first), then `a`, then
+    // `main`.
+    let bi = stderr.find("at b (").unwrap();
+    let ai = stderr.find("at a (").unwrap();
+    let mi = stderr.find("at main (").unwrap();
+    assert!(bi < ai && ai < mi, "trace not newest-first:\n{stderr}");
+    // The trace locations reference the real source file.
+    assert!(
+        stderr.contains("trace.k2:"),
+        "trace must point at the source file, got: {stderr}"
+    );
+
+    // In ReleaseFast the trace block is stripped; only the header prints.
+    let out_rf = k2c()
+        .arg("run")
+        .arg("--release-fast")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stderr_rf = String::from_utf8_lossy(&out_rf.stderr);
+    assert!(stderr_rf.contains("error: Boom"), "stderr: {stderr_rf}");
+    assert!(
+        !stderr_rf.contains("error return trace:"),
+        "ReleaseFast must strip the trace, got: {stderr_rf}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_rich_caret_aligns_under_multibyte_token() {
+    // A multi-byte string literal (`"café 漢字"`) precedes the offending value on
+    // the same line, so a byte-based caret would be misplaced. The rich renderer
+    // must align the `^` under the *display* column of `true`, counting `é` as
+    // one cell and each CJK glyph as two.
+    let src = "fn f() void { const s = \"café 漢字\"; _ = s; const x: u8 = true; _ = x; }\n";
+    let (ok, _stdout, stderr) = run_with_stdin(&["check", "-"], src.as_bytes());
+    assert!(!ok);
+    assert!(stderr.contains("expected `u8`, found `bool`"), "{stderr}");
+    assert!(stderr.contains("-->"), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let si = lines
+        .iter()
+        .position(|l| l.contains("café"))
+        .expect("source line");
+    let src_line = lines[si];
+    let underline = lines[si + 1];
+    let caret = underline.find('^').expect("caret");
+    let ubar = underline.find('|').unwrap();
+    let sbar = src_line.find('|').unwrap();
+    // The expected caret column is the display width of the text before `true`:
+    // each `é` is one cell, each CJK glyph is two.
+    let text_after_bar = &src_line[sbar + 2..];
+    let true_byte = text_after_bar.find("true").unwrap();
+    let prefix = &text_after_bar[..true_byte];
+    let true_disp: usize = prefix
+        .chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x4E00..=0x9FFF).contains(&cp) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum();
+    assert_eq!(
+        caret - (ubar + 2),
+        true_disp,
+        "caret must align under `true` past the multi-byte text\n{stderr}"
+    );
+    // Sanity: the byte offset of `true` differs from its display column.
+    assert_ne!(
+        true_disp, true_byte,
+        "fixture must exercise multi-byte width"
+    );
+}
+
+#[test]
+fn check_rich_caret_copies_leading_tab() {
+    // A real tab indents the offending line; the rich renderer copies the tab
+    // verbatim into the underline row so the caret aligns at any tab width.
+    let src = "fn f() void {\n\tconst x: u8 = true;\n}\n";
+    let (ok, _stdout, stderr) = run_with_stdin(&["check", "-"], src.as_bytes());
+    assert!(!ok);
+    assert!(stderr.contains("expected `u8`, found `bool`"), "{stderr}");
+    let underline = stderr
+        .lines()
+        .find(|l| l.contains('^'))
+        .expect("underline row");
+    let after_bar = &underline[underline.find('|').unwrap() + 2..];
+    assert!(
+        after_bar.starts_with('\t'),
+        "underline must copy the leading tab verbatim, got: {after_bar:?}"
     );
 }

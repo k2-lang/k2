@@ -12,6 +12,42 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **Rich diagnostics & error-return traces (v0.20).** Every phase can now attach a
+  *primary labelled span* plus zero-or-more *secondary labelled spans*, *notes*,
+  and a *help/suggestion* to a diagnostic, and the driver renders them in a
+  rustc/ariadne-style report — pure std, zero external crates. Components:
+  - **A shared rich model** (`k2_syntax::{RichDiagnostic, Label, RichSeverity}`).
+    Each phase's `Diagnostic` gains additive `primary_label`/`labels`/`notes`/
+    `help` fields (default-empty, so every existing constructor and `.message`/
+    `.span` assertion is unchanged) and a `to_rich()` conversion.
+  - **A pure-std caret renderer** (`k2c::render`) that prints the
+    `severity: message` header, a `--> file:line:col` locator, the source line(s)
+    with a line-number gutter, a `^^^` underline under the primary span (with its
+    inline label), secondary `---` underlines, multi-line span rails, and
+    `note:`/`help:` lines. It aligns the caret by **display column** — multi-byte
+    UTF-8 counts the right cells, CJK/emoji are width-2, combining marks are
+    width-0, and tabs are reproduced verbatim so alignment holds at any terminal
+    tab width. It honours `NO_COLOR`/`K2_NO_COLOR`/`K2_COLOR` and only colours a
+    tty, and it **never panics** on any input (empty file, EOF/past-EOF spans,
+    zero-width spans, 100 000-char lines, tab-only lines).
+  - **Wired into every `k2c` subcommand** (parse/ast/fmt/resolve/check/mir/run/
+    build/…), replacing ~12 hand-rolled one-line formatters with one path;
+    multiple diagnostics print in source order.
+  - **Upgraded high-value diagnostics:** type mismatch (primary "this is `T`" +
+    an `@as` help when both sides are numeric), undeclared name (primary "not
+    found in this scope" + a Levenshtein "did you mean `x`?" help), duplicate /
+    shadow decl (primary on the redeclaration + a secondary on the original),
+    non-exhaustive switch (note listing the missing cases + a help), and
+    parse-expected (a zero-width caret + a "while parsing …" note).
+  - **Error-return traces (VM).** A `@errorReturnTrace()` builtin (opaque
+    `?*StackTrace`, `null` for now) plus runtime instrumentation: each `try`
+    that re-throws records its source site, and when an error escapes `main` in
+    Debug/ReleaseSafe the runtime prints an `error return trace:` block listing
+    those sites newest-first (Zig-style). In **ReleaseFast** the whole mechanism
+    is stripped at compile time — no `ReturnErr` instruction, no per-fiber buffer,
+    byte-identical hot path. Native error-return traces are deferred/best-effort
+    (the shim ABI is specified for a later milestone); v0.20 ships them in the VM
+    (`k2c run`), which is what the acceptance gate verifies.
 - **C interop & FFI (v0.19): call libc from k2, expose k2 to C.** A k2 program can
   declare `extern fn puts(s: [*:0]const u8) c_int;`, call it, compile to a
   relocatable object, link with the system `cc`, and RUN with the right output;

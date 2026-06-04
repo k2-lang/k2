@@ -37,6 +37,21 @@ fn sole_error(t: &Typed) -> String {
     errs[0].message.clone()
 }
 
+/// The single error diagnostic (cloned), asserting there is exactly one error.
+/// Used by tests that inspect the rich labels / notes / help, not just the
+/// header message.
+fn sole_error_diag(t: &Typed) -> k2_types::Diagnostic {
+    let errs: Vec<_> = t.errors().collect();
+    assert_eq!(
+        errs.len(),
+        1,
+        "expected exactly one error, got {}: {:#?}",
+        errs.len(),
+        errs
+    );
+    errs[0].clone()
+}
+
 /// `true` if at least one error has the given message.
 fn has_error(t: &Typed, msg: &str) -> bool {
     t.errors().any(|d| d.message == msg)
@@ -197,9 +212,17 @@ fn switch_non_exhaustive_enum() {
     let t = check(
         "const C = enum { red, green, blue };\nfn f(c: C) void { switch (c) { .red => {}, .green => {} } }\n",
     );
+    let err = sole_error_diag(&t);
+    assert_eq!(err.message, "switch on enum `C` is not exhaustive");
+    // The missing-case list moved out of the header into a note.
+    assert!(
+        err.notes.iter().any(|n| n == "missing cases: `.blue`"),
+        "expected a missing-cases note, got: {:?}",
+        err.notes
+    );
     assert_eq!(
-        sole_error(&t),
-        "switch on enum `C` is not exhaustive: missing .blue"
+        err.help.as_deref(),
+        Some("add the missing arm(s) or an `else =>` branch")
     );
 }
 
@@ -208,9 +231,12 @@ fn switch_non_exhaustive_enum() {
 fn switch_non_exhaustive_error_set() {
     let t =
         check("const E = error{ A, B };\nfn f(e: E) u8 { return switch (e) { error.A => 1 }; }\n");
-    assert_eq!(
-        sole_error(&t),
-        "switch over error set is not exhaustive: missing error.B"
+    let err = sole_error_diag(&t);
+    assert_eq!(err.message, "switch over error set is not exhaustive");
+    assert!(
+        err.notes.iter().any(|n| n == "missing cases: `error.B`"),
+        "expected a missing-cases note, got: {:?}",
+        err.notes
     );
 }
 
@@ -744,5 +770,30 @@ fn failed_instantiation_reported_once() {
         1,
         "a failed instantiation reused at two sites must report once, got: {:#?}",
         t.errors().collect::<Vec<_>>()
+    );
+}
+
+// ---- Rich-diagnostic content (v0.20): labels / notes / help -------------
+
+#[test]
+fn type_mismatch_has_primary_label() {
+    let t = check("fn f() void { const x: i32 = true; }\n");
+    let err = sole_error_diag(&t);
+    assert_eq!(err.message, "expected `i32`, found `bool`");
+    assert_eq!(err.primary_label, "this is `bool`");
+    // `bool`->`i32` is not numeric-to-numeric, so no `@as` help here.
+    assert!(err.help.is_none(), "unexpected help: {:?}", err.help);
+}
+
+#[test]
+fn numeric_mismatch_suggests_as_cast() {
+    // A wider int flowing into a narrower typed binding: both numeric → help.
+    let t = check("fn f(n: i64) void { const x: i32 = n; _ = x; }\n");
+    let err = sole_error_diag(&t);
+    assert_eq!(err.message, "expected `i32`, found `i64`");
+    assert_eq!(err.primary_label, "this is `i64`");
+    assert_eq!(
+        err.help.as_deref(),
+        Some("convert explicitly with `@as(i32, …)` if a cast is intended")
     );
 }

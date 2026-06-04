@@ -340,7 +340,10 @@ impl<'a> Lowerer<'a> {
         if !fb.terminated() {
             fb.run_scope_exit_all(false);
             let v = Operand::Const(Const::Void);
-            fb.set_term(Terminator::Return { value: v });
+            fb.set_term(Terminator::Return {
+                value: v,
+                err_trace: None,
+            });
         }
         fb.pop_scope_no_defers();
         let alloc_info = fb.alloc_info.clone();
@@ -379,7 +382,10 @@ impl<'a> Lowerer<'a> {
         if !fb.terminated() {
             fb.run_scope_exit_all(false);
             let v = Operand::Const(Const::Void);
-            fb.set_term(Terminator::Return { value: v });
+            fb.set_term(Terminator::Return {
+                value: v,
+                err_trace: None,
+            });
         }
         fb.pop_scope_no_defers();
         let alloc_info = fb.alloc_info.clone();
@@ -440,7 +446,10 @@ impl<'a> Lowerer<'a> {
         } else {
             Operand::Const(Const::Undef { ty: ret })
         };
-        f.blocks[entry.index()].term = Terminator::Return { value: v };
+        f.blocks[entry.index()].term = Terminator::Return {
+            value: v,
+            err_trace: None,
+        };
     }
 
     /// Writes a trivial `return void` stub into `fid` (for a body-less fn).
@@ -457,7 +466,10 @@ impl<'a> Lowerer<'a> {
         } else {
             Operand::Const(Const::Undef { ty: ret })
         };
-        f.blocks[entry.index()].term = Terminator::Return { value: v };
+        f.blocks[entry.index()].term = Terminator::Return {
+            value: v,
+            err_trace: None,
+        };
     }
 
     // -------------------------------------------------------------------
@@ -1175,16 +1187,22 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         let ret_ty = self.func.ret;
         // Compute the returned value first (before defers, so defers see the
         // post-value state but the value is already materialized in a temp).
-        let (operand, is_error) = match value {
+        let (operand, is_error, is_origin) = match value {
             Some(e) => {
                 let vty = self.type_at(e.span());
                 let is_err = self.is_error_value(e, vty);
+                // This `return` is the ORIGIN of the error — the site where the
+                // error value first appears (spec §6.9) — exactly when it lowers
+                // to a `MakeErr`: an error-union return whose operand is a
+                // statically-known `error.X` / `Set.X` tag. Pass-through returns
+                // of an existing error union (`return someEU`) are not origins.
+                let is_origin = self.is_error_origin_return(e, ret_ty, vty);
                 // Materialize into a temp so defers can run after.
                 let tmp = self.new_temp(ret_ty, span);
                 self.lower_return_value_into(Place::local(tmp), e, ret_ty);
-                (Operand::local(tmp), is_err)
+                (Operand::local(tmp), is_err, is_origin)
             }
-            None => (Operand::Const(Const::Void), false),
+            None => (Operand::Const(Const::Void), false, false),
         };
         self.run_scope_exit_all(is_error);
         // Move into the ret slot, then Return.
@@ -1193,7 +1211,27 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             rvalue: Rvalue::Use(operand.clone()),
             span,
         });
-        self.set_term(Terminator::Return { value: operand });
+        // Seed the error-return trace's ORIGIN frame at the creation site so the
+        // deepest printed frame is where the error came from (`return E.X`), not
+        // the first `try` above it. The VM's `MakeErr` clears the per-fiber trace
+        // buffer (a fresh error starts clean), then this `ReturnErr` pushes the
+        // origin frame; later `try` sites append above it, newest-first.
+        self.set_term(Terminator::Return {
+            value: operand,
+            err_trace: if is_origin { Some(span) } else { None },
+        });
+    }
+
+    /// `true` when a `return e` is the error *origin* — i.e. it lowers to a
+    /// `MakeErr` that mints a fresh error union from a statically-known
+    /// `error.X` / `Set.X` tag. This mirrors the `MakeErr` arm of
+    /// [`lower_return_value_into`]; a pass-through of an existing error union or a
+    /// dynamic error-set value is not an origin (no fresh error is created here).
+    fn is_error_origin_return(&mut self, e: &Expr, ret_ty: TypeId, vty: TypeId) -> bool {
+        if !matches!(self.lo.typed.arena.get(ret_ty), Type::ErrorUnion { .. }) {
+            return false;
+        }
+        self.is_error_value(e, vty) && self.error_operand_tag(e).is_some()
     }
 
     /// Lowers the value of a `return` into `dst`, wrapping into the error union /

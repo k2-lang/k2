@@ -102,16 +102,32 @@ impl crate::check::Checker<'_> {
             self.record(span, rec);
             got
         } else {
-            self.error(
+            // A primary label naming the found type, plus a targeted help when an
+            // explicit cast (`@as`) is the likely fix (both sides are numeric).
+            let expected_s = self.arena.fmt(expected);
+            let found_s = self.arena.fmt(got);
+            let mut diag = crate::Diagnostic::error(
                 span,
-                format!(
-                    "expected `{}`, found `{}`",
-                    self.arena.fmt(expected),
-                    self.arena.fmt(got)
-                ),
-            );
+                format!("expected `{expected_s}`, found `{found_s}`"),
+            )
+            .with_primary_label(format!("this is `{found_s}`"));
+            if self.is_numeric(expected) && self.is_numeric(got) {
+                diag = diag.with_help(format!(
+                    "convert explicitly with `@as({expected_s}, …)` if a cast is intended"
+                ));
+            }
+            self.error_rich(diag);
             self.arena.t_error()
         }
+    }
+
+    /// `true` if `ty` is an integer or float type (the cases an `@as` cast can
+    /// bridge), used to decide whether to suggest an explicit conversion.
+    fn is_numeric(&self, ty: TypeId) -> bool {
+        matches!(
+            self.arena.get(ty),
+            Type::Int { .. } | Type::Float { .. } | Type::ComptimeInt | Type::ComptimeFloat
+        )
     }
 
     /// Infers an expression's type bottom-up.

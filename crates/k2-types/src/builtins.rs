@@ -83,6 +83,18 @@ impl crate::check::Checker<'_> {
             }
             // `@import("s")` -> a module namespace (or Deferred if unmapped).
             "@import" => self.import_namespace(args, span),
+            // `@errorReturnTrace()` -> an opaque `?*StackTrace` handle. In
+            // Debug/ReleaseSafe the runtime yields a non-null handle; in
+            // ReleaseFast it yields `null` (the trace machinery is stripped). For
+            // v0.20 the value is opaque (the program can null-check / pass it
+            // around); the useful product is the automatic trace printed on an
+            // error escaping `main`. We model the result as `?<opaque>` so a
+            // null-check type-checks.
+            "@errorReturnTrace" => {
+                self.synth_all(args);
+                let inner = self.arena.t_deferred();
+                self.arena.optional(inner)
+            }
             // String-producing builtins.
             "@errorName" | "@typeName" | "@tagName" | "@embedFile" => {
                 self.synth_all(args);
