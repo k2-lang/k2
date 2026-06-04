@@ -85,6 +85,35 @@ is being designed in the open and nothing is stable yet.
     `docs/spec/09-concurrency.md §8.1` and `crate::sched`). New example
     `examples/concurrency.k2` (spawn+join parallel sum, channel producer/consumer,
     mutex counter, atomics, async/await) runs with deterministic output.
+  - **The build system is k2 + the package/module system (v0.12).** `build.k2`
+    now *runs*: `build(b: *Build)` is ordinary k2 executed on the VM with a
+    `*Build` **capability** — the build-time analogue of `*System`. Its methods
+    bottom out in a floor of `@build*` **recording** intrinsics (no I/O, no real
+    allocation — the comptime sandbox is honored) that build a deterministic,
+    creation-ordered **build graph** the VM exposes after `build(b)` returns. The
+    bundled `build` module (`crates/k2-std/std/build.k2`) declares the `Build`
+    capability surface and its `Target`/`OptimizeMode`/`Step`/`Module`/`Artifact`
+    helper types over that floor. A new `k2c build [step] [-Dkey=value …]`
+    subcommand runs `build(b)`, parses `-Doptimize`/`-Dtarget`/custom options,
+    writes a deterministic, reproducible `build.lock`, then executes the step:
+    `install`/default **describes + validates** the DAG (native artifact emission
+    is a documented no-op until post-0.13 native codegen), `run` **builds + runs**
+    the chosen executable through the VM, and `test` **compiles + runs** the
+    reachable `test { ... }` blocks. **Multi-file compilation** is realized by
+    merging the module graph into one implicit-struct `SourceFile` (the
+    std-injection move, generalized): `.k2` **path imports** (`@import("./x.k2")`)
+    and **named modules** (`exe.addModule("name", lib.module())`, then
+    `@import("name")` in the artifact) now resolve, type-check, monomorphize,
+    lower, and run as one program — wired into `k2c run` as well, with the
+    single-file fast path untouched. `@import("build_options")` is a **synthesized
+    comptime module** (one `pub const` per `addOption`), so `if (opts.flag)` is a
+    comptime-known condition whose dead branch the optimizer eliminates entirely.
+    Fixes a latent checker/lowering bug where a **non-generic free function called
+    through a namespace const** (`ns.add(x, y)`) was lowered with a spurious
+    receiver. New `examples/support/root.k2` + `examples/tests/all.k2` make
+    `examples/build.k2` run end to end: `k2c build` describes the DAG,
+    `k2c build run -Dexample=hello` prints `Hello, k2!`, and `k2c build test` runs
+    the example tests.
 
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security

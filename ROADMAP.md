@@ -47,7 +47,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | v0.9 | Optimizer & release mode — **proven fast** | ⬜ |
 | v0.10 | Standard library & the `*System` capabilities | ⬜ |
 | v0.11 | Concurrency: threads, sync & async | ⬜ |
-| v0.12 | `build.k2` & the package/module system | ⬜ |
+| v0.12 | `build.k2` & the package/module system | ✅ |
 | v0.13 | Tooling: formatter polish & language server | ⬜ |
 
 ---
@@ -153,12 +153,30 @@ Library-provided over OS threads; no built-in runtime. See
 - Colorless, stackless `async`/`await` lowered at compile time, with
   caller-owned `Frame` storage and an event loop obtained from `*System`.
 
-## v0.12 — `build.k2` & the package/module system ⬜
+## v0.12 — `build.k2` & the package/module system ✅
 
-- `build.k2` executed by the comptime engine — the build system *is* k2 itself,
-  with no second configuration language. `k2c build`.
-- A multi-file module/package graph, lockfile, and reproducible builds.
-- Build options surfaced to programs via `@import("build_options")`.
+- ✅ `build.k2` *runs* — the build system **is** k2, with no second
+  configuration language. `build(b: *Build)` is ordinary k2 executed on the VM
+  with a `*Build` **capability** (the build-time analogue of `*System`) backed by
+  `@build*` **recording** intrinsics that build a deterministic graph (no I/O, no
+  real allocation — the comptime sandbox is honored). This is the faithful
+  realization of "executed by the comptime engine" (noted in
+  `docs/spec/08 §6.1`).
+- ✅ `k2c build [step] [-Dkey=value …]`: runs `build(b)`, parses
+  `-Doptimize`/`-Dtarget`/custom bool/string options, then executes the step —
+  `install`/default **describes + validates** the DAG (native emission a
+  documented no-op until post-0.13 codegen), `run` **builds + runs** the chosen
+  executable through the VM, `test` **compiles + runs** the `test { ... }`
+  blocks.
+- ✅ A multi-file module graph: `.k2` **path imports** and **named modules**
+  (`addModule`) resolve, type-check, monomorphize, lower, and run as one merged
+  program (the std-injection move, generalized) — wired into `k2c run` too.
+- ✅ A deterministic, reproducible `build.lock` (sorted graph + per-input content
+  hashes; identical inputs → byte-identical lock). The offline/local realization
+  of the §7.3 lockfile.
+- ✅ Build options surfaced to programs via `@import("build_options")` — a
+  synthesized comptime module whose `if (opts.flag)` dead branch the optimizer
+  eliminates entirely.
 
 ## v0.13 — Tooling: formatter polish & language server ⬜
 

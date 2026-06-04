@@ -168,8 +168,17 @@ impl crate::check::Checker<'_> {
             | Expr::AnyType { .. }
             | Expr::Container(_) => {
                 // Evaluate the denoted type for its side effects (interning,
-                // sub-checks), but the *value* of a type expression is `type`.
-                let _ = self.eval_type(e);
+                // sub-checks). The *value* of a type expression is `type`, but we
+                // also record the DENOTED type at this span so the MIR lowerer can
+                // give a type-valued argument (e.g. the `[]const u8` in
+                // `b.option([]const u8, ...)`) an `undef` carrier of the concrete
+                // type — not the erased `type` — so a build option honors its
+                // declared kind.
+                let denoted = self.eval_type(e);
+                if !self.arena.is_bottom(denoted) {
+                    self.type_valued_spans
+                        .insert((e.span().start, e.span().end), denoted);
+                }
                 self.arena.t_type()
             }
 
@@ -234,8 +243,21 @@ impl crate::check::Checker<'_> {
         match self.resolution_at(span) {
             Some(k2_resolve::Resolution::Predeclared(_)) => {
                 // A predeclared type name in value position has type `type`; a
-                // predeclared value would too, but none exist in v0.5.
-                self.predeclared_value_type(name)
+                // predeclared value would too, but none exist in v0.5. Record the
+                // denoted primitive type at this span (so `bool`/`u32` passed to a
+                // `comptime T: type` intrinsic — e.g. `b.option(bool, ...)` — give
+                // the lowerer a concrete `undef` carrier instead of the erased
+                // `type`). Capability markers (`System`/`Allocator`/`Build`) are
+                // not type-denoting, so they are skipped.
+                let value_ty = self.predeclared_value_type(name);
+                if matches!(self.arena.get(value_ty), Type::TypeType) {
+                    let denoted = self.predeclared_type(name);
+                    if !self.arena.is_bottom(denoted) {
+                        self.type_valued_spans
+                            .insert((span.start, span.end), denoted);
+                    }
+                }
+                value_ty
             }
             Some(k2_resolve::Resolution::Def(id)) => self
                 .binding_types

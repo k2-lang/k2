@@ -1,0 +1,26 @@
+//! examples_tests — the test root for `k2 build test`.
+//!
+//! It imports the shared `examples_support` module (wired in by
+//! `examples/build.k2` via `tests.addModule("examples_support", lib.module())`)
+//! and exercises it with a couple of real `test { ... }` blocks. The test runner
+//! compiles every reachable test block into a runner and executes each on a fresh,
+//! sandboxed fiber (spec §08.9.3).
+
+const std = @import("std");
+const support = @import("examples_support");
+
+test "support version is v12" {
+    try std.testing.expectEqual(@as(u32, 12), support.VERSION);
+}
+
+test "banner echoes its argument" {
+    try std.testing.expect(support.banner("k2").len == 2);
+}
+
+test "mirror flag is a comptime-known bool" {
+    // `support.mirror_to_stderr` comes from the build option; either value is a
+    // valid bool, so this just proves the build_options wiring type-checks and
+    // runs end to end.
+    const flag = support.mirror_to_stderr;
+    try std.testing.expect(flag == true or flag == false);
+}

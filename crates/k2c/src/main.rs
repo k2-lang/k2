@@ -37,6 +37,11 @@
 //! failure). For `parse`, the process additionally exits nonzero when the
 //! source contained one or more parse errors.
 
+mod build_cmd;
+mod imports;
+mod lock;
+mod multi;
+
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -97,6 +102,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "check" => cmd_check(rest),
         "mir" => cmd_mir(rest),
         "run" => cmd_run(rest),
+        "build" => build_cmd::cmd_build(rest),
         "bench" => cmd_bench(rest),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -963,6 +969,29 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         path.ok_or_else(|| "`run` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
 
     let (source, label) = read_source(path)?;
+
+    // Multi-file fast path: a program with `@import("./x.k2")` path imports
+    // compiles as a merged module graph (path imports + named modules resolve,
+    // type-check, monomorphize, lower, and run as one program). A program with
+    // only named imports (`std`, …) takes the existing single-file path below,
+    // whose spans/diagnostics are byte-identical to before.
+    if multi::has_path_imports(&source) {
+        if path == "-" {
+            // A relative `@import("./...")` has no anchor when the source comes
+            // from stdin (there is no file directory to resolve against), so the
+            // multi-file merge cannot run. Reject it at COMPILE time with a clear
+            // message instead of letting the unresolved import reach the VM as an
+            // `unsupported intrinsic module.VERSION` runtime panic.
+            let _ = writeln!(
+                io::stderr(),
+                "{label}: error: cannot resolve a relative `@import(\"./...\")` from stdin; \
+                 pass a file path so the build root is known"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        return run_multi_file(path, &label, mode, opt_flag, opt_report, forwarded);
+    }
+
     let pres = parse_program(&source);
 
     // Parse errors gate execution: report them and stop, like `mir`.
@@ -1086,6 +1115,69 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
 
     // Execute `main`; the VM streams program output and propagates the exit code.
+    Ok(run_program(
+        &prog,
+        RunArgs {
+            mode,
+            argv: forwarded,
+        },
+    ))
+}
+
+/// Compiles + runs a multi-file program: a root `.k2` with `@import("./x.k2")`
+/// path imports. The module graph is merged into one program (the std-injection
+/// mechanism generalized), then lowered, optimized, and executed exactly like a
+/// single-file run. The build root is the root file's own directory, so path
+/// imports resolve relative to it.
+fn run_multi_file(
+    path: &str,
+    label: &str,
+    mode: BuildMode,
+    opt_flag: bool,
+    opt_report: bool,
+    forwarded: Vec<String>,
+) -> Result<ExitCode, String> {
+    let root = Path::new(path);
+    let build_root = root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let merged = multi::merge(&multi::CompileInputs {
+        root_source: root.to_path_buf(),
+        build_root,
+        named_modules: Vec::new(),
+        build_options: Vec::new(),
+        inject_build: false,
+    })
+    .map_err(|d| format!("{}: {}", d.label, d.message))?;
+
+    let mut prog = match multi::compile_merged(&merged.source, label, mode) {
+        Ok(p) => p,
+        Err(diags) => {
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            for d in &diags {
+                let _ = writeln!(err, "{}: {}", d.label, d.message);
+            }
+            let _ = writeln!(err, "error: cannot run {label}: front-end errors");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    let stats = run_optimizer(&mut prog, mode, opt_flag)?;
+    if opt_report {
+        let _ = writeln!(io::stderr(), "# opt: {stats:?}");
+    }
+    let problems = prog.verify();
+    if !problems.is_empty() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for p in &problems {
+            let _ = writeln!(err, "error: malformed MIR: {}", p.message);
+        }
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(run_program(
         &prog,
         RunArgs {

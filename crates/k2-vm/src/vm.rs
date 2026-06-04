@@ -14,12 +14,41 @@ use std::rc::Rc;
 use k2_mir::{BinOp, CastKind, DiscrKind, FnId, MirProgram, SliceMeta, TrapReason, UnOp};
 use k2_types::TypeId;
 
+use crate::build_graph::{
+    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, ModuleNode, OptMode, StepNode,
+    TargetTriple,
+};
 use crate::compile::{compile_program, default_value, int_repr_of};
 use crate::fmt::format_into;
 use crate::heap::{Heap, HeapFault, Ptr};
 use crate::isa::{AggregateKind, CompiledFn, Instr, IntrinsicId, Reg, StoreStep};
 use crate::sched::{BlockReason, FiberId, FiberState, Frame, Scheduler};
 use crate::value::{Capability, IntRepr, SchedKind, Value};
+
+/// The build-time inputs the driver seeds into the VM before running `build(b)`:
+/// the resolved target/optimize choices and the `-D` option map. The `*Build`
+/// intrinsics read these (e.g. `b.standardTarget()` returns `target`,
+/// `b.option(...)` looks up the `-D` map) and record the rest into a
+/// [`BuildGraph`].
+#[derive(Clone, Debug)]
+pub struct BuildInputs {
+    /// The resolved target triple (`-Dtarget`, default host).
+    pub target: TargetTriple,
+    /// The optimization mode (`-Doptimize`, default Debug).
+    pub optimize: OptMode,
+    /// The `-Dkey=value` option map (deterministic order via the driver's
+    /// `BTreeMap`).
+    pub dopts: Vec<(String, String)>,
+}
+
+/// The mutable build-recording state the `*Build` floor writes into. Present only
+/// while `build(b)` runs; ordinary `run`/`test` leave it `None`.
+struct BuildContext {
+    /// The driver-seeded inputs (target/optimize/`-D` map).
+    inputs: BuildInputs,
+    /// The graph being recorded, in creation order.
+    graph: BuildGraph,
+}
 
 /// How far the VM may step before it gives up on a presumed-nonterminating
 /// program. Real corpus programs finish in a few thousand steps; this is still
@@ -67,6 +96,7 @@ const MAX_DEPTH: usize = 200_000;
 
 /// A reason the VM stopped: a clean program panic, an error that escaped `main`,
 /// or an explicit exit.
+#[derive(Clone, Debug)]
 pub enum Halt {
     /// A safety check failed or a trap/unreachable fired.
     Panic(PanicInfo),
@@ -77,6 +107,7 @@ pub enum Halt {
 }
 
 /// The detail of a clean panic.
+#[derive(Clone, Debug)]
 pub struct PanicInfo {
     /// Why the panic fired.
     pub reason: TrapReason,
@@ -85,6 +116,15 @@ pub struct PanicInfo {
 }
 
 impl PanicInfo {
+    /// A panic describing an internal toolchain failure (e.g. a caught Rust
+    /// panic), used by the public entry points' `catch_unwind` backstops.
+    pub fn internal(what: &str) -> PanicInfo {
+        PanicInfo {
+            reason: TrapReason::Panic,
+            detail: Some(format!("internal VM error: {what}")),
+        }
+    }
+
     /// The human-readable panic message (without the `panic: ` prefix).
     pub fn message(&self) -> String {
         let base = match self.reason {
@@ -192,6 +232,9 @@ pub struct Vm<'p> {
     instr_count: u64,
     /// When the run started, for the wall-clock termination deadline.
     started: std::time::Instant,
+    /// The build-recording context, present only while `build(b)` runs (the
+    /// `*Build` capability floor writes into it). `None` for ordinary runs.
+    build: Option<BuildContext>,
 }
 
 impl<'p> Vm<'p> {
@@ -216,6 +259,7 @@ impl<'p> Vm<'p> {
             budget: STEP_BUDGET,
             instr_count: 0,
             started: std::time::Instant::now(),
+            build: None,
         }
     }
 
@@ -251,6 +295,102 @@ impl<'p> Vm<'p> {
             return Some(f.id);
         }
         self.prog.entries.first().copied()
+    }
+
+    /// Finds the `pub fn build(b: *Build)` entry function id, if present.
+    fn find_build(&self) -> Option<FnId> {
+        self.prog
+            .funcs
+            .iter()
+            .find(|f| f.name == "build")
+            .map(|f| f.id)
+    }
+
+    /// Runs `build(b)` on the VM with a `*Build` capability and returns the
+    /// recorded [`BuildGraph`]. This is the faithful realization of the roadmap's
+    /// "executed by the comptime engine": `build(b)` is ordinary k2 run on the
+    /// same VM as any program, but with a `*Build` value backed by recording
+    /// intrinsics that build a graph (no I/O, no real allocation).
+    pub fn run_build(&mut self, inputs: BuildInputs) -> Result<BuildGraph, Halt> {
+        let build = self.find_build().ok_or_else(|| {
+            Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some("build.k2 has no `pub fn build(b: *Build)` entry".to_string()),
+            })
+        })?;
+        let graph = BuildGraph::new(inputs.target.clone(), inputs.optimize);
+        self.build = Some(BuildContext { inputs, graph });
+        // The `*Build` capability is a fresh opaque handle, like `*System`.
+        let cap = Value::Cap(Capability::Build);
+        let root = self.spawn_fiber_for(build, vec![cap])?;
+        self.event_loop()?;
+        let _ = root;
+        Ok(self
+            .build
+            .take()
+            .map(|b| b.graph)
+            .unwrap_or_else(|| BuildGraph::new(TargetTriple::host(), OptMode::Debug)))
+    }
+
+    /// Runs every `test { ... }` block in `prog` on a fresh fiber, returning
+    /// `(passed, failed, report_lines)`. Each test function is named `"test …"`
+    /// by the MIR lowering; a test that returns an error (its `!void` carries an
+    /// `ErrVal`) or panics is a failure. This reuses the existing test lowering;
+    /// the VM only needs this entry point.
+    pub fn run_tests(&mut self) -> (usize, usize, Vec<String>) {
+        // Collect the test entries up front (name + id) so the borrow of `prog`
+        // does not overlap the fiber runs.
+        let tests: Vec<(FnId, String)> = self
+            .prog
+            .funcs
+            .iter()
+            .filter(|f| f.name == "test" || f.name.starts_with("test "))
+            .map(|f| (f.id, f.name.clone()))
+            .collect();
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        let mut report = Vec::new();
+        for (fid, name) in tests {
+            match self.run_one_test(fid) {
+                Ok(()) => {
+                    passed += 1;
+                    report.push(format!("{name} ... ok"));
+                }
+                Err(detail) => {
+                    failed += 1;
+                    report.push(format!("{name} ... FAILED ({detail})"));
+                }
+            }
+        }
+        (passed, failed, report)
+    }
+
+    /// Runs a single test function on a fresh fiber + clean scheduler state,
+    /// returning `Ok(())` on pass or `Err(detail)` on an error/panic.
+    fn run_one_test(&mut self, fid: FnId) -> Result<(), String> {
+        // Reset the scheduler so each test runs on its own clean fiber set (a
+        // prior test's stale fibers must not leak into this one).
+        self.sched = Scheduler::new();
+        let root = match self.spawn_fiber_for(fid, Vec::new()) {
+            Ok(r) => r,
+            Err(h) => return Err(halt_detail(&h)),
+        };
+        match self.event_loop() {
+            Ok(()) => {}
+            Err(h) => return Err(halt_detail(&h)),
+        }
+        match self.sched.fibers[root as usize].result.take() {
+            Some(Value::ErrVal(tag)) => {
+                let name = self
+                    .prog
+                    .err_names
+                    .get(&k2_mir::ErrTag(tag))
+                    .cloned()
+                    .unwrap_or_else(|| format!("error{tag}"));
+                Err(format!("error.{name}"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Builds the root [`Frame`] for `fnid` seeded with `args`, registers a fresh
@@ -1292,9 +1432,497 @@ impl<'p> Vm<'p> {
             }
             return self.dispatch_concurrency(id, args);
         }
+        // The *Build capability floor records into the build graph (no I/O). The
+        // `*Artifact`/`*Step` methods carry their handle id in the RECEIVER (a
+        // `{ id }` struct, or a pointer to one); prepend it so the recorder reads
+        // it uniformly, exactly like the concurrency floor.
+        if is_build_intrinsic(id) {
+            // The `Target` field reads index the receiver struct directly.
+            if let Some(field) = build_target_field(id) {
+                let v = match &recv {
+                    Some(Value::Struct(fields)) => {
+                        fields.get(field).cloned().unwrap_or(Value::Unit)
+                    }
+                    _ => Value::Unit,
+                };
+                return Ok(IntrinsicOutcome::Value(v));
+            }
+            if needs_handle_receiver(id) {
+                if let Some(r) = &recv {
+                    let mut merged = Vec::with_capacity(args.len() + 1);
+                    merged.push(self.handle_of_receiver(r));
+                    merged.extend_from_slice(args);
+                    return self
+                        .dispatch_build(id, &merged)
+                        .map(IntrinsicOutcome::Value);
+                }
+            }
+            return self.dispatch_build(id, args).map(IntrinsicOutcome::Value);
+        }
         // Every other intrinsic is non-blocking: compute its value and wrap it.
         self.dispatch_intrinsic_value(id, recv, args)
             .map(IntrinsicOutcome::Value)
+    }
+
+    /// Reads a `[]const u8` argument as a Rust `String`, from either a `Str`
+    /// literal value or a heap-backed `Slice` (e.g. `b.fmt(...)`'s `@bufPrint`
+    /// result). A non-string value yields the empty string.
+    fn read_bytes(&self, v: Option<&Value>) -> String {
+        match v {
+            Some(Value::Str(b)) => String::from_utf8_lossy(b).into_owned(),
+            Some(Value::Slice { ptr, len }) => {
+                let mut out = Vec::with_capacity(*len);
+                for i in 0..*len {
+                    match self.heap.load_index(*ptr, i) {
+                        Ok(Value::Int { v, .. }) => out.push(v as u8),
+                        _ => break,
+                    }
+                }
+                String::from_utf8_lossy(&out).into_owned()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Reads a build handle id from a value: a bare integer, a `{ id }` handle
+    /// struct (Artifact/Step/Module), or a pointer to one (`&run_exe.step`). This
+    /// is how `addRunArtifact(exe)`, `installArtifact(a)`, `addModule(.., mod)`,
+    /// and `dependOn(&other.step)` read the id out of their handle operand.
+    fn build_handle_id(&self, v: Option<&Value>) -> u32 {
+        match v {
+            Some(Value::Int { v, .. }) => *v as u32,
+            Some(Value::Struct(fields)) => {
+                fields.first().and_then(|f| f.as_usize()).unwrap_or(0) as u32
+            }
+            Some(Value::Ptr(p)) => match self.heap.load(*p) {
+                Ok(inner) => self.build_handle_id(Some(&inner)),
+                Err(_) => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Dispatches one `*Build` capability intrinsic. Every variant is a pure
+    /// recorder: it reads driver-seeded inputs and/or pushes a node into the build
+    /// graph, performing no I/O and no real allocation (the comptime sandbox). The
+    /// graph is stored in creation order, so the result — and the lockfile derived
+    /// from it — is deterministic.
+    fn dispatch_build(&mut self, id: &IntrinsicId, args: &[Value]) -> Result<Value, Halt> {
+        // Every build intrinsic needs the recording context; its absence means a
+        // `@build*` reached an ordinary `run`/`test`, which is a clean panic.
+        if self.build.is_none() {
+            return Err(Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some("build intrinsic reached outside `k2 build`".to_string()),
+            }));
+        }
+        match id {
+            IntrinsicId::BuildStdTarget => Ok(self.build_target_value()),
+            IntrinsicId::BuildStdOptimize => {
+                let idx = self.build.as_ref().unwrap().graph.optimize.index();
+                Ok(Value::Enum {
+                    tag: idx as u32,
+                    payload: Box::new(Value::Unit),
+                })
+            }
+            IntrinsicId::BuildOption => Ok(self.build_option(args)),
+            IntrinsicId::BuildAddLibrary => {
+                Ok(self.build_add_artifact(ArtifactKind::Library, args))
+            }
+            IntrinsicId::BuildAddExecutable => {
+                Ok(self.build_add_artifact(ArtifactKind::Executable, args))
+            }
+            IntrinsicId::BuildAddTest => Ok(self.build_add_artifact(ArtifactKind::Test, args)),
+            IntrinsicId::BuildArtifactOption => {
+                self.build_artifact_option(args);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::BuildArtifactModule => {
+                self.build_artifact_module(args);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::BuildArtifactModuleSelf => Ok(self.build_artifact_module_self(args)),
+            IntrinsicId::BuildArtifactStep => Ok(self.build_artifact_step(args)),
+            IntrinsicId::BuildArtifactForwardArgs => {
+                self.build_artifact_forward_args(args);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::BuildAddRun => Ok(self.build_add_run(args)),
+            IntrinsicId::BuildInstall => {
+                self.build_install(args);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::BuildStep => Ok(self.build_step(args)),
+            IntrinsicId::BuildStepDependOn => {
+                self.build_step_depend_on(args);
+                Ok(Value::Unit)
+            }
+            // `b.path(rel)` is identity: return the path string operand verbatim.
+            IntrinsicId::BuildPath => Ok(args
+                .iter()
+                .find(|a| matches!(a, Value::Str(_) | Value::Slice { .. }))
+                .cloned()
+                .unwrap_or(Value::Unit)),
+            // `b.fmt(template, args)` formats into a fresh string via the shared
+            // engine (no build-time I/O, no allocator).
+            IntrinsicId::BuildFmt => self.build_fmt(args),
+            _ => Err(self.internal("non-build intrinsic in build dispatcher")),
+        }
+    }
+
+    /// Builds the `Target` struct value `@buildStdTarget()` returns: a 3-field
+    /// `{ arch, os, abi }` of enum values, so a build script can `switch
+    /// (target.os)`.
+    fn build_target_value(&self) -> Value {
+        let t = &self.build.as_ref().unwrap().graph.target;
+        let mk = |idx: i128| Value::Enum {
+            tag: idx as u32,
+            payload: Box::new(Value::Unit),
+        };
+        Value::Struct(Rc::new(vec![
+            mk(t.arch_index()),
+            mk(t.os_index()),
+            mk(t.abi_index()),
+        ]))
+    }
+
+    /// `b.fmt(template, args)`: format `args` into a fresh string via the shared
+    /// format engine, returning a `[]const u8` (`Value::Str`). No build-time I/O
+    /// and no allocator — the bytes live in the returned value.
+    fn build_fmt(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let template = args
+            .iter()
+            .find(|a| matches!(a, Value::Str(_) | Value::Slice { .. }))
+            .cloned();
+        let fmt_bytes = match &template {
+            Some(Value::Str(b)) => b.as_ref().clone(),
+            Some(v @ Value::Slice { .. }) => self.read_bytes(Some(v)).into_bytes(),
+            _ => Vec::new(),
+        };
+        // The argument tuple is the first struct/array operand after the template.
+        let arg_values: Vec<Value> = args
+            .iter()
+            .find_map(|a| match a {
+                Value::Struct(fields) | Value::Array(fields) => Some(fields.as_ref().clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut buf = Vec::new();
+        format_into(&mut buf, &fmt_bytes, &arg_values).map_err(|e| {
+            Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some(e),
+            })
+        })?;
+        Ok(Value::Str(Rc::new(buf)))
+    }
+
+    /// `@buildOption(T, name, desc)`: look up `name` in the `-D` map, record the
+    /// declared option for `--help`/lock, and return `?T` (`null` → `orelse` when
+    /// absent). The first operand is the declared option type `T`, carried as an
+    /// `undef` of the CONCRETE type (the MIR lowerer gives a type-denoting argument
+    /// its denoted type), so the VM honors the DECLARED kind (`bool`/`int`/`string`)
+    /// rather than guessing it from the `-D` value string. The two string operands
+    /// are `name` then `desc`.
+    fn build_option(&mut self, args: &[Value]) -> Value {
+        let strs: Vec<String> = args
+            .iter()
+            .filter(|a| matches!(a, Value::Str(_) | Value::Slice { .. }))
+            .map(|a| self.read_bytes(Some(a)))
+            .collect();
+        let name = strs.first().cloned().unwrap_or_default();
+        let desc = strs.get(1).cloned().unwrap_or_default();
+        let kind = option_kind_of(type_carrier(args), &self.prog.arena);
+        let (kind_word, present, value) = self.option_for_kind(kind, &name);
+        let ctx = self.build.as_mut().unwrap();
+        // Record the declared option once (first declaration wins).
+        if !ctx.graph.options.iter().any(|o| o.name == name) {
+            ctx.graph.options.push(DeclaredOption {
+                name: name.clone(),
+                kind: kind_word.to_string(),
+                desc,
+            });
+        }
+        if present {
+            Value::Optional(Some(Box::new(value)))
+        } else {
+            Value::Optional(None)
+        }
+    }
+
+    /// Computes `(kind_word, present, value)` for a build option of the given
+    /// declared [`OptionKind`], coercing the `-D` value string to that kind:
+    ///
+    /// * `Bool` accepts `true`/`1`/`yes`/`on` (and a bare `-Dflag`) as true and
+    ///   ANY other value — `0`/`false`/`no`/`off`/anything — as false, so a bool
+    ///   option NEVER breaks the build for a non-`true`/`false` value.
+    /// * `Int` parses the value (a non-numeric value coerces to `0`).
+    /// * `String` keeps the value verbatim, so a numeric-looking string stays a
+    ///   string (no more `.len`-on-an-int build-script panic).
+    ///
+    /// An absent option returns `(kind, false, _)` so the caller's `orelse`
+    /// supplies the default.
+    fn option_for_kind(&self, kind: OptionKind, name: &str) -> (&'static str, bool, Value) {
+        let raw = self
+            .build
+            .as_ref()
+            .unwrap()
+            .inputs
+            .dopts
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone());
+        match kind {
+            OptionKind::Bool => {
+                let present = raw.is_some();
+                let b = matches!(
+                    raw.as_deref().map(str::trim).map(str::to_ascii_lowercase),
+                    Some(ref s) if matches!(s.as_str(), "true" | "1" | "yes" | "on" | "")
+                );
+                ("bool", present, Value::Bool(b))
+            }
+            OptionKind::Int => match raw {
+                Some(s) => (
+                    "int",
+                    true,
+                    Value::int(s.trim().parse().unwrap_or(0), IntRepr::COMPTIME),
+                ),
+                None => ("int", false, Value::Unit),
+            },
+            OptionKind::String => match raw {
+                Some(s) => ("string", true, Value::Str(Rc::new(s.into_bytes()))),
+                None => ("string", false, Value::Unit),
+            },
+        }
+    }
+
+    /// `b.addLibrary/addExecutable/addTest(cfg)`: push the artifact node and
+    /// return its `u32` id. The `cfg` is the anonymous config struct, read
+    /// positionally — field 0 = `.name`, field 1 = `.root_source` (the example's
+    /// canonical field order). Each artifact gets an embedded step id so
+    /// `&exe.step` / `installArtifact` work.
+    fn build_add_artifact(&mut self, kind: ArtifactKind, args: &[Value]) -> Value {
+        // The first struct/array operand is the config aggregate.
+        let cfg = args.iter().find_map(|a| match a {
+            Value::Struct(fields) | Value::Array(fields) => Some(fields.clone()),
+            _ => None,
+        });
+        let (name, root_source) = match cfg {
+            Some(fields) => {
+                let name = self.read_bytes(fields.first());
+                let root = fields.get(1).map(|f| self.read_bytes(Some(f)));
+                (name, root)
+            }
+            None => {
+                // Fall back to bare positional string operands.
+                let strs: Vec<String> = args
+                    .iter()
+                    .filter(|a| matches!(a, Value::Str(_) | Value::Slice { .. }))
+                    .map(|a| self.read_bytes(Some(a)))
+                    .collect();
+                (
+                    strs.first().cloned().unwrap_or_default(),
+                    strs.get(1).cloned(),
+                )
+            }
+        };
+        let root_source = root_source.filter(|s| !s.is_empty());
+        let ctx = self.build.as_mut().unwrap();
+        let id = ctx.graph.artifacts.len() as u32;
+        let step_id = ctx.graph.steps.len() as u32;
+        ctx.graph.steps.push(StepNode {
+            id: step_id,
+            name: None,
+            desc: format!("build {name}"),
+            deps: Vec::new(),
+        });
+        ctx.graph.artifacts.push(Artifact {
+            id,
+            kind,
+            name,
+            root_source,
+            modules: Vec::new(),
+            options: Vec::new(),
+            exe_id: None,
+            forward_args: false,
+            step_id,
+        });
+        Value::int(id as i128, IntRepr::USIZE)
+    }
+
+    /// `a.addOption(T, name, value)`: append a comptime-known build option to
+    /// artifact `a`'s options table. The receiver supplies `args[0]` = the
+    /// artifact id; the remaining operands are the type carrier, the name, and the
+    /// value (the type carrier is skipped — the value itself carries its shape).
+    fn build_artifact_option(&mut self, args: &[Value]) {
+        let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        // After the id, drop the `Undef` type carrier; the remaining operands are
+        // the name (first string) then the value (bool/int, or a second string).
+        let rest: Vec<&Value> = args
+            .iter()
+            .skip(1)
+            .filter(|a| !matches!(a, Value::Undef(_)))
+            .collect();
+        let name = rest
+            .first()
+            .map(|a| self.read_bytes(Some(a)))
+            .unwrap_or_default();
+        let val = self.opt_val_of(rest.get(1).copied());
+        if let Some(ctx) = self.build.as_mut() {
+            if let Some(a) = ctx.graph.artifacts.get_mut(id) {
+                // Last write wins for a repeated option name.
+                if let Some(slot) = a.options.iter_mut().find(|(n, _)| *n == name) {
+                    slot.1 = val;
+                } else {
+                    a.options.push((name, val));
+                }
+            }
+        }
+    }
+
+    /// Captures a build-option value (`bool`/`[]const u8`/int) for the options
+    /// table.
+    fn opt_val_of(&self, v: Option<&Value>) -> BuildOptVal {
+        match v {
+            Some(Value::Bool(b)) => BuildOptVal::Bool(*b),
+            Some(Value::Str(_)) | Some(Value::Slice { .. }) => BuildOptVal::Str(self.read_bytes(v)),
+            Some(Value::Int { v, .. }) => BuildOptVal::Int(*v),
+            _ => BuildOptVal::Bool(false),
+        }
+    }
+
+    /// `a.addModule(name, mod)`: record that import name `name` inside artifact
+    /// `a` resolves to module `mod`. The receiver supplies `args[0]` = the
+    /// artifact id; `args[1]` = the name; `args[2]` = the `Module` handle struct.
+    fn build_artifact_module(&mut self, args: &[Value]) {
+        let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        let name = self.read_bytes(args.get(1));
+        let mod_id = self.build_handle_id(args.get(2));
+        if let Some(ctx) = self.build.as_mut() {
+            if let Some(a) = ctx.graph.artifacts.get_mut(id) {
+                if !a.modules.iter().any(|(n, _)| *n == name) {
+                    a.modules.push((name, mod_id));
+                }
+            }
+        }
+    }
+
+    /// `@buildArtifactModuleSelf(id)`: mint a `Module` value (a `{ id }` struct)
+    /// that exposes artifact `id`'s root source, so `lib.module()` is reusable.
+    fn build_artifact_module_self(&mut self, args: &[Value]) -> Value {
+        let artifact_id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+        let ctx = self.build.as_mut().unwrap();
+        // Reuse an existing module node for this artifact if one was minted.
+        let mod_id = if let Some(m) = ctx
+            .graph
+            .module_nodes
+            .iter()
+            .find(|m| m.artifact_id == artifact_id)
+        {
+            m.id
+        } else {
+            let mod_id = ctx.graph.module_nodes.len() as u32;
+            ctx.graph.module_nodes.push(ModuleNode {
+                id: mod_id,
+                artifact_id,
+            });
+            mod_id
+        };
+        Value::Struct(Rc::new(vec![Value::int(mod_id as i128, IntRepr::USIZE)]))
+    }
+
+    /// `artifact.step` (field read): return a `Step` handle `{ step_id }` for the
+    /// artifact's embedded step, so `&run_exe.step` is a real step to depend on.
+    fn build_artifact_step(&self, args: &[Value]) -> Value {
+        let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        let step_id = self
+            .build
+            .as_ref()
+            .unwrap()
+            .graph
+            .artifacts
+            .get(id)
+            .map(|a| a.step_id)
+            .unwrap_or(0);
+        Value::Struct(Rc::new(vec![Value::int(step_id as i128, IntRepr::USIZE)]))
+    }
+
+    /// `@buildArtifactForwardArgs(id)`: flag a run-artifact to receive `--`-args.
+    fn build_artifact_forward_args(&mut self, args: &[Value]) {
+        let id = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        if let Some(ctx) = self.build.as_mut() {
+            if let Some(a) = ctx.graph.artifacts.get_mut(id) {
+                a.forward_args = true;
+            }
+        }
+    }
+
+    /// `b.addRunArtifact(exe)`: push a `Run` artifact wrapping `exe`, with its own
+    /// embedded step, and return its id. `exe` is an `Artifact` handle struct.
+    fn build_add_run(&mut self, args: &[Value]) -> Value {
+        let exe_id = self.build_handle_id(args.first());
+        let ctx = self.build.as_mut().unwrap();
+        let id = ctx.graph.artifacts.len() as u32;
+        let step_id = ctx.graph.steps.len() as u32;
+        ctx.graph.steps.push(StepNode {
+            id: step_id,
+            name: None,
+            desc: format!("run artifact {exe_id}"),
+            deps: Vec::new(),
+        });
+        ctx.graph.artifacts.push(Artifact {
+            id,
+            kind: ArtifactKind::Run,
+            name: format!("run{id}"),
+            root_source: None,
+            modules: Vec::new(),
+            options: Vec::new(),
+            exe_id: Some(exe_id),
+            forward_args: false,
+            step_id,
+        });
+        Value::int(id as i128, IntRepr::USIZE)
+    }
+
+    /// `b.installArtifact(a)`: add artifact `a` to the install step's deps. `a`
+    /// is an `Artifact` handle struct.
+    fn build_install(&mut self, args: &[Value]) {
+        let id = self.build_handle_id(args.first());
+        if let Some(ctx) = self.build.as_mut() {
+            if !ctx.graph.install.contains(&id) {
+                ctx.graph.install.push(id);
+            }
+        }
+    }
+
+    /// `@buildStep(name, desc)`: push a named step and return its id.
+    fn build_step(&mut self, args: &[Value]) -> Value {
+        let name = self.read_bytes(args.first());
+        let desc = self.read_bytes(args.get(1));
+        let ctx = self.build.as_mut().unwrap();
+        let id = ctx.graph.steps.len() as u32;
+        ctx.graph.steps.push(StepNode {
+            id,
+            name: Some(name),
+            desc,
+            deps: Vec::new(),
+        });
+        Value::Struct(Rc::new(vec![Value::int(id as i128, IntRepr::USIZE)]))
+    }
+
+    /// `step.dependOn(&other.step)`: add a DAG edge. The receiver supplies
+    /// `args[0]` = this step's id; `args[1]` = the depended-on step (a `&step`
+    /// pointer to a `Step` handle struct).
+    fn build_step_depend_on(&mut self, args: &[Value]) {
+        let step_id = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        let dep_id = self.build_handle_id(args.get(1));
+        if let Some(ctx) = self.build.as_mut() {
+            if let Some(s) = ctx.graph.steps.get_mut(step_id) {
+                if !s.deps.contains(&dep_id) {
+                    s.deps.push(dep_id);
+                }
+            }
+        }
     }
 
     /// Dispatches one concurrency / scheduler intrinsic. `args[0]` (when the op
@@ -2447,6 +3075,34 @@ fn type_carrier(args: &[Value]) -> Option<TypeId> {
     })
 }
 
+/// The declared kind of a build option, derived from its concrete type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionKind {
+    /// A `bool` option (`-Dflag=true|false|1|0|yes|no|on|off`).
+    Bool,
+    /// An integer option (any signed/unsigned width or `comptime_int`).
+    Int,
+    /// A `[]const u8` (string) option, the default for any other type.
+    String,
+}
+
+/// Maps a build option's declared type (carried as the `undef` TYPE of the first
+/// `@buildOption` operand) to its [`OptionKind`]. The MIR lowerer gives a
+/// type-denoting argument its DENOTED type, so `bool` → `Bool`, any integer width
+/// → `Int`, and anything else (`[]const u8`, a named type) → `String`. A still-
+/// erased carrier (`type`/deferred) falls back to `String`, the safe default that
+/// never crashes a build.
+fn option_kind_of(carrier: Option<TypeId>, arena: &k2_types::TypeArena) -> OptionKind {
+    if let Some(t) = carrier {
+        match arena.get(t) {
+            k2_types::Type::Bool => return OptionKind::Bool,
+            k2_types::Type::Int { .. } | k2_types::Type::ComptimeInt => return OptionKind::Int,
+            _ => {}
+        }
+    }
+    OptionKind::String
+}
+
 /// `true` if `id` is one of the concurrency / scheduler intrinsics (routed by
 /// [`Vm::dispatch_concurrency`], some of it blocking).
 fn is_concurrency_intrinsic(id: &IntrinsicId) -> bool {
@@ -2475,6 +3131,71 @@ fn is_concurrency_intrinsic(id: &IntrinsicId) -> bool {
             | IntrinsicId::WgDone
             | IntrinsicId::WgWait
     )
+}
+
+/// `true` for the `*Build` capability floor — the recording intrinsics behind the
+/// bundled `build` module. Routed to [`Vm::dispatch_build`].
+fn is_build_intrinsic(id: &IntrinsicId) -> bool {
+    matches!(
+        id,
+        IntrinsicId::BuildStdTarget
+            | IntrinsicId::BuildStdOptimize
+            | IntrinsicId::BuildOption
+            | IntrinsicId::BuildAddLibrary
+            | IntrinsicId::BuildAddExecutable
+            | IntrinsicId::BuildAddTest
+            | IntrinsicId::BuildArtifactOption
+            | IntrinsicId::BuildArtifactModule
+            | IntrinsicId::BuildArtifactModuleSelf
+            | IntrinsicId::BuildArtifactForwardArgs
+            | IntrinsicId::BuildAddRun
+            | IntrinsicId::BuildInstall
+            | IntrinsicId::BuildStep
+            | IntrinsicId::BuildStepDependOn
+            | IntrinsicId::BuildPath
+            | IntrinsicId::BuildFmt
+            | IntrinsicId::BuildTargetArch
+            | IntrinsicId::BuildTargetOs
+            | IntrinsicId::BuildTargetAbi
+            | IntrinsicId::BuildArtifactStep
+    )
+}
+
+/// Maps a `Target` field-read intrinsic to the struct field index it reads
+/// (`arch`=0, `os`=1, `abi`=2), or `None` for any other build intrinsic.
+fn build_target_field(id: &IntrinsicId) -> Option<usize> {
+    match id {
+        IntrinsicId::BuildTargetArch => Some(0),
+        IntrinsicId::BuildTargetOs => Some(1),
+        IntrinsicId::BuildTargetAbi => Some(2),
+        _ => None,
+    }
+}
+
+/// `true` for the `*Artifact`/`*Step` methods whose handle id lives in the
+/// RECEIVER (`{ id }` struct), so the dispatcher prepends it to the operands. The
+/// `*Build` methods (`standardTarget`, `addLibrary`, `addRunArtifact`, …) take a
+/// bare `*Build` receiver carrying no id, so they are excluded.
+fn needs_handle_receiver(id: &IntrinsicId) -> bool {
+    matches!(
+        id,
+        IntrinsicId::BuildArtifactOption
+            | IntrinsicId::BuildArtifactModule
+            | IntrinsicId::BuildArtifactModuleSelf
+            | IntrinsicId::BuildArtifactForwardArgs
+            | IntrinsicId::BuildArtifactStep
+            | IntrinsicId::BuildStepDependOn
+    )
+}
+
+/// A short human description of a [`Halt`], used by the test runner to report why
+/// a test failed (an error name, a panic message, or an explicit exit).
+fn halt_detail(h: &Halt) -> String {
+    match h {
+        Halt::ProgramError(tag) => format!("error tag {tag}"),
+        Halt::Panic(info) => format!("panic: {}", info.message()),
+        Halt::Exit(c) => format!("exit {c}"),
+    }
 }
 
 /// Finds the scheduler-object handle id of `kind` among an intrinsic's operands.

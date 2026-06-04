@@ -235,6 +235,66 @@ fn shadowing_a_predeclared_name_is_allowed() {
 }
 
 #[test]
+fn top_level_const_does_not_shadow_a_nested_namespace_param() {
+    // v0.12 CRITICAL finding: a file-level binding whose name coincides with an
+    // identifier used as a parameter/local INSIDE a sibling nested namespace
+    // (exactly how `std` is injected as `const __k2_std_root = struct { ... }`)
+    // must NOT be flagged as an illegal shadow. Here `eql`/`a`/`b` at file scope
+    // coincide with the param names of `fn eql(a, b)` inside the nested struct.
+    let src = "\
+const eql = 5;\n\
+const a = 7;\n\
+const b = 9;\n\
+const __k2_std_root = struct {\n\
+    pub fn eql(comptime T: type, a: T, b: T) bool { _ = T; return a == b; }\n\
+};\n";
+    let r = resolve(src);
+    assert!(
+        r.is_ok(),
+        "a top-level const must not shadow a nested namespace's params: {:#?}",
+        r.errors().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn nested_namespace_member_may_realias_a_file_item() {
+    // The root re-export wrapper (`const __k2_mod_X = struct { pub const V = ...; }`
+    // for a self-import / cycle) declares a member whose name matches a file-level
+    // item. A container member lives in the member namespace (reached qualified),
+    // so this must not be a spurious shadow of the outermost `pub const V`.
+    let src = "\
+pub const V: u32 = 42;\n\
+const __k2_mod_x = struct {\n\
+    pub const V = V;\n\
+};\n";
+    let r = resolve(src);
+    assert!(
+        r.is_ok(),
+        "a container member may realias a file-level item: {:#?}",
+        r.errors().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn direct_file_member_local_still_cannot_shadow_a_file_item() {
+    // The guard half: a local inside a function that is a DIRECT file member (no
+    // intervening container) shadowing a file-level item is STILL an illegal
+    // shadow — the nested-namespace carve-out must not weaken this.
+    let src = "const g = 1;\nfn f() void { const g = 2; _ = g; }\n";
+    let r = resolve(src);
+    assert!(
+        !r.is_ok(),
+        "a direct file-member local shadowing a file item must still error"
+    );
+    assert!(
+        r.errors()
+            .any(|d| d.message.starts_with("declaration of `g` shadows")),
+        "expected the shadow error: {:#?}",
+        r.errors().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn arbitrary_width_integers_resolve() {
     // Finding 1: `uN`/`iN` are recognized as primitive types by pattern, not by
     // an enumerated list. The §07 parity-table snippet uses `[256]u1` and

@@ -1,0 +1,24 @@
+//! examples_support — a tiny shared library for the examples.
+//!
+//! This is the `examples_support` module wired into each example by
+//! `examples/build.k2` (`exe.addModule("examples_support", lib.module())`).
+//! It is deliberately small: its real value is proving that NAMED modules and
+//! BUILD OPTIONS flow end to end through the build system.
+
+// `@import("build_options")` resolves to a synthesized, comptime-known module the
+// build injects from this artifact's `addOption(...)` calls. Reading a value from
+// it drives a comptime branch (the dead arm is eliminated in the MIR).
+const opts = @import("build_options");
+
+/// A greeting helper the examples can import. Trivial; the wiring is the point.
+pub fn banner(name: []const u8) []const u8 {
+    return name;
+}
+
+/// Comptime-known flag surfaced from the build (`-Dwith-stderr-log`). Because it
+/// is comptime-known, a `if (mirror_to_stderr) {...}` over it costs nothing at
+/// runtime — the unused branch is eliminated entirely.
+pub const mirror_to_stderr: bool = opts.with_stderr_log;
+
+/// The shared library's version, importable as `examples_support.VERSION`.
+pub const VERSION: u32 = 12;

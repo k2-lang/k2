@@ -268,20 +268,44 @@ impl Resolver {
     ///   the enclosing `struct`/`enum`/`union` body (`fn at(self, len: i32)`
     ///   alongside `fn len(self)`).
     ///
-    /// The skip is deliberately confined to `Container` member scopes. A
-    /// **file**-level item is still shadowable-as-error by an inner local
-    /// (`illegal_shadow_of_file_item_by_local`), and genuine local-vs-local,
-    /// local-vs-param, and local-vs-outer-local shadows in `Params`/`Block`/
-    /// `Capture` scopes are still flagged — those scopes carry no skippable
-    /// member kinds.
+    /// **Crossing a `Container` boundary** is the third skip, and it is what makes
+    /// the std-injection / multi-file merge sound. A `.k2` file IS a struct (spec
+    /// §08.1), so a **file-level** item/module is *also* a member of an outer
+    /// struct namespace, reached qualified (`std.eql`, `mod.NAME`), never as a
+    /// bare identifier from inside a *sibling* nested namespace. The driver injects
+    /// `std` (and `build` / `build_options` / every imported file) as nested
+    /// `const __k2_..._root = struct { ... }`; their interior parameters and locals
+    /// must NOT be flagged as "shadowing" a user's top-level `const eql = 5;` /
+    /// `const a = 7;` / `const a = @import("./a.k2")`. We therefore stop treating a
+    /// file-level `Item`/`Module` as shadowable once the outward walk has crossed
+    /// into the enclosing struct's namespace from a nested container.
+    ///
+    /// What stays an error: a genuine local-vs-local, local-vs-param, or
+    /// local-vs-outer-local shadow in `Params`/`Block`/`Capture` scopes
+    /// (`illegal_shadow_param_by_local`), and a **direct** file-member function's
+    /// local shadowing a file item with no intervening container in between
+    /// (`illegal_shadow_of_file_item_by_local`).
     fn lookup_enclosing_user(&self, scope: ScopeId, name: &str) -> Option<DefId> {
+        // Whether the outward walk has crossed a `Container` scope boundary on its
+        // way to `s`. Once crossed, a file-level item/module is a member of the
+        // enclosing struct, not a bare binding the new declaration can shadow. A
+        // declaration *directly* in a `Container` (a sibling member of a nested
+        // struct) is likewise in the member namespace, so it too may reuse a
+        // file-level item/module name — seed `crossed_container` from the
+        // declaring scope's own kind so a root re-export wrapper
+        // (`const __k2_mod_<root> = struct { pub const V = V; }`) and a `@import`
+        // back to the root resolve instead of spuriously "shadowing" it.
+        let mut crossed_container = self.scopes[scope.index()].kind == ScopeKind::Container;
         let mut cur = self.scopes[scope.index()].parent;
         while let Some(s) = cur {
             let sc = &self.scopes[s.index()];
             if sc.kind.participates_in_shadow_check() {
-                if let Some(id) = self.lookup_local_nonmember(s, sc.kind, name) {
+                if let Some(id) = self.lookup_local_nonmember(s, sc.kind, name, crossed_container) {
                     return Some(id);
                 }
+            }
+            if sc.kind == ScopeKind::Container {
+                crossed_container = true;
             }
             cur = sc.parent;
         }
@@ -290,10 +314,20 @@ impl Resolver {
 
     /// Looks up `name` declared directly in `scope`, skipping declarations that
     /// occupy a *member* namespace rather than the bare-binding namespace (see
-    /// [`Self::lookup_enclosing_user`]): container fields are always skipped, and
-    /// container *items* are skipped when `scope` is a `Container` body.
-    fn lookup_local_nonmember(&self, scope: ScopeId, kind: ScopeKind, name: &str) -> Option<DefId> {
+    /// [`Self::lookup_enclosing_user`]): container fields are always skipped;
+    /// container *items* are skipped when `scope` is a `Container` body; and a
+    /// **file**-level item/module is skipped once the outward walk has crossed a
+    /// container boundary (`crossed_container`), because it then lives in an outer
+    /// struct's member namespace rather than the bare-binding namespace.
+    fn lookup_local_nonmember(
+        &self,
+        scope: ScopeId,
+        kind: ScopeKind,
+        name: &str,
+        crossed_container: bool,
+    ) -> Option<DefId> {
         let in_container = kind == ScopeKind::Container;
+        let in_file = kind == ScopeKind::File;
         self.scopes[scope.index()]
             .names
             .iter()
@@ -305,8 +339,15 @@ impl Resolver {
                     // Fields live in the member namespace everywhere.
                     DefKind::Field => false,
                     // Sibling container items (`fn`/`const`/`var`) are member-
-                    // namespace too, but a *file*-level item is not.
-                    DefKind::Item => !in_container,
+                    // namespace too. A *file*-level item is normally a shadowable
+                    // bare binding, but once the walk has crossed into the file
+                    // struct from a nested container it is a member of that struct.
+                    DefKind::Item => !(in_container || (in_file && crossed_container)),
+                    // A file-level `@import` const (`std`, a path module) is a
+                    // member of the file struct once reached across a container
+                    // boundary — its name does not block a nested namespace's
+                    // parameter/local of the same name.
+                    DefKind::Module => !(in_file && crossed_container),
                     _ => true,
                 }
             })

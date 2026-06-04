@@ -103,6 +103,10 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
     });
     tests.addModule("examples_support", lib.module());
+    // The test root pulls in `examples_support`, which reads the build option, so
+    // the test artifact surfaces it too (every artifact carries its own
+    // comptime-known build options).
+    tests.addOption(bool, "with_stderr_log", with_stderr_log);
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run all example tests");

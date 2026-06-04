@@ -615,3 +615,26 @@ pub fn main(sys: *System) !void {
         "outcome: {outcome:?}"
     );
 }
+
+#[test]
+fn top_level_value_const_materializes_in_format_arg() {
+    // v0.12 fix: a bare reference to a top-level (file-scope) value const has no
+    // local slot, so it must inline its initializer instead of lowering to an
+    // `undef` that the `{d}` formatter renders as the `<int>` placeholder.
+    assert_stdout(
+        "const N = 5;\npub fn main(sys: *System) !void { const o = sys.io.stdout(); \
+         try o.print(\"{d}\\n\", .{N}); }\n",
+        "5\n",
+    );
+}
+
+#[test]
+fn top_level_typed_const_materializes_in_format_arg() {
+    // The same fix must cover a *sized*-int const (whose bound is `u32`, not
+    // `comptime_int`, so the comptime-int fast path does not apply).
+    assert_stdout(
+        "const N: u32 = 42;\npub fn main(sys: *System) !void { const o = sys.io.stdout(); \
+         try o.print(\"{d}\\n\", .{N}); }\n",
+        "42\n",
+    );
+}

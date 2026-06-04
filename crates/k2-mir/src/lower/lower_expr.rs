@@ -41,8 +41,19 @@ impl FnBuilder<'_, '_> {
             Expr::Ident { .. } | Expr::Deref { .. } => {
                 if let Some(p) = self.try_lower_place(e) {
                     self.assign(dst, Rvalue::Use(Operand::Copy(p)), e.span());
+                } else if let Some(init) = self.top_level_const_init(e) {
+                    // A bare reference to a top-level (file-scope) *value* const
+                    // has no local slot — inline its initializer expression so the
+                    // const's value materializes, exactly as the namespaced
+                    // `std.testing.allocator` member-access path does. Without this,
+                    // `const eql = 5; ... .{eql}` would lower to `undef` and print
+                    // the `<int>` placeholder instead of `5`.
+                    self.lower_into(dst, &init);
                 } else {
-                    let ty = self.type_at(e.span());
+                    // No place, no value const: a type-denoting ident (`bool`,
+                    // `u32`) or an opaque. Carry the DENOTED type when known so a
+                    // type-valued intrinsic argument is concrete.
+                    let ty = self.type_carrier_at(e.span());
                     self.assign(
                         dst,
                         Rvalue::Use(Operand::Const(Const::Undef { ty })),
@@ -124,7 +135,11 @@ impl FnBuilder<'_, '_> {
             | Expr::ErrorSet { .. }
             | Expr::AnyType { .. }
             | Expr::Container(_) => {
-                let ty = self.type_at(e.span());
+                // The undef carrier is the DENOTED type when the checker recorded
+                // one (so a type-valued intrinsic argument like the `[]const u8` in
+                // `b.option([]const u8, ...)` carries the concrete type), else the
+                // meta-type `type`.
+                let ty = self.type_carrier_at(e.span());
                 self.assign(
                     dst,
                     Rvalue::Use(Operand::Const(Const::Undef { ty })),
@@ -1570,6 +1585,26 @@ impl FnBuilder<'_, '_> {
     // ===================================================================
     //  Constants & folded values
     // ===================================================================
+
+    /// If `e` is a bare identifier resolving to a top-level (file-scope) *value*
+    /// const with a recorded initializer, returns a clone of that initializer.
+    /// Such a const has no runtime local slot, so a bare reference to it must
+    /// inline the initializer to materialize the value (mirroring the namespaced
+    /// member-access inlining in [`Self::lower_field_into`]). A reference that
+    /// already has a local slot is handled by [`Self::try_lower_place`] and never
+    /// reaches here.
+    pub(super) fn top_level_const_init(&self, e: &Expr) -> Option<Expr> {
+        let Expr::Ident { span, .. } = e else {
+            return None;
+        };
+        let def = self.resolved_def(*span)?;
+        // Only inline when there is genuinely no local slot for the binding (a
+        // shadowing local would have been caught by `try_lower_place`).
+        if self.locals_by_def.contains_key(&def) {
+            return None;
+        }
+        self.lo.value_const_inits.get(&def).cloned()
+    }
 
     /// Builds an [`Const`] for a literal/enum/error expression, if possible.
     pub(super) fn const_of(&mut self, e: &Expr, expected: TypeId) -> Option<Const> {

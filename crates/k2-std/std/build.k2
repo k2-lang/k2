@@ -1,0 +1,180 @@
+// build.k2 — the bundled `build` standard module, written in k2.
+//
+// k2 — "Kardashev Type II": total control over the machine, with zero waste.
+//
+// This file is the BODY of the `build` namespace: the driver wraps it in a
+// synthetic `const __k2_build_root = struct { <this file> };` and injects it
+// (only when compiling a `build.k2`) so `@import("build")` resolves to a REAL
+// module. It declares the `*Build` CAPABILITY surface and its helper types
+// (`Target`, `OptimizeMode`, `Step`, `Module`, `Artifact`), exactly as
+// `*System` is the program's authority and `std` declares its helpers.
+//
+// EXECUTION MODEL. `build(b: *Build)` is ordinary k2 run by the toolchain on the
+// VM with a `*Build` capability — the build-time analogue of `*System`. The
+// methods below bottom out in a small floor of `@build*` RECORDING intrinsics
+// the VM implements: each one pushes a node/edge into a build graph the VM
+// exposes after `build(b)` returns (and reads driver-seeded `-D` options). They
+// perform NO I/O and NO real allocation, honoring the comptime sandbox (spec
+// §06.1 / §08.6.1). Because `b: *Build` is the predeclared opaque capability,
+// member calls on it (`b.standardTarget()`, `lib.addOption(...)`) lower to those
+// `@build*` intrinsics directly — the same mechanism by which `sys.io.stdout()`
+// and `alloc.create(T)` reach the `*System`/`Allocator` floor. The method bodies
+// here are the readable, authoritative spelling of that surface.
+
+/// A resolved cross-compilation target: `arch-os-abi`. A `Target` value is
+/// comptime-known inside `build(b)`, so a build script can branch on it with
+/// ordinary `if`/`switch` over `target.os` (spec §08.8).
+pub const Target = struct {
+    /// The CPU architecture.
+    arch: Arch,
+    /// The operating system.
+    os: Os,
+    /// The ABI.
+    abi: Abi,
+
+    /// The architectures the toolchain models.
+    pub const Arch = enum { x86_64, aarch64, riscv64, wasm32 };
+    /// The operating systems the toolchain models.
+    pub const Os = enum { linux, macos, windows, freebsd, wasi, other };
+    /// The ABIs the toolchain models.
+    pub const Abi = enum { gnu, musl, msvc, none };
+};
+
+/// The build-mode ladder (spec §08.5.2). `Debug` keeps the full safety toolkit;
+/// `ReleaseSafe` optimizes but keeps checks; `ReleaseFast` strips checks.
+pub const OptimizeMode = enum { Debug, ReleaseSafe, ReleaseFast };
+
+/// A node in the build step graph. `&exe.step` yields a pointer to an artifact's
+/// embedded step so a user step can `dependOn` it.
+pub const Step = struct {
+    /// The step's id into the VM-recorded graph.
+    id: u32,
+
+    /// Make this step depend on `other`, adding a DAG edge.
+    pub fn dependOn(self: *Step, other: *Step) void {
+        @buildStepDependOn(other);
+    }
+};
+
+/// A module value: the public surface of an artifact's `root_source`, reusable
+/// via `exe.addModule("name", lib.module())` (spec §08.6.2).
+pub const Module = struct {
+    /// The module's id into the VM-recorded graph.
+    id: u32,
+};
+
+/// A build artifact: a library, executable, or test. The shared handle routes
+/// every method by its `id` into the VM's recorded graph.
+pub const Artifact = struct {
+    /// The artifact's id into the VM-recorded graph.
+    id: u32,
+    /// The artifact's embedded step, so `&exe.step` is a real step to depend on.
+    step: Step,
+
+    /// Surface a comptime-known build option to this artifact's code, readable
+    /// via `@import("build_options")` (spec §08.6.3). The dead branch of an
+    /// `if (opts.flag)` over a comptime-known option is eliminated entirely.
+    pub fn addOption(self: *Artifact, comptime T: type, name: []const u8, value: T) void {
+        @buildArtifactOption(T, name, value);
+    }
+
+    /// Wire a named module into this artifact's import namespace. Inside the
+    /// artifact, `@import(name)` then resolves to `mod`.
+    pub fn addModule(self: *Artifact, name: []const u8, mod: Module) void {
+        @buildArtifactModule(name, mod);
+    }
+
+    /// The module value exposing this artifact's `root_source` (reusable for
+    /// wiring into other artifacts).
+    pub fn module(self: *Artifact) Module {
+        return @buildArtifactModuleSelf();
+    }
+
+    /// Flag this run-artifact to receive `--`-forwarded program arguments.
+    pub fn passForwardedArgs(self: *Artifact) void {
+        @buildArtifactForwardArgs();
+    }
+};
+
+/// Configuration for `addLibrary`/`addExecutable`/`addTest`: an artifact's name,
+/// its single `root_source` module, and the resolved target / optimize mode.
+pub const ArtifactOptions = struct {
+    /// The artifact name.
+    name: []const u8,
+    /// The single module that IS the artifact's public surface and entry point.
+    root_source: []const u8,
+    /// The resolved target triple.
+    target: Target,
+    /// The optimization mode.
+    optimize: OptimizeMode,
+};
+
+/// The BUILD capability — the build-time analogue of `*System`. There is no
+/// ambient build state: every artifact, option, and step flows through `b`.
+pub const Build = struct {
+    /// The resolved target, honoring `-Dtarget=<triple>` (defaults to the host).
+    pub fn standardTarget(self: *Build) Target {
+        return @buildStdTarget();
+    }
+
+    /// The optimization mode, honoring `-Doptimize=...` (defaults to `Debug`).
+    pub fn standardOptimize(self: *Build) OptimizeMode {
+        return @buildStdOptimize();
+    }
+
+    /// Read a user-selectable option from the command line (`-Dname=value`).
+    /// Returns `null` when unset, so the idiom is `b.option(...) orelse default`.
+    ///
+    /// `b.option(T, ...)` is dispatched directly as the `@buildOption` recording
+    /// intrinsic (this readable body documents its surface); the concrete option
+    /// type `T` is carried to the VM as the first operand's TYPE, so the VM honors
+    /// the DECLARED type (`bool`/`int`/`string`) instead of guessing the kind from
+    /// the `-D` value string. A `bool` option then accepts
+    /// `1`/`0`/`yes`/`no`/`true`/`false` and a numeric-looking string stays a
+    /// string.
+    pub fn option(self: *Build, comptime T: type, name: []const u8, desc: []const u8) ?T {
+        return @buildOption(T, name, desc);
+    }
+
+    /// Declare a library artifact.
+    pub fn addLibrary(self: *Build, cfg: ArtifactOptions) Artifact {
+        return @buildAddLibrary(cfg);
+    }
+
+    /// Declare an executable artifact.
+    pub fn addExecutable(self: *Build, cfg: ArtifactOptions) Artifact {
+        return @buildAddExecutable(cfg);
+    }
+
+    /// Declare a test artifact (runs every reachable `test { ... }` block).
+    pub fn addTest(self: *Build, cfg: ArtifactOptions) Artifact {
+        return @buildAddTest(cfg);
+    }
+
+    /// Declare a run-artifact that builds and runs `exe`.
+    pub fn addRunArtifact(self: *Build, exe: Artifact) Artifact {
+        return @buildAddRun(exe);
+    }
+
+    /// Add an artifact to the default `install` step.
+    pub fn installArtifact(self: *Build, a: Artifact) void {
+        @buildInstall(a);
+    }
+
+    /// Register a named, command-line-invokable step.
+    pub fn step(self: *Build, name: []const u8, desc: []const u8) Step {
+        return @buildStep(name, desc);
+    }
+
+    /// Resolve a relative source path (identity; recorded by artifact creation).
+    pub fn path(self: *Build, rel: []const u8) []const u8 {
+        return rel;
+    }
+
+    /// Format a comptime-deterministic string (no build-time I/O), reusing the
+    /// shared `@bufPrint` engine — e.g. `b.fmt("{s}.k2", .{name})`.
+    pub fn fmt(self: *Build, comptime template: []const u8, args: anytype) []const u8 {
+        var buf: [256]u8 = undefined;
+        return @bufPrint(buf[0..], template, args) catch "";
+    }
+};

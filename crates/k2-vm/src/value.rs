@@ -205,6 +205,11 @@ pub enum Capability {
     Random,
     /// The `sys.env` environment-lookup capability.
     Env,
+    /// The root `*Build` authority handed to `build(b)` — the build-time analogue
+    /// of [`Capability::System`]. Its methods bottom out in the recording
+    /// `@build*` intrinsics (no I/O, no allocation); the VM exposes the recorded
+    /// graph after `build(b)` returns.
+    Build,
 }
 
 impl Value {

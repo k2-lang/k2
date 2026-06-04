@@ -36,6 +36,7 @@
 //! returns the structured [`RunOutcome`] plus the exit code, so it can assert
 //! exact bytes without spawning a process.
 
+mod build_graph;
 mod compile;
 mod fmt;
 mod heap;
@@ -52,8 +53,73 @@ use std::process::ExitCode;
 
 use k2_mir::{BuildMode, MirProgram};
 
+pub use build_graph::{
+    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, ModuleNode, OptMode, StepNode,
+    TargetTriple,
+};
 pub use value::{Capability, IntRepr, SchedKind, Value};
-pub use vm::{Halt, PanicInfo, Vm};
+pub use vm::{BuildInputs, Halt, PanicInfo, Vm};
+
+/// Runs `build(b)` over a compiled `build.k2` program and returns the recorded
+/// [`BuildGraph`]. The program is the merged `build.k2` (with the bundled `build`
+/// module injected); the VM runs `build(b)` with a `*Build` capability backed by
+/// recording intrinsics, then this returns the graph for the driver to execute.
+///
+/// A final `catch_unwind` backstop maps any stray internal Rust panic to a clean
+/// [`Halt::Panic`] rather than aborting the process.
+pub fn run_build_graph(prog: &MirProgram, inputs: BuildInputs) -> Result<BuildGraph, Halt> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut vm = Vm::new(prog);
+        vm.run_build(inputs)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(Halt::Panic(PanicInfo::internal("build graph recording"))),
+    }
+}
+
+/// The outcome of running a program's `test { ... }` blocks: how many passed and
+/// failed, plus a per-test report line for each.
+pub struct TestReport {
+    /// The number of tests that passed.
+    pub passed: usize,
+    /// The number of tests that failed.
+    pub failed: usize,
+    /// One `name ... ok|FAILED (...)` line per test, in lowering order.
+    pub lines: Vec<String>,
+    /// The program's captured stdout across all tests.
+    pub stdout: Vec<u8>,
+    /// The program's captured stderr across all tests.
+    pub stderr: Vec<u8>,
+}
+
+/// Compiles + runs every `test { ... }` block in `prog`, returning a
+/// [`TestReport`]. Each test runs on a fresh fiber with clean scheduler state, so
+/// one test cannot leak fibers into the next. A `catch_unwind` backstop maps any
+/// stray internal Rust panic to a failing report rather than aborting.
+pub fn run_tests(prog: &MirProgram) -> TestReport {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut vm = Vm::new(prog);
+        let (passed, failed, lines) = vm.run_tests();
+        (passed, failed, lines, vm.stdout, vm.stderr)
+    }));
+    match result {
+        Ok((passed, failed, lines, stdout, stderr)) => TestReport {
+            passed,
+            failed,
+            lines,
+            stdout,
+            stderr,
+        },
+        Err(_) => TestReport {
+            passed: 0,
+            failed: 1,
+            lines: vec!["internal VM error (Rust panic) running tests".to_string()],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+    }
+}
 
 /// The arguments to a run: the build mode (informs ReleaseFast behaviour) and the
 /// forwarded program argv (reserved; `main(sys)` takes no argv in v0.8).
@@ -92,6 +158,16 @@ pub enum RunOutcome {
 /// and exits nonzero; success exits zero. A final `catch_unwind` backstop turns
 /// any stray internal Rust panic into a nonzero exit rather than an abort.
 pub fn run_program(prog: &MirProgram, args: RunArgs) -> ExitCode {
+    exit_code(run_program_code(prog, args))
+}
+
+/// Like [`run_program`], but returns the raw `i32` exit code instead of an opaque
+/// [`ExitCode`]. The streaming behaviour and the never-panic backstop are
+/// identical; this entry point exists so a caller that must *aggregate* several
+/// runs (the build driver's multi-artifact `run`/`test` steps) can inspect each
+/// sub-run's success/failure and propagate the first nonzero code. `0` means
+/// success; `134` is the internal-VM-error backstop.
+pub fn run_program_code(prog: &MirProgram, args: RunArgs) -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(prog, args)));
     match result {
         Ok((outcome, code, out, err)) => {
@@ -108,11 +184,11 @@ pub fn run_program(prog: &MirProgram, args: RunArgs) -> ExitCode {
                     let _ = writeln!(std::io::stderr(), "panic: {msg}");
                 }
             }
-            exit_code(code)
+            code
         }
         Err(_) => {
             let _ = writeln!(std::io::stderr(), "panic: internal VM error (Rust panic)");
-            ExitCode::from(134)
+            134
         }
     }
 }

@@ -433,6 +433,29 @@ Steps the user can name on the command line are the ones you register with
 the top-level `install` step (run by a bare `k2 build`) gathers everything passed
 to `b.installArtifact(...)`.
 
+> **Implementation note (v0.12).** The roadmap says `build(b)` is "executed by
+> the comptime engine." The faithful realization the current toolchain ships is
+> to **run `build(b)` on the same VM as any program, with a `*Build` capability**
+> — the build-time analogue of `*System`. Just as `*System` bottoms out in the
+> io/heap intrinsics, `*Build` bottoms out in a small floor of `@build*`
+> **recording** intrinsics: each one pushes a node/edge into a build graph the VM
+> exposes after `build(b)` returns (and reads the driver-seeded `-D` options).
+> Those intrinsics perform **no I/O and no real allocation**, so the comptime
+> sandbox of §6.1 is honored exactly — `build(b)` is pure description.
+> `k2c build [step]` then reads the recorded graph and executes the requested
+> step: `install`/default **describes + validates** the DAG (every artifact's
+> `root_source` is compiled; native artifact emission is a documented **no-op**
+> until post-0.13 native codegen), `run` **builds + runs** the chosen executable
+> through the VM, and `test` **compiles + runs** the reachable `test { ... }`
+> blocks through the VM. Multi-file compilation (path imports + `addModule`-wired
+> named modules) is realized by merging the module graph into one implicit-struct
+> `SourceFile` — the same move by which `std` is injected, generalized — so path
+> imports, named modules, `build`, and `build_options` all resolve, type-check,
+> monomorphize, lower, and run through the unchanged pipeline. `@import("build_options")`
+> is a **synthesized comptime module**: one `pub const` per `addOption(...)`, so
+> `if (opts.flag)` is a comptime-known condition whose dead branch the optimizer
+> eliminates entirely (§6.3).
+
 ### 6.2 `root_source` and module wiring
 
 Each artifact names exactly one `root_source` — the module that *is* the
@@ -532,6 +555,18 @@ The lockfile is committed to version control and is what `b.dependency(...)`
 reads at build time. Updating a dependency is an explicit command
 (`k2 pkg update`) that rewrites the lock; an ordinary build never silently moves
 a dependency.
+
+> **Implementation note (v0.12).** The current toolchain ships the **local,
+> offline** realization of this lockfile: `k2c build` writes a deterministic
+> `build.lock` to the build root recording the resolved build graph (target,
+> optimize mode, declared options, artifacts, wired modules, steps, install set)
+> plus a content hash of every resolved `.k2` input. Every collection is emitted
+> in **sorted order** and the `-D` map is a `BTreeMap`, so identical inputs and
+> identical `-D` flags yield a **byte-identical** lock with a matching
+> `graph_hash` (a changed input flips its content hash, which flips
+> `graph_hash`). The networked, content-addressed `k2.lock` of §7 (remote `(url,
+> hash)` fetch) is the post-0.12 superset; `build.lock` here performs **no fetch
+> and no network access**, consistent with the offline charter.
 
 ### 7.4 Fetching is the only non-comptime part
 

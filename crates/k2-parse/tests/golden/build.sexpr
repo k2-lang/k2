@@ -298,6 +298,16 @@
           )
         )
       )
+      (expr
+        (call
+          (field addOption
+            (ident tests)
+          )
+          (ident bool)
+          (str "\"with_stderr_log\"")
+          (ident with_stderr_log)
+        )
+      )
       (const run_tests
         (call
           (field addRunArtifact

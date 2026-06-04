@@ -826,6 +826,20 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             .unwrap_or_else(|| self.lo.typed.arena.t_deferred())
     }
 
+    /// The `undef` carrier type for a value-position expression at `span`: the
+    /// DENOTED type when `span` is a type-valued expression (so a type-denoting
+    /// argument like `bool` / `[]const u8` passed to a `comptime T: type`
+    /// intrinsic carries the concrete type, letting the VM honor a build option's
+    /// declared kind), else the expression's own (meta) type.
+    fn type_carrier_at(&self, span: Span) -> TypeId {
+        self.lo
+            .typed
+            .type_valued_spans
+            .get(&(span.start, span.end))
+            .copied()
+            .unwrap_or_else(|| self.type_at(span))
+    }
+
     /// The member resolution recorded at `span`, if any.
     fn member_at(&self, span: Span) -> Option<MemberRes> {
         self.lo.typed.members.get(&(span.start, span.end)).copied()
@@ -1213,6 +1227,18 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. } | Expr::Deref { .. } => {
                 if let Some(p) = self.try_lower_place(e) {
                     return Operand::Copy(p);
+                }
+                // A top-level value const has no local slot: inline its
+                // initializer into a temp rather than falling through to `undef`.
+                if let Some(init) = self.top_level_const_init(e) {
+                    let t = if self.lo.typed.arena.is_bottom(ty) {
+                        self.type_at(e.span())
+                    } else {
+                        ty
+                    };
+                    let tmp = self.new_temp(t, e.span());
+                    self.lower_into(Place::local(tmp), &init);
+                    return Operand::local(tmp);
                 }
             }
             _ => {}

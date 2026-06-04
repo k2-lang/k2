@@ -36,6 +36,18 @@ impl crate::check::Checker<'_> {
         if matches!(self.arena.get(base_ty), Type::TypeType) {
             if let Some(denoted) = self.denoted_aggregate_of(base) {
                 if let Some(ty) = self.member_of_aggregate(denoted, field, span) {
+                    // Record the BASE's span as denoting `denoted` so a call
+                    // `ns.func(...)` lowers as an ASSOCIATED call (no implicit
+                    // receiver) rather than method-call sugar. Without this a
+                    // non-generic free function reached through a namespace const
+                    // (`ns.add(x, y)`, the multi-file-wrapped module case) would
+                    // be lowered with a spurious receiver/type carrier. (Generic
+                    // namespaced calls already route through `instantiate_call`,
+                    // so this only repairs the non-generic free-function path.)
+                    let bspan = base.span();
+                    self.type_valued_spans
+                        .entry((bspan.start, bspan.end))
+                        .or_insert(denoted);
                     // If this member is *itself* a type-valued decl (a nested
                     // namespace or a non-generic nested struct type), record this
                     // access span as type-valued so a further `.member` or an

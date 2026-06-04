@@ -558,6 +558,24 @@ impl<'p> FnCompiler<'p> {
                 "wgAdd" => IntrinsicId::WgAdd,
                 "wgDone" => IntrinsicId::WgDone,
                 "wgWait" => IntrinsicId::WgWait,
+                // The *Build capability floor (v0.12). These bottom out the
+                // bundled `build` module's method bodies; the VM records a build
+                // graph (no I/O, no allocation). See `IntrinsicId` and the VM's
+                // `dispatch_build`.
+                "buildStdTarget" => IntrinsicId::BuildStdTarget,
+                "buildStdOptimize" => IntrinsicId::BuildStdOptimize,
+                "buildOption" => IntrinsicId::BuildOption,
+                "buildAddLibrary" => IntrinsicId::BuildAddLibrary,
+                "buildAddExecutable" => IntrinsicId::BuildAddExecutable,
+                "buildAddTest" => IntrinsicId::BuildAddTest,
+                "buildArtifactOption" => IntrinsicId::BuildArtifactOption,
+                "buildArtifactModule" => IntrinsicId::BuildArtifactModule,
+                "buildArtifactModuleSelf" => IntrinsicId::BuildArtifactModuleSelf,
+                "buildArtifactForwardArgs" => IntrinsicId::BuildArtifactForwardArgs,
+                "buildAddRun" => IntrinsicId::BuildAddRun,
+                "buildInstall" => IntrinsicId::BuildInstall,
+                "buildStep" => IntrinsicId::BuildStep,
+                "buildStepDependOn" => IntrinsicId::BuildStepDependOn,
                 other => IntrinsicId::Unsupported(format!("@{other}")),
             },
             IntrinsicRoot::Value(_) => {
@@ -615,6 +633,38 @@ impl<'p> FnCompiler<'p> {
                     ["add"] => IntrinsicId::WgAdd,
                     ["done"] => IntrinsicId::WgDone,
                     ["wait"] => IntrinsicId::WgWait,
+                    // The *Build / *Artifact / *Step capability method floor
+                    // (v0.12). Reached as member calls on the `b: *Build` opaque
+                    // value (and the `Artifact`/`Step` handles it returns), exactly
+                    // like the `*System`/`Allocator` method spellings above. Each
+                    // bottoms out in a recording `@build*` intrinsic; the receiver
+                    // (or the config struct / first operand) carries the handle id.
+                    ["standardTarget"] => IntrinsicId::BuildStdTarget,
+                    ["standardOptimize"] => IntrinsicId::BuildStdOptimize,
+                    ["option"] => IntrinsicId::BuildOption,
+                    ["addLibrary"] => IntrinsicId::BuildAddLibrary,
+                    ["addExecutable"] => IntrinsicId::BuildAddExecutable,
+                    ["addTest"] => IntrinsicId::BuildAddTest,
+                    ["addOption"] => IntrinsicId::BuildArtifactOption,
+                    ["addModule"] => IntrinsicId::BuildArtifactModule,
+                    ["module"] => IntrinsicId::BuildArtifactModuleSelf,
+                    ["passForwardedArgs"] => IntrinsicId::BuildArtifactForwardArgs,
+                    ["addRunArtifact"] => IntrinsicId::BuildAddRun,
+                    ["installArtifact"] => IntrinsicId::BuildInstall,
+                    // `b.step(name, desc)` registers a named step (a CALL);
+                    // `artifact.step` is a FIELD read of the embedded step. Both
+                    // spell `step`, so disambiguate on `is_call`.
+                    ["step"] if path.is_call => IntrinsicId::BuildStep,
+                    ["step"] => IntrinsicId::BuildArtifactStep,
+                    ["dependOn"] => IntrinsicId::BuildStepDependOn,
+                    ["path"] => IntrinsicId::BuildPath,
+                    ["fmt"] => IntrinsicId::BuildFmt,
+                    // The `Target` struct's fields, read on the deferred `target`
+                    // value `b.standardTarget()` returns (so `target.os ==
+                    // .windows` works in a build script).
+                    ["arch"] => IntrinsicId::BuildTargetArch,
+                    ["os"] => IntrinsicId::BuildTargetOs,
+                    ["abi"] => IntrinsicId::BuildTargetAbi,
                     _ => IntrinsicId::Unsupported(format!("value.{}", path.dotted())),
                 }
             }

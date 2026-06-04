@@ -164,6 +164,64 @@ pub enum IntrinsicId {
     /// `@wgWait(wg)` -> void. Blocks until the counter reaches zero.
     WgWait,
 
+    // ---- The *Build capability floor (v0.12) ----------------------------
+    //
+    // These back the bundled `build` module's `Build`/`Artifact`/`Step` methods
+    // (see `crates/k2-std/std/build.k2`). They are pure RECORDERS: every one
+    // pushes a node/edge into the VM's `BuildGraph` (or reads a driver-seeded
+    // `-D` value) and performs NO I/O and NO real allocation — honoring the
+    // comptime sandbox (spec §06.1 / §08.6.1). `build(b)` runs on the ordinary VM
+    // with a `*Build` capability; afterward `k2c build` reads the graph back.
+    /// `@buildStdTarget()` -> the resolved `Target` struct (from `-Dtarget`).
+    BuildStdTarget,
+    /// `@buildStdOptimize()` -> the `OptimizeMode` enum value (from `-Doptimize`).
+    BuildStdOptimize,
+    /// `@buildOption(kind, name, desc)` -> `?T`: looks up `name` in the `-D` map,
+    /// records the declared option, and returns `null` (→ `orelse`) when absent.
+    /// `kind`: 0=bool 1=string 2=int.
+    BuildOption,
+    /// `b.addLibrary(cfg)` -> the new library artifact's `u32` id. The `cfg` is
+    /// the anonymous config struct, read positionally (field 0 = name, field 1 =
+    /// root_source).
+    BuildAddLibrary,
+    /// `b.addExecutable(cfg)` -> the new executable artifact's `u32` id.
+    BuildAddExecutable,
+    /// `b.addTest(cfg)` -> the new test artifact's `u32` id.
+    BuildAddTest,
+    /// `@buildArtifactOption(id, name, value)` -> void. Appends a build-option.
+    BuildArtifactOption,
+    /// `@buildArtifactModule(id, name, mod_id)` -> void. Wires a named module in.
+    BuildArtifactModule,
+    /// `@buildArtifactModuleSelf(id)` -> a `Module` id for artifact `id`.
+    BuildArtifactModuleSelf,
+    /// `@buildArtifactForwardArgs(id)` -> void. Flags a run-artifact to forward
+    /// `--`-args.
+    BuildArtifactForwardArgs,
+    /// `@buildAddRun(exe_id)` -> a new `Run` artifact's `u32` id.
+    BuildAddRun,
+    /// `@buildInstall(id)` -> void. Adds `id` to the install step's deps.
+    BuildInstall,
+    /// `@buildStep(name, desc)` -> the new step's `u32` id.
+    BuildStep,
+    /// `@buildStepDependOn(step_id, dep_step_id)` -> void. Adds a DAG edge.
+    BuildStepDependOn,
+    /// `b.path(rel)` -> the relative path string (identity); the artifact records
+    /// it at creation time.
+    BuildPath,
+    /// `b.fmt(template, args)` -> a formatted `[]const u8`, via the shared format
+    /// engine into a fresh string (no build-time I/O).
+    BuildFmt,
+    /// `target.arch` / `target.os` / `target.abi` -> the corresponding enum field
+    /// of the `Target` struct (field 0/1/2), reached on the deferred-typed
+    /// `target` value `b.standardTarget()` returns.
+    BuildTargetArch,
+    BuildTargetOs,
+    BuildTargetAbi,
+    /// `artifact.step` (a FIELD read, not the `b.step(...)` method) -> a `Step`
+    /// handle for the artifact's embedded step, so `&run_exe.step` is a real step
+    /// a user step can `dependOn`.
+    BuildArtifactStep,
+
     /// An intrinsic the VM does not implement (e.g. a `std.testing.*` member
     /// reached outside the `run` path). Dispatch yields a clean panic naming it.
     Unsupported(String),
