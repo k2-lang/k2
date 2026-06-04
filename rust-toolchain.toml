@@ -1,9 +1,12 @@
-# Pin the k2 toolchain build to the stable Rust channel.
+# Pin the k2 toolchain to a fixed stable release.
 #
-# The k2 compiler front-end uses no nightly or unstable features anywhere, so a
-# plain `stable` channel is sufficient and keeps CI reproducible and offline.
+# The k2 compiler uses no nightly or unstable features. We pin an exact version
+# (rather than a floating `stable`) so that rustc/clippy/rustfmt are identical
+# in CI and in development — otherwise newer-stable clippy lints drift from the
+# local toolchain and fail CI on style-only changes. The project is developed
+# on 1.93.x.
 
 [toolchain]
-channel = "stable"
+channel = "1.93.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

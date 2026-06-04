@@ -25,10 +25,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Rust (stable, with rustfmt and clippy)
+      - name: Set up Rust (pinned 1.93.0, with rustfmt and clippy)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          # Pin the toolchain so CI's rustc/clippy/rustfmt match the project's
+          # development toolchain exactly — otherwise newer-stable clippy lints
+          # drift from local and fail CI on style-only changes. (The project is
+          # developed on 1.93.x.)
+          rustup toolchain install 1.93.0 --profile minimal --no-self-update
+          rustup default 1.93.0
           rustup component add rustfmt clippy
           rustc --version && cargo --version && cargo clippy --version
 
