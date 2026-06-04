@@ -676,6 +676,14 @@ impl Resolver {
                 }
                 self.resolve_expr(inner);
             }
+            Expr::ManyPtr {
+                sentinel, inner, ..
+            } => {
+                if let Some(s) = sentinel {
+                    self.resolve_expr(s);
+                }
+                self.resolve_expr(inner);
+            }
             Expr::ArrayType { len, inner, .. } => {
                 self.resolve_expr(len);
                 self.resolve_expr(inner);

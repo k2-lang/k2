@@ -65,8 +65,8 @@ pub use arena::TypeArena;
 pub use diag::{Diagnostic, Severity};
 pub use dump::{dump_signatures, dump_types};
 pub use ty::{
-    ArrayLen, EnumInfo, ErrSetInfo, ErrSetRef, FieldInfo, FnSig, IntBits, MemberDecl, MemberRes,
-    ParamInfo, StructInfo, Type, TypeId, UnionInfo,
+    ArrayLen, EnumInfo, ErrSetInfo, ErrSetRef, ExternInfo, ExternKind, FieldInfo, FnSig, IntBits,
+    MemberDecl, MemberRes, ParamInfo, StructInfo, Type, TypeId, UnionInfo,
 };
 
 use k2_resolve::{DefId, Resolved};
@@ -102,6 +102,11 @@ pub struct Typed {
     /// to a `comptime_int`, so a `const N = serializedSize(T)` use lowers to a
     /// literal rather than to a runtime call.
     pub comptime_int_values: HashMap<DefId, i128>,
+    /// The C-interop linkage of each `extern`/`export` function, keyed by its
+    /// [`DefId`] (v0.19). The MIR lowerer reads this to mark a callee as an
+    /// undefined external symbol (`extern`) or a defined global C symbol
+    /// (`export`), and to drive the variadic `AL`-zeroing for a printf-class call.
+    pub extern_fns: HashMap<DefId, ty::ExternInfo>,
     /// Every diagnostic produced, in roughly source order.
     pub diagnostics: Vec<Diagnostic>,
 }

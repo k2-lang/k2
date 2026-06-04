@@ -230,10 +230,17 @@ impl<'a> Lowerer<'a> {
         // Reserve a placeholder fn with an empty entry block; lowering fills it.
         let name = self.inst_display_name(&inst);
         let ret = self.fn_ret_type(&inst);
+        // v0.19: resolve the function's C linkage from the typed extern/export
+        // table. A plain (non-`extern`/`export`) instantiation stays Internal/K2.
+        let (abi, linkage, is_extern_decl, varargs) = self.fn_linkage_of(inst.fn_def);
         let mut f = MirFunction {
             id,
             name,
             def: Some(inst.fn_def),
+            abi,
+            linkage,
+            is_extern_decl,
+            varargs,
             inst: inst.clone(),
             params: Vec::new(),
             ret,
@@ -305,7 +312,16 @@ impl<'a> Lowerer<'a> {
             return;
         };
         let Some(body) = body else {
-            self.stub_function(fid);
+            // A body-less declaration. For a v0.19 `extern` C function, build a
+            // params-only stub so the codegen can read the declared parameter types
+            // (it needs them to marshal a string literal as a `const char *` vs a
+            // fat slice, and to classify each arg). Other body-less protos stay a
+            // trivial stub.
+            if self.funcs[fid.index()].is_extern_decl {
+                self.extern_stub_function(fid, &inst, params, *span);
+            } else {
+                self.stub_function(fid);
+            }
             return;
         };
 
@@ -373,6 +389,60 @@ impl<'a> Lowerer<'a> {
         id
     }
 
+    /// Builds a params-only stub for a v0.19 `extern` C function declaration: the
+    /// parameter locals carry their declared types (so the codegen knows each
+    /// arg's ABI class — e.g. a `[*:0]const u8` pointer vs a `[]const u8` slice),
+    /// but the body is a trivial return (the symbol is undefined; the call site
+    /// references it via a relocation, the body is never emitted). The
+    /// extern/export/varargs linkage flags set by `enqueue` are preserved.
+    fn extern_stub_function(
+        &mut self,
+        fid: FnId,
+        inst: &InstId,
+        params: &[k2_syntax::Param],
+        span: Span,
+    ) {
+        let ret = self.funcs[fid.index()].ret;
+        // Build the param locals (slot 0 is the return slot, like a real fn).
+        let mut locals: Vec<Local> = Vec::with_capacity(params.len() + 1);
+        locals.push(Local {
+            id: LocalId(0),
+            ty: ret,
+            origin: LocalOrigin::Ret,
+            address_taken: false,
+            span,
+        });
+        let mut param_ids: Vec<LocalId> = Vec::with_capacity(params.len());
+        for p in params {
+            let pty = self.param_type(inst, p);
+            let id = LocalId(locals.len() as u32);
+            let origin = match self.def_of(p.span) {
+                Some(d) => LocalOrigin::Param(d),
+                None => LocalOrigin::Temp,
+            };
+            locals.push(Local {
+                id,
+                ty: pty,
+                origin,
+                address_taken: false,
+                span: p.span,
+            });
+            param_ids.push(id);
+        }
+        let f = &mut self.funcs[fid.index()];
+        f.locals = locals;
+        f.params = param_ids;
+        f.blocks.clear();
+        let entry = f.new_block();
+        f.entry = entry;
+        let v = if matches!(self.typed.arena.get(ret), Type::Void) {
+            Operand::Const(Const::Void)
+        } else {
+            Operand::Const(Const::Undef { ty: ret })
+        };
+        f.blocks[entry.index()].term = Terminator::Return { value: v };
+    }
+
     /// Writes a trivial `return void` stub into `fid` (for a body-less fn).
     fn stub_function(&mut self, fid: FnId) {
         let ret = self.funcs[fid.index()].ret;
@@ -393,6 +463,29 @@ impl<'a> Lowerer<'a> {
     // -------------------------------------------------------------------
     //  Type / name helpers for instantiation
     // -------------------------------------------------------------------
+
+    /// Resolves a function definition's C linkage (v0.19) from the typed
+    /// extern/export table: `(abi, linkage, is_extern_decl, varargs)`. A plain
+    /// (non-FFI) function is `(K2, Internal, false, false)`.
+    fn fn_linkage_of(&self, fn_def: DefId) -> (FnAbi, Linkage, bool, bool) {
+        match self.typed.extern_fns.get(&fn_def) {
+            Some(info) => match info.kind {
+                k2_types::ExternKind::Extern => (
+                    FnAbi::C,
+                    Linkage::ExternC(info.abi_name.clone()),
+                    true,
+                    info.varargs,
+                ),
+                k2_types::ExternKind::Export => (
+                    FnAbi::C,
+                    Linkage::ExportC(info.abi_name.clone()),
+                    false,
+                    info.varargs,
+                ),
+            },
+            None => (FnAbi::K2, Linkage::Internal, false, false),
+        }
+    }
 
     /// The result (success) type of an instantiated function.
     fn fn_ret_type(&self, inst: &InstId) -> TypeId {
@@ -506,6 +599,10 @@ fn placeholder_fn(id: FnId, ret: TypeId) -> MirFunction {
         id,
         name: String::new(),
         def: None,
+        abi: FnAbi::K2,
+        linkage: Linkage::Internal,
+        is_extern_decl: false,
+        varargs: false,
         inst: InstId::plain(DefId(u32::MAX)),
         params: Vec::new(),
         ret,
@@ -609,6 +706,7 @@ fn is_value_const_init(value: &Expr) -> bool {
             | Expr::AnyType { .. }
             | Expr::Pointer { .. }
             | Expr::Slice { .. }
+            | Expr::ManyPtr { .. }
     )
 }
 
@@ -697,11 +795,21 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         let name = lo.funcs[fid.index()].name.clone();
         let inst = lo.funcs[fid.index()].inst.clone();
         let def = lo.funcs[fid.index()].def;
+        // Carry the C linkage/abi set by `enqueue` (an `export fn`'s body is
+        // lowered here, so it keeps its `ExportC` linkage + `C` abi).
+        let abi = lo.funcs[fid.index()].abi;
+        let linkage = lo.funcs[fid.index()].linkage.clone();
+        let is_extern_decl = lo.funcs[fid.index()].is_extern_decl;
+        let varargs = lo.funcs[fid.index()].varargs;
         let bool_ty = lo.typed.arena.t_bool();
         let mut func = MirFunction {
             id: fid,
             name,
             def,
+            abi,
+            linkage,
+            is_extern_decl,
+            varargs,
             inst,
             params: Vec::new(),
             ret,

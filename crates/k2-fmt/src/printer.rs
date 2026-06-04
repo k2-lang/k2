@@ -1793,6 +1793,24 @@ impl<'a> Printer<'a> {
                 s.push_str(&self.flat_child(inner, e, Side::Right));
                 s
             }
+            Expr::ManyPtr {
+                is_const,
+                sentinel,
+                inner,
+                ..
+            } => {
+                let mut s = String::from("[*");
+                if let Some(sent) = sentinel {
+                    s.push(':');
+                    s.push_str(&self.flat_expr(sent, 0));
+                }
+                s.push(']');
+                if *is_const {
+                    s.push_str("const ");
+                }
+                s.push_str(&self.flat_child(inner, e, Side::Right));
+                s
+            }
             Expr::ArrayType { len, inner, .. } => {
                 format!(
                     "[{}]{}",
@@ -2269,6 +2287,7 @@ fn prec(e: &Expr) -> u8 {
         Expr::Optional { .. }
         | Expr::Pointer { .. }
         | Expr::Slice { .. }
+        | Expr::ManyPtr { .. }
         | Expr::ArrayType { .. }
         | Expr::ErrorUnion { .. } => 11,
         // Postfix and primaries bind tightest.

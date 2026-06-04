@@ -311,22 +311,35 @@ impl Parser {
     }
 
     /// Parses a `[`-introduced type: a slice type `[]T` / `[]const T` /
-    /// `[]align(e) T`, a many-item pointer `[*]T` (modelled as a [`Expr::Slice`]
-    /// since they share the postfix-modifier shape), or an array type `[N]T`
-    /// (`N` may be `_`).
+    /// `[]align(e) T`, a many-item / sentinel pointer `[*]T` / `[*:s]T` (an
+    /// [`Expr::ManyPtr`] — a raw single-eightbyte pointer, used for C interop where
+    /// `[*:0]const u8` is a `const char *`), or an array type `[N]T` (`N` may be
+    /// `_`).
     fn parse_bracket_type(&mut self, start: Span) -> Expr {
         self.bump(); // `[`
-                     // `[*]T` — a many-item pointer. We accept `*` (optionally `[*:s]`-style
-                     // sentinels are out of scope) and model it like a slice modifier.
+                     // `[*]T` / `[*:s]T` — a many-item / sentinel pointer. The optional
+                     // `:sentinel` records a terminator *value* (e.g. `[*:0]const u8`, a
+                     // NUL-terminated `const char *`); it is modelled as a raw pointer.
         if self.at(TokenKind::Star) {
             self.bump();
-            self.expect(TokenKind::RBracket, "to close a many-item pointer `[*]`");
-            let (is_const, align) = self.parse_ptr_qualifiers();
+            let sentinel = if self.at(TokenKind::Colon) {
+                self.bump(); // `:`
+                Some(Box::new(self.parse_expr_no_struct(false)))
+            } else {
+                None
+            };
+            self.expect(
+                TokenKind::RBracket,
+                "to close a many-item pointer `[*]` / `[*:s]`",
+            );
+            // `align(e)` is accepted for symmetry but a sentinel pointer is a bare
+            // pointer for layout; only `const` materially affects typing here.
+            let (is_const, _align) = self.parse_ptr_qualifiers();
             let inner = self.parse_unary();
             let span = start.merge(inner.span());
-            return Expr::Slice {
+            return Expr::ManyPtr {
                 is_const,
-                align: align.map(Box::new),
+                sentinel,
                 inner: Box::new(inner),
                 span,
             };

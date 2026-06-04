@@ -135,6 +135,9 @@ pub struct Checker<'a> {
     /// bodies are checked exactly once (spec §07.4: per-instantiation soundness),
     /// not per use site.
     pub(crate) rechecked_insts: HashSet<TypeId>,
+    /// The C-interop linkage recorded for each `extern`/`export` function during
+    /// checking (v0.19), moved into [`Typed::extern_fns`] at the end of [`run`].
+    pub(crate) extern_fns: HashMap<DefId, crate::ty::ExternInfo>,
 }
 
 impl<'a> Checker<'a> {
@@ -169,6 +172,7 @@ impl<'a> Checker<'a> {
             type_valued_spans: HashMap::new(),
             cond_depth: 0,
             rechecked_insts: HashSet::new(),
+            extern_fns: HashMap::new(),
         }
     }
 
@@ -216,6 +220,7 @@ impl<'a> Checker<'a> {
             type_valued_spans: self.type_valued_spans,
             comptime_span_ints: self.comptime_span_ints,
             comptime_int_values: self.comptime_int_values,
+            extern_fns: self.extern_fns,
             diagnostics: self.diags,
         }
     }
@@ -334,10 +339,17 @@ impl<'a> Checker<'a> {
                 }
             }
             Item::Fn {
-                params, ret, span, ..
+                params,
+                ret,
+                span,
+                is_varargs,
+                ..
             } => {
                 if let Some(def) = self.def_of(*span) {
-                    let sig = self.build_fn_sig(params, ret);
+                    let mut sig = self.build_fn_sig(params, ret);
+                    // v0.19: carry the `...`-varargs flag so a printf-class extern
+                    // call type-checks with extra trailing arguments.
+                    sig.is_varargs = *is_varargs;
                     let fnty = self.arena.intern_fn(sig);
                     self.binding_types.insert(def, fnty);
                 }
@@ -420,6 +432,7 @@ impl<'a> Checker<'a> {
             Expr::Optional { .. }
                 | Expr::Pointer { .. }
                 | Expr::Slice { .. }
+                | Expr::ManyPtr { .. }
                 | Expr::ArrayType { .. }
                 | Expr::ErrorUnion { .. }
                 | Expr::FnType { .. }
@@ -448,8 +461,21 @@ impl<'a> Checker<'a> {
                 ret,
                 body,
                 name,
+                is_extern,
+                is_export,
+                is_varargs,
+                span,
                 ..
-            } => self.check_fn(name, params, ret, body.as_deref()),
+            } => self.check_fn(
+                name,
+                params,
+                ret,
+                body.as_deref(),
+                *is_extern,
+                *is_export,
+                *is_varargs,
+                *span,
+            ),
             Item::Test { body, .. } => {
                 // A `test` body runs as an `!void` so `try` is allowed (spec §06).
                 self.push_inferred_void_fn();
@@ -611,10 +637,29 @@ impl<'a> Checker<'a> {
     }
 
     /// Checks a function: build the signature, bind params, push the frame, and
-    /// walk the body, then verify the body returns appropriately.
-    fn check_fn(&mut self, _name: &str, params: &[Param], ret: &Expr, body: Option<&[Stmt]>) {
+    /// walk the body, then verify the body returns appropriately. The `extern`/
+    /// `export` flags drive the v0.19 C-interop checks (FFI-representability of the
+    /// signature, body presence rules) and record the function's C linkage.
+    #[allow(clippy::too_many_arguments)]
+    fn check_fn(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        ret: &Expr,
+        body: Option<&[Stmt]>,
+        is_extern: bool,
+        is_export: bool,
+        is_varargs: bool,
+        fn_span: Span,
+    ) {
         let sig = self.build_fn_sig(params, ret);
         let ret_ty = sig.ret;
+        // ---- v0.19 C-interop checks for extern/export functions. ----
+        if is_extern || is_export {
+            self.check_ffi_fn(
+                name, params, &sig, body, is_extern, is_export, is_varargs, fn_span,
+            );
+        }
         // Bind each parameter to its type.
         for (p, info) in params.iter().zip(sig.params.iter()) {
             if let Some(def) = self.def_of(p.span) {
@@ -638,6 +683,115 @@ impl<'a> Checker<'a> {
             self.check_fn_fallthrough(ret_ty, ok, is_eu, ret);
         }
         self.fn_stack.pop();
+    }
+
+    /// The v0.19 C-interop checks for an `extern`/`export` function: body-presence
+    /// rules and FFI-representability of every parameter + the return type. On
+    /// success the function's C linkage is recorded in [`Self::extern_fns`] keyed by
+    /// its [`DefId`] so the MIR lowerer can emit the right symbol (undefined for
+    /// `extern`, defined-global for `export`).
+    #[allow(clippy::too_many_arguments)]
+    fn check_ffi_fn(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        sig: &FnSig,
+        body: Option<&[Stmt]>,
+        is_extern: bool,
+        is_export: bool,
+        is_varargs: bool,
+        fn_span: Span,
+    ) {
+        // Body-presence rules: an `extern` fn declares a C symbol and must NOT have
+        // a body; an `export` fn exposes a k2 body and MUST have one.
+        if is_extern && body.is_some() {
+            self.error(
+                fn_span,
+                "an `extern` function declares a C symbol and must not have a body",
+            );
+            return;
+        }
+        if is_export && body.is_none() {
+            self.error(
+                fn_span,
+                "an `export` function must have a body to expose to C",
+            );
+            return;
+        }
+        // FFI-representability of the signature. A varargs `extern` (printf-class)
+        // is allowed; its fixed params must still be representable.
+        let mut representable = true;
+        for p in &sig.params {
+            if !self.is_ffi_representable(p.ty) {
+                representable = false;
+                self.error(
+                    p.span,
+                    format!(
+                        "parameter type `{}` is not C-ABI representable in an \
+                         `{}` function",
+                        self.arena.fmt(p.ty),
+                        if is_extern { "extern" } else { "export" }
+                    ),
+                );
+            }
+        }
+        // The return type must be representable or `void`.
+        if !matches!(self.arena.get(sig.ret), Type::Void) && !self.is_ffi_representable(sig.ret) {
+            representable = false;
+            self.error(
+                fn_span,
+                format!(
+                    "return type `{}` is not C-ABI representable in an `{}` function",
+                    self.arena.fmt(sig.ret),
+                    if is_extern { "extern" } else { "export" }
+                ),
+            );
+        }
+        // Suppress params we never bound (already-flagged) from cascading.
+        let _ = params;
+        if !representable {
+            return;
+        }
+        if let Some(def) = self.def_of(fn_span) {
+            let kind = if is_extern {
+                crate::ty::ExternKind::Extern
+            } else {
+                crate::ty::ExternKind::Export
+            };
+            self.extern_fns.insert(
+                def,
+                crate::ty::ExternInfo {
+                    kind,
+                    abi_name: name.to_string(),
+                    varargs: is_varargs,
+                },
+            );
+        }
+    }
+
+    /// `true` if `ty` is representable in the C ABI (so it may appear in an
+    /// `extern`/`export` signature): a fixed-width integer, `bool`, an `f32`/`f64`,
+    /// a single/many pointer, or a `void`. A k2-only type — a slice (a fat
+    /// `{ptr,len}` aggregate), an optional, an error union, a non-`extern` struct
+    /// by value, an 80-bit `c_longdouble` (modelled as `f128`), or a deferred type
+    /// — is NOT, so the FFI gate rejects it rather than miscompiling the ABI.
+    fn is_ffi_representable(&self, ty: TypeId) -> bool {
+        match self.arena.get(ty) {
+            // Fixed-width / pointer-width integers (incl. the `c_*` aliases, which
+            // are concrete ints) and `bool` are single-register scalars.
+            Type::Int { .. } | Type::Bool => true,
+            // `f32`/`f64` ride an SSE register; `f128` (our `c_longdouble`) is the
+            // 80-bit x87 long double, which the backend does not model — reject it.
+            Type::Float { bits } => *bits == 32 || *bits == 64,
+            // Single / many pointers are a raw eightbyte (a C `T *` / `const char *`).
+            Type::Pointer { .. } => true,
+            // An `extern struct` of representable fields lays out per the C ABI.
+            Type::Struct(id) => {
+                let info = &self.arena.structs[id.0 as usize];
+                info.is_extern && info.fields.iter().all(|f| self.is_ffi_representable(f.ty))
+            }
+            _ => false,
+        }
     }
 
     /// If a non-void, non-deferred function never produced a value `return`,

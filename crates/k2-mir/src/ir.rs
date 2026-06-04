@@ -250,6 +250,32 @@ pub enum ConstData {
     Aggregate(Vec<Operand>),
 }
 
+/// The calling convention a function uses / is called with (v0.19 C interop).
+/// The backend's existing System V AMD64 emission *is* the C ABI, so `K2` and `C`
+/// share the same register/stack marshalling; the distinction exists so the
+/// lowerer/codegen can apply the C-specific touches (variadic `AL`-zeroing,
+/// un-mangled symbol, ordinary value return for an `export fn`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FnAbi {
+    /// The default k2 calling convention (SysV AMD64, no C-specific touches).
+    K2,
+    /// The C calling convention (SysV AMD64 with the C-interop touches).
+    C,
+}
+
+/// A function's symbol linkage (v0.19 C interop).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Linkage {
+    /// An ordinary k2 function: a defined symbol with no stable C name.
+    Internal,
+    /// `export fn name(...)`: a defined GLOBAL symbol exposed to C under the
+    /// carried un-mangled name.
+    ExportC(String),
+    /// `extern fn name(...);`: an UNDEFINED external symbol (no body) the system
+    /// linker resolves against libc, referenced by the carried C name.
+    ExternC(String),
+}
+
 /// One monomorphized function: typed locals, parameters, and a control-flow graph.
 pub struct MirFunction {
     /// This function's id.
@@ -258,6 +284,19 @@ pub struct MirFunction {
     pub name: String,
     /// The source `fn` definition (`None` for a synthesized wrapper).
     pub def: Option<DefId>,
+    /// The function's calling convention (v0.19): `K2` by default, `C` for an
+    /// `extern`/`export` function.
+    pub abi: FnAbi,
+    /// The function's symbol linkage (v0.19): `Internal` by default, or an
+    /// `ExportC`/`ExternC` C symbol for an `export`/`extern` function.
+    pub linkage: Linkage,
+    /// `true` if this is a body-less `extern` declaration of a C function the
+    /// program calls — the codegen emits an undefined external symbol + a PLT32
+    /// relocation at each call site instead of a real body.
+    pub is_extern_decl: bool,
+    /// `true` for a `...`-variadic extern (printf-class): the backend zeroes `AL`
+    /// (the SysV "number of vector registers used") before a call to it.
+    pub varargs: bool,
     /// The instantiation identity (empty args for a plain function).
     pub inst: InstId,
     /// Parameter locals, in declaration order (a prefix of `locals`). For a

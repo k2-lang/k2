@@ -327,6 +327,32 @@ pub struct FnSig {
     pub has_anytype_param: bool,
 }
 
+/// The C-interop linkage of a `fn` (v0.19). [`ExternKind::Extern`] is a
+/// body-less declaration of a C function the k2 program *calls* (an undefined
+/// external symbol the system linker resolves against libc); [`ExternKind::Export`]
+/// exposes a defined k2 function to C under a stable, un-mangled C symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternKind {
+    /// `extern fn name(...) Ret;` — an undefined C symbol the program calls.
+    Extern,
+    /// `export fn name(...) Ret { ... }` — a defined global C symbol.
+    Export,
+}
+
+/// The recorded FFI metadata for one `extern`/`export` function, keyed by its
+/// [`DefId`] in [`crate::Typed::extern_fns`]. The `abi_name` is the un-mangled C
+/// symbol (the k2 fn name in v0.19); `varargs` marks a `...`-variadic extern (so
+/// the backend zeroes `AL` before a call per the SysV ABI).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternInfo {
+    /// Whether this is an `extern` (undefined) or `export` (defined) C symbol.
+    pub kind: ExternKind,
+    /// The un-mangled C symbol name (defaults to the k2 function name).
+    pub abi_name: String,
+    /// `true` for a `...`-variadic extern declaration (printf-class).
+    pub varargs: bool,
+}
+
 /// What a previously-`DeferredMember` occurrence resolved to in the type layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberRes {

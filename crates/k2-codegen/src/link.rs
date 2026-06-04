@@ -22,12 +22,13 @@
 
 use std::collections::HashMap;
 
-use k2_mir::{FnId, MirProgram};
+use k2_mir::{FnId, Linkage, MirProgram};
 
 use crate::aarch64;
 use crate::elf::{self, ElfImage};
 use crate::encode::{Asm, FixupKind};
 use crate::lower::FnLower;
+use crate::obj::{self, ObjReloc, ObjSymbol, ObjectImage};
 use crate::reg::Gpr;
 use crate::runtime::{self, RuntimeFn};
 use crate::target::Target;
@@ -186,6 +187,315 @@ fn compile_program_x86(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
 /// (the signal that this program needs the `*System` runtime emitted).
 fn is_runtime_or_state(kind: FixupKind) -> bool {
     matches!(kind, FixupKind::Runtime(_) | FixupKind::State(_))
+}
+
+/// Compiles a [`MirProgram`] to a relocatable `ET_REL` x86-64 object (v0.19 C
+/// interop): the stitched `.text` (no `_start` shim — crt0/libc provides it), the
+/// `.rodata` blob, a `.symtab` with `extern` callees UNDEFINED and `export`/`main`
+/// functions defined-GLOBAL, and a `.rela.text` of the call/data relocations. The
+/// object is meant to be linked with the system `cc` (`-no-pie`) against libc.
+///
+/// This is a **parallel** entry point to [`compile_program`]; the freestanding
+/// ELF path is untouched. A program that needs the `*System` runtime (heap /
+/// capabilities) is refused here — the libc/FFI path does not emit the runtime — so
+/// it stays on the directly-runnable freestanding path or the VM.
+pub fn compile_program_to_object(
+    prog: &MirProgram,
+    target: Target,
+) -> Result<ObjectImage, CodegenError> {
+    if target != Target::X86_64Linux {
+        return Err(CodegenError::Unsupported(format!(
+            "C-interop object emission is x86-64-only; `{}` is not supported",
+            target.triple()
+        )));
+    }
+
+    // ---- Lower every defined function; an `extern` decl emits no body. ----
+    let mut rodata = RoData::new();
+    let mut lowered: Vec<LoweredFn> = Vec::new();
+    for func in &prog.funcs {
+        if func.is_extern_decl {
+            continue; // an undefined external symbol — no code.
+        }
+        let (code, fixups) = FnLower::new(prog, func).lower(&mut rodata)?;
+        // The FFI/libc path does not emit the `*System` runtime; a heap/capability
+        // program must use the freestanding path or the VM instead.
+        if fixups.iter().any(|f| is_runtime_or_state(f.kind)) {
+            return Err(CodegenError::Unsupported(
+                "a program using the `*System` runtime (heap / capabilities) cannot be linked \
+                 with libc; build it with the freestanding `build-native` path or run it on the VM"
+                    .into(),
+            ));
+        }
+        lowered.push(LoweredFn {
+            id: func.id,
+            code,
+            fixups,
+            text_off: 0,
+        });
+    }
+
+    // ---- Stitch the functions into `.text`, recording each one's offset. ----
+    let mut text: Vec<u8> = Vec::new();
+    let mut fn_offsets: HashMap<FnId, usize> = HashMap::new();
+    let mut fn_sizes: HashMap<FnId, usize> = HashMap::new();
+    for lf in &mut lowered {
+        lf.text_off = text.len();
+        fn_offsets.insert(lf.id, lf.text_off);
+        fn_sizes.insert(lf.id, lf.code.len());
+        text.extend_from_slice(&lf.code);
+    }
+
+    // ---- Build the symbol table: section symbols (local), defined fn globals,
+    //      and the undefined extern callees. ----
+    // Symbol index 0 is the null symbol; then the two LOCAL section symbols
+    // (`.text` and `.rodata`, the relocation targets for data refs and intra-object
+    // calls); then the GLOBAL defined functions and undefined externs.
+    let mut symbols: Vec<ObjSymbol> = Vec::new();
+    symbols.push(ObjSymbol {
+        name: String::new(),
+        bind: obj::abi::STB_LOCAL,
+        typ: obj::abi::STT_NOTYPE,
+        shndx: obj::abi::SHN_UNDEF,
+        value: 0,
+        size: 0,
+    });
+    // `.text` section symbol (index 1).
+    let sym_text = symbols.len() as u32;
+    symbols.push(ObjSymbol {
+        name: String::new(),
+        bind: obj::abi::STB_LOCAL,
+        typ: obj::abi::STT_SECTION,
+        shndx: obj::abi::SEC_TEXT,
+        value: 0,
+        size: 0,
+    });
+    // `.rodata` section symbol (index 2).
+    let sym_rodata = symbols.len() as u32;
+    symbols.push(ObjSymbol {
+        name: String::new(),
+        bind: obj::abi::STB_LOCAL,
+        typ: obj::abi::STT_SECTION,
+        shndx: obj::abi::SEC_RODATA,
+        value: 0,
+        size: 0,
+    });
+
+    // Defined GLOBAL function symbols. The entry `main` is renamed to the C symbol
+    // `main` (so crt0 calls it); an `export fn` keeps its un-mangled C name. Other
+    // helpers are emitted as GLOBAL `STT_FUNC` under their lowered name with a
+    // sanitized, collision-free symbol (a monomorphized name like `List(u32).push`
+    // is not a legal C identifier, but only `main`/exports are *referenced* by C,
+    // so the helpers' names only matter for debugging — sanitize them).
+    let main_id = find_main(prog);
+    let mut sym_of_fn: HashMap<FnId, u32> = HashMap::new();
+    let mut exports: Vec<String> = Vec::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for lf in &lowered {
+        let func = &prog.funcs[lf.id.index()];
+        let (sym_name, is_global) = match &func.linkage {
+            Linkage::ExportC(name) => {
+                exports.push(name.clone());
+                (name.clone(), true)
+            }
+            _ if Some(lf.id) == main_id => {
+                exports.push("main".to_string());
+                ("main".to_string(), true)
+            }
+            _ => (
+                unique_symbol(&sanitize_symbol(&func.name), &used_names),
+                false,
+            ),
+        };
+        used_names.insert(sym_name.clone());
+        let idx = symbols.len() as u32;
+        sym_of_fn.insert(lf.id, idx);
+        symbols.push(ObjSymbol {
+            name: sym_name,
+            bind: if is_global {
+                obj::abi::STB_GLOBAL
+            } else {
+                obj::abi::STB_LOCAL
+            },
+            typ: obj::abi::STT_FUNC,
+            shndx: obj::abi::SEC_TEXT,
+            value: lf.text_off as u64,
+            size: *fn_sizes.get(&lf.id).unwrap_or(&0) as u64,
+        });
+    }
+
+    // ELF requires every LOCAL symbol to precede every GLOBAL one. The defined-fn
+    // loop above interleaves local helpers and global exports, so partition the
+    // symbol table into [null, locals..., globals...] and rebuild the fn->index map.
+    let (symbols, sym_text, sym_rodata, sym_of_fn) =
+        reorder_locals_first(symbols, sym_text, sym_rodata, sym_of_fn);
+
+    // Undefined extern symbols (one per `extern` decl that some call references).
+    let mut sym_of_extern: HashMap<FnId, u32> = HashMap::new();
+    let mut had_extern = false;
+    let mut symbols = symbols;
+    for func in &prog.funcs {
+        if !func.is_extern_decl {
+            continue;
+        }
+        let name = match &func.linkage {
+            Linkage::ExternC(n) => n.clone(),
+            _ => sanitize_symbol(&func.name),
+        };
+        had_extern = true;
+        let idx = symbols.len() as u32;
+        sym_of_extern.insert(func.id, idx);
+        symbols.push(ObjSymbol {
+            name,
+            bind: obj::abi::STB_GLOBAL,
+            typ: obj::abi::STT_NOTYPE,
+            shndx: obj::abi::SHN_UNDEF,
+            value: 0,
+            size: 0,
+        });
+    }
+
+    // ---- Build `.text` relocations from the surviving fixups. ----
+    let mut relocs: Vec<ObjReloc> = Vec::new();
+    for lf in &lowered {
+        for fx in &lf.fixups {
+            let site = (lf.text_off + fx.at) as u64;
+            match fx.kind {
+                FixupKind::Call(callee) => {
+                    if let Some(&sym) = sym_of_extern.get(&callee) {
+                        // A call into libc (or another object): PLT32, addend -4.
+                        relocs.push(ObjReloc {
+                            offset: site,
+                            sym,
+                            typ: obj::abi::R_X86_64_PLT32,
+                            addend: -4,
+                        });
+                    } else if let Some(&off) = fn_offsets.get(&callee) {
+                        // An intra-object call: PLT32 against `.text`, addend
+                        // `callee_off - 4` (the linker relaxes it to a direct
+                        // PC32 since the target is local).
+                        relocs.push(ObjReloc {
+                            offset: site,
+                            sym: sym_text,
+                            typ: obj::abi::R_X86_64_PLT32,
+                            addend: off as i64 - 4,
+                        });
+                    } else {
+                        return Err(CodegenError::Unsupported(
+                            "call to an unknown fn in object emission".into(),
+                        ));
+                    }
+                }
+                FixupKind::Data(off) => {
+                    // A `.rodata` pointer (`mov r64, imm64`): absolute 64-bit
+                    // relocation against the `.rodata` section symbol (needs a
+                    // non-PIE link, `cc -no-pie`).
+                    relocs.push(ObjReloc {
+                        offset: site,
+                        sym: sym_rodata,
+                        typ: obj::abi::R_X86_64_64,
+                        addend: off as i64,
+                    });
+                }
+                FixupKind::Runtime(_) | FixupKind::State(_) => {
+                    // Rejected above; never reached.
+                    return Err(CodegenError::Unsupported(
+                        "runtime reference in a libc-linked object".into(),
+                    ));
+                }
+                FixupKind::Local(_) => {
+                    // Resolved by `Asm::finish`; should not survive.
+                }
+            }
+        }
+    }
+
+    let _ = sym_of_fn; // defined-fn symbols aid debugging; calls go via `.text`.
+    Ok(obj::write_object(
+        &text,
+        rodata.bytes(),
+        &symbols,
+        &relocs,
+        had_extern,
+        exports,
+    ))
+}
+
+/// Partitions a symbol table built with interleaved locals/globals into
+/// `[null, all-locals..., all-globals...]` (an ELF ordering requirement) and
+/// rewrites the section-symbol indices and the fn->symbol map to the new order.
+fn reorder_locals_first(
+    symbols: Vec<ObjSymbol>,
+    sym_text: u32,
+    sym_rodata: u32,
+    sym_of_fn: HashMap<FnId, u32>,
+) -> (Vec<ObjSymbol>, u32, u32, HashMap<FnId, u32>) {
+    // Build the new order: index 0 stays null; locals (non-null) first, then
+    // globals, preserving relative order within each class.
+    let mut order: Vec<usize> = vec![0];
+    for (i, s) in symbols.iter().enumerate().skip(1) {
+        if s.bind == obj::abi::STB_LOCAL {
+            order.push(i);
+        }
+    }
+    for (i, s) in symbols.iter().enumerate().skip(1) {
+        if s.bind == obj::abi::STB_GLOBAL {
+            order.push(i);
+        }
+    }
+    // old index -> new index.
+    let mut remap = vec![0u32; symbols.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        remap[old_idx] = new_idx as u32;
+    }
+    let new_symbols: Vec<ObjSymbol> = order.iter().map(|&i| symbols[i].clone()).collect();
+    let new_fn_map: HashMap<FnId, u32> = sym_of_fn
+        .into_iter()
+        .map(|(k, v)| (k, remap[v as usize]))
+        .collect();
+    (
+        new_symbols,
+        remap[sym_text as usize],
+        remap[sym_rodata as usize],
+        new_fn_map,
+    )
+}
+
+/// Sanitizes a lowered fn name into a valid (best-effort) symbol identifier: any
+/// non-`[A-Za-z0-9_]` byte becomes `_`. Only `main`/exports are *referenced* by C;
+/// helper names only need to be valid + collision-free (handled by
+/// [`unique_symbol`]) for the symbol table and `readelf`/`objdump`.
+fn sanitize_symbol(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        s.push('_');
+    }
+    s
+}
+
+/// Returns `base`, or `base_2`/`base_3`/… if `base` is already taken, so two
+/// distinct helpers never share a symbol name.
+fn unique_symbol(base: &str, used: &std::collections::HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Patches one surviving fixup at `base + fx.at` against the resolved fn / runtime

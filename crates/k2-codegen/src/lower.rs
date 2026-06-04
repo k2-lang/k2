@@ -2563,9 +2563,29 @@ impl<'p> FnLower<'p> {
         rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         self.reject_deferred_aggregate_args(func, args)?;
-        self.marshal_args(args, None, rodata)?;
+        let sse_used = self.marshal_args(args, None, Some(func), rodata)?;
+        // v0.19: a C/variadic call needs `AL` = number of vector registers used,
+        // per the SysV ABI (glibc's `printf` reads it). For the common all-integer
+        // case `xor eax,eax` is exactly right; otherwise set the SSE count.
+        self.maybe_set_vararg_al(func, sse_used);
         self.asm.call_fn(func);
         Ok(())
+    }
+
+    /// Sets `AL` to the number of vector (SSE) argument registers used before a C
+    /// variadic call (the SysV ABI requirement that `printf`-class functions read).
+    /// A no-op for a non-C / non-variadic callee. `xor eax,eax` is emitted for the
+    /// zero case (smaller + the common path); otherwise `mov al, n`.
+    fn maybe_set_vararg_al(&mut self, func: k2_mir::FnId, sse_used: usize) {
+        let callee = &self.prog.funcs[func.index()];
+        if callee.abi != k2_mir::FnAbi::C {
+            return;
+        }
+        if sse_used == 0 {
+            self.asm.xor_rr(Gpr::Rax, Gpr::Rax);
+        } else {
+            self.asm.mov_ri(Gpr::Rax, sse_used as i64);
+        }
     }
 
     /// Rejects a call that passes an aggregate (`> 8`-byte) argument into a callee
@@ -2601,6 +2621,16 @@ impl<'p> FnLower<'p> {
                 continue;
             }
             let Some(arg) = args.get(i) else { continue };
+            // v0.19: a string literal passed to a *pointer* parameter decays to a
+            // `const char *` data pointer (one eightbyte), not a fat slice — this
+            // is the FFI C-string marshalling, not an aggregate-into-scalar bug.
+            if matches!(
+                arg,
+                Operand::Const(Const::Str(_) | Const::EmptySlice { .. })
+            ) && matches!(self.prog.arena.get(pty), Type::Pointer { .. })
+            {
+                continue;
+            }
             let aty = match arg {
                 Operand::Const(Const::Str(_) | Const::EmptySlice { .. }) => {
                     Some(self.prog.arena.t_str())
@@ -2629,7 +2659,8 @@ impl<'p> FnLower<'p> {
     ) -> Result<(), CodegenError> {
         // Save the sret pointer in a scratch home is unnecessary: marshal_args
         // does not clobber ADDR until after we move it into RDI. Move it first.
-        self.marshal_args(args, Some(sret_reg), rodata)?;
+        let sse_used = self.marshal_args(args, Some(sret_reg), Some(func), rodata)?;
+        self.maybe_set_vararg_al(func, sse_used);
         self.asm.call_fn(func);
         Ok(())
     }
@@ -2643,16 +2674,35 @@ impl<'p> FnLower<'p> {
     /// arg register. To stay correct we evaluate every arg's *value* before
     /// loading arg registers: integer/stack args are placed last-to-first via a
     /// temporary spill to the outgoing region for the stack ones.
+    ///
+    /// Returns the number of SSE (vector) argument registers consumed, which a C
+    /// variadic call needs in `AL` per the SysV ABI.
     fn marshal_args(
         &mut self,
         args: &[Operand],
         sret: Option<Gpr>,
+        callee: Option<k2_mir::FnId>,
         rodata: &mut RoData,
-    ) -> Result<(), CodegenError> {
+    ) -> Result<usize, CodegenError> {
         // Classify and lay out each argument.
         let mut int_idx = 0usize;
         let mut sse_idx = 0usize;
         let mut stack_off = self.plan.outgoing_args_base();
+
+        // v0.19: a string-literal argument decays to a single C-string data
+        // pointer (a `const char *`, one integer register) when the callee
+        // parameter is a single/many pointer rather than a `[]const u8` slice. The
+        // interned bytes carry a trailing NUL. `arg_is_cstr_ptr[i]` records that.
+        let arg_is_cstr_ptr: Vec<bool> = args
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| {
+                matches!(
+                    arg,
+                    Operand::Const(Const::Str(_) | Const::EmptySlice { .. })
+                ) && self.callee_param_is_ptr(callee, i)
+            })
+            .collect();
 
         if let Some(p) = sret {
             // RDI := sret pointer.
@@ -2674,6 +2724,17 @@ impl<'p> FnLower<'p> {
         }
         let mut placements: Vec<(usize, Place2)> = Vec::new();
         for (ai, arg) in args.iter().enumerate() {
+            // A string literal decaying to a `const char *` is one integer register.
+            if arg_is_cstr_ptr[ai] {
+                if int_idx < ARG_REGS.len() {
+                    placements.push((ai, Place2::Int(int_idx)));
+                    int_idx += 1;
+                } else {
+                    placements.push((ai, Place2::Stack(stack_off)));
+                    stack_off += 8;
+                }
+                continue;
+            }
             // A string / empty-slice literal argument is a `[]const u8` fat slice
             // (`{ptr, len}`, two integer eightbytes) even though the bare constant
             // carries no TypeId — classify it as a two-int aggregate.
@@ -2740,6 +2801,11 @@ impl<'p> FnLower<'p> {
             match pl {
                 Place2::Stack(off) => {
                     let arg = &args[*ai];
+                    if arg_is_cstr_ptr[*ai] {
+                        self.cstr_ptr_to(arg, Gpr::Rax, rodata);
+                        self.asm.mov_store_mem(Gpr::Rsp, *off, Gpr::Rax);
+                        continue;
+                    }
                     let ty = self.operand_type(arg).unwrap_or(self.func.ret);
                     if self.is_float(ty) {
                         self.load_float_operand(arg, Xmm::Xmm0)?;
@@ -2778,7 +2844,11 @@ impl<'p> FnLower<'p> {
                 Place2::Int(ri) => {
                     let arg = &args[*ai];
                     let reg = ARG_REGS[*ri];
-                    self.operand_to(arg, reg)?;
+                    if arg_is_cstr_ptr[*ai] {
+                        self.cstr_ptr_to(arg, reg, rodata);
+                    } else {
+                        self.operand_to(arg, reg)?;
+                    }
                 }
                 Place2::Sse(xi) => {
                     let arg = &args[*ai];
@@ -2807,7 +2877,46 @@ impl<'p> FnLower<'p> {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(sse_idx)
+    }
+
+    /// `true` if the callee's parameter `i` is a single/many pointer (so a string
+    /// literal passed there decays to a `const char *` data pointer, not a fat
+    /// slice). `None` callee (an intrinsic / sret helper) is never a pointer param.
+    fn callee_param_is_ptr(&self, callee: Option<k2_mir::FnId>, i: usize) -> bool {
+        let Some(func) = callee else { return false };
+        let callee = &self.prog.funcs[func.index()];
+        let Some(param) = callee.params.get(i) else {
+            // Beyond the fixed params of a C variadic callee (printf-class), a
+            // string-literal argument decays to a single `const char *` data
+            // pointer (one integer eightbyte), exactly like C: varargs are never
+            // fat `[]const u8` slices. Without this, the trailing length word of
+            // the fat slice would consume an extra integer arg register and shift
+            // every following vararg.
+            return callee.varargs && callee.abi == k2_mir::FnAbi::C;
+        };
+        let pty = callee.locals[param.index()].ty;
+        matches!(self.prog.arena.get(pty), Type::Pointer { .. })
+    }
+
+    /// Materializes a string-literal argument as a NUL-terminated C-string data
+    /// pointer into `dst` (a `const char *`). The interned bytes get a trailing NUL
+    /// appended (deduplicated on the terminated form) so the pointer is a valid
+    /// C string. An empty-slice literal yields a null pointer.
+    fn cstr_ptr_to(&mut self, arg: &Operand, dst: Gpr, rodata: &mut RoData) {
+        match arg {
+            Operand::Const(Const::Str(id)) => match &self.prog.consts[id.0 as usize] {
+                ConstData::Bytes(b) => {
+                    let mut terminated = b.clone();
+                    terminated.push(0);
+                    let off = rodata.intern(&terminated);
+                    self.asm.mov_ri_data(dst, off);
+                }
+                ConstData::Aggregate(_) => self.asm.mov_ri(dst, 0),
+            },
+            // An empty-slice / other constant: a null `const char *`.
+            _ => self.asm.mov_ri(dst, 0),
+        }
     }
 
     /// The `(rodata offset of the bytes, len)` of a string / empty-slice literal
@@ -4936,6 +5045,23 @@ fn call_stack_bytes(prog: &MirProgram, args: &[Operand]) -> i32 {
     let mut sse_idx = 0usize;
     let mut stack = 0i32;
     for arg in args {
+        // A string / empty-slice literal marshals as a `[]const u8` fat slice
+        // (`{ptr, len}`, two eightbytes) unless the callee decays it to a
+        // `const char *` (one eightbyte). Without the callee context here we
+        // size it as the wider TwoInt case so the outgoing-args region is never
+        // *undersized* — undersizing lets a stack-resident slice store overflow
+        // the region and corrupt the frame (segfault).
+        if matches!(
+            arg,
+            Operand::Const(Const::Str(_) | Const::EmptySlice { .. })
+        ) {
+            if int_idx + 2 <= ARG_REGS.len() {
+                int_idx += 2;
+            } else {
+                stack += 16;
+            }
+            continue;
+        }
         let ty = operand_type_global(prog, arg);
         match ty.map(|t| classify(prog, t)).unwrap_or(ArgClass::OneInt) {
             ArgClass::OneInt => {

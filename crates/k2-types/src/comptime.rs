@@ -285,6 +285,7 @@ impl crate::check::Checker<'_> {
             Expr::Optional { .. }
             | Expr::Pointer { .. }
             | Expr::Slice { .. }
+            | Expr::ManyPtr { .. }
             | Expr::ArrayType { .. }
             | Expr::ErrorUnion { .. }
             | Expr::FnType { .. }
@@ -1209,6 +1210,12 @@ impl crate::check::Checker<'_> {
             } => {
                 let el = self.eval_type_comptime(env, inner)?;
                 Ok(self.arena.slice(*is_const, el))
+            }
+            Expr::ManyPtr {
+                is_const, inner, ..
+            } => {
+                let pointee = self.eval_type_comptime(env, inner)?;
+                Ok(self.arena.ptr(*is_const, pointee))
             }
             Expr::ArrayType { len, inner, .. } => {
                 let el = self.eval_type_comptime(env, inner)?;

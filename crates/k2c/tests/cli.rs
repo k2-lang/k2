@@ -2016,3 +2016,148 @@ fn build_native_unknown_target_errors() {
         "error should list supported triples, got:\n{err}"
     );
 }
+
+// =========================================================================
+//  v0.19 C-interop / FFI driver tests (gated on a system `cc`)
+// =========================================================================
+
+/// Probes for a usable C compiler (`$CC`, then `cc`, then `gcc`); returns the
+/// first whose `--version` runs, so an FFI test can skip cleanly without one.
+fn find_cc() -> Option<String> {
+    let mut cands: Vec<String> = Vec::new();
+    if let Ok(cc) = std::env::var("CC") {
+        if !cc.is_empty() {
+            cands.push(cc);
+        }
+    }
+    cands.push("cc".to_string());
+    cands.push("gcc".to_string());
+    for c in cands {
+        let ok = Command::new(&c)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Writes `src` into a fresh temp file under `dir` and returns its path.
+fn write_k2(dir: &std::path::Path, name: &str, src: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let p = dir.join(name);
+    std::fs::write(&p, src).unwrap();
+    p
+}
+
+/// `run-native --link-libc` on a puts-calling program prints the line and exits 0.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_native_link_libc_puts() {
+    if find_cc().is_none() {
+        eprintln!("skipping run_native_link_libc_puts: no C compiler");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("k2_ffi_run_{}", std::process::id()));
+    let path = write_k2(
+        &dir,
+        "puts.k2",
+        "extern fn puts(s: [*:0]const u8) c_int; \
+         pub fn main() c_int { _ = puts(\"hi from libc\"); return 0; }",
+    );
+    let out = k2c()
+        .args(["run-native", "--link-libc"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "run-native --link-libc must exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi from libc\n",
+        "puts output on stdout"
+    );
+}
+
+/// `build-native --link-libc` writes a runnable executable linked against libc.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn build_native_link_libc_writes_runnable() {
+    if find_cc().is_none() {
+        eprintln!("skipping build_native_link_libc_writes_runnable: no C compiler");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("k2_ffi_build_{}", std::process::id()));
+    let src = write_k2(
+        &dir,
+        "puts.k2",
+        "extern fn puts(s: [*:0]const u8) c_int; \
+         pub fn main() c_int { _ = puts(\"built\"); return 0; }",
+    );
+    let exe = dir.join("puts");
+    let out = k2c()
+        .args(["build-native", "--link-libc", "-o"])
+        .arg(&exe)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build-native --link-libc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(&exe).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run.status.success(), "linked binary must run + exit 0");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "built\n");
+}
+
+/// A `--link-libc` request with `$CC` pointing at a missing binary produces an
+/// actionable error (and a nonzero exit), not a crash/panic.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn link_libc_missing_cc_is_actionable_error() {
+    let dir = std::env::temp_dir().join(format!("k2_ffi_nocc_{}", std::process::id()));
+    let src = write_k2(
+        &dir,
+        "puts.k2",
+        "extern fn puts(s: [*:0]const u8) c_int; \
+         pub fn main() c_int { _ = puts(\"x\"); return 0; }",
+    );
+    let out = k2c()
+        .args(["build-native", "--link-libc"])
+        .arg(&src)
+        .env("CC", "/nonexistent/definitely-not-a-compiler-xyz")
+        .env("PATH", "/nonexistent-empty-path")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success(),
+        "a missing C toolchain must fail, not succeed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("C compiler") || err.contains("link"),
+        "error should mention the missing C compiler, got:\n{err}"
+    );
+}
+
+/// The freestanding (no `--link-libc`) native path still works for a non-FFI
+/// program: it builds + runs without a C toolchain.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn freestanding_native_still_works_without_libc() {
+    let path = examples_dir().join("hello.k2");
+    let out = k2c().args(["run-native"]).arg(&path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "freestanding run-native must still work, got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

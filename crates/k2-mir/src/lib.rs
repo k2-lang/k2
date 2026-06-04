@@ -53,9 +53,9 @@ mod tests;
 
 pub use ir::{
     AggKind, ArithOp, BasicBlock, BinOp, BlockId, BuildMode, CastKind, CheckKind, Const, ConstData,
-    ConstId, Diagnostic, DiscrKind, ErrTag, FnId, InstArgKey, InstId, IntrinsicPath, IntrinsicRoot,
-    Local, LocalId, LocalOrigin, MirFunction, MirProgram, Operand, Place, Proj, Rvalue,
-    SafetyCheck, Severity, SliceMeta, Statement, Terminator, TrapReason, UnOp,
+    ConstId, Diagnostic, DiscrKind, ErrTag, FnAbi, FnId, InstArgKey, InstId, IntrinsicPath,
+    IntrinsicRoot, Linkage, Local, LocalId, LocalOrigin, MirFunction, MirProgram, Operand, Place,
+    Proj, Rvalue, SafetyCheck, Severity, SliceMeta, Statement, Terminator, TrapReason, UnOp,
 };
 pub use pretty::dump_mir;
 

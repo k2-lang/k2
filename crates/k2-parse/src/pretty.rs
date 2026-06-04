@@ -538,6 +538,24 @@ impl Printer {
                 self.indent(depth);
                 self.close_span(e.span());
             }
+            Expr::ManyPtr {
+                is_const,
+                sentinel,
+                inner,
+                ..
+            } => {
+                self.open(depth, "many-ptr");
+                if *is_const {
+                    self.flag(":const");
+                }
+                self.out.push('\n');
+                if let Some(s) = sentinel {
+                    self.labeled(depth + 1, "sentinel", s);
+                }
+                self.expr(depth + 1, inner);
+                self.indent(depth);
+                self.close_span(e.span());
+            }
             Expr::ArrayType { len, inner, .. } => {
                 self.open(depth, "array-type");
                 self.out.push('\n');

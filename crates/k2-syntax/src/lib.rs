@@ -239,6 +239,17 @@ pub enum Expr {
         inner: Box<Expr>,
         span: Span,
     },
+    /// `[*]T`, `[*]const T`, `[*:s]T`, `[*:s]const T` — a many-item / sentinel
+    /// pointer type (v0.19 C interop). It is a raw single-eightbyte pointer (the
+    /// type-system models it as `*T`/`*const T`); the optional `sentinel`
+    /// terminator value (`:s`) is a *value* contract used so a string literal
+    /// passed to a `[*:0]const u8` parameter is NUL-terminated, not a layout fact.
+    ManyPtr {
+        is_const: bool,
+        sentinel: Option<Box<Expr>>,
+        inner: Box<Expr>,
+        span: Span,
+    },
     /// `[N]T` — array type. `len` may be `_` (inferred length).
     ArrayType {
         len: Box<Expr>,
@@ -375,6 +386,7 @@ impl Expr {
             | Expr::Optional { span, .. }
             | Expr::Pointer { span, .. }
             | Expr::Slice { span, .. }
+            | Expr::ManyPtr { span, .. }
             | Expr::ArrayType { span, .. }
             | Expr::ErrorUnion { span, .. }
             | Expr::FnType { span, .. }

@@ -12,6 +12,41 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **C interop & FFI (v0.19): call libc from k2, expose k2 to C.** A k2 program can
+  declare `extern fn puts(s: [*:0]const u8) c_int;`, call it, compile to a
+  relocatable object, link with the system `cc`, and RUN with the right output;
+  and an `export fn add(a: c_int, b: c_int) c_int { ... }` produces a stable,
+  un-mangled C symbol a gcc-compiled `main` can call. Components:
+  - **`c_*` integer aliases are concrete C-ABI widths.** `c_char`/`c_short`/
+    `c_int`/`c_long`/`c_longlong` (+ unsigned) map to the LP64 widths
+    (8/16/32/64/64), so `@sizeOf(c_int) == 4` etc. fall straight out of the shared
+    layout math; `@sizeOf`/`@alignOf` of representative `extern struct`s match C
+    `sizeof`/`_Alignof` (verified by compiling + running an equivalent C program).
+    `c_longdouble` (the 80-bit x87 `long double`) is mapped to `f128` and rejected
+    by the FFI gate rather than silently miscompiled.
+  - **A many-item / sentinel pointer type `[*]T` / `[*:0]const u8`** — a raw
+    eightbyte pointer usable as a C `T *` / `const char *`. A string literal passed
+    to such a parameter decays to its data pointer (NUL-terminated), so
+    `puts("hi")` marshals a `const char *`, not a fat `{ptr,len}` slice.
+  - **`extern` / `export` typing.** An `extern fn` is a body-less undefined C
+    symbol the program calls; an `export fn` is a defined global C symbol. Both are
+    checked for FFI-representability (a slice/optional/error-union/non-`extern`
+    struct-by-value parameter is rejected with a clear message); `...`-variadic
+    externs (printf-class) are supported.
+  - **A pure-std `ET_REL` ELF64 object writer** (`obj.rs`): `.text` + `.rodata` +
+    a `.symtab` (externs UNDEFINED, `export`/`main` defined GLOBAL `STT_FUNC`) +
+    `.rela.text` (`R_X86_64_PLT32` for an `extern` call, `R_X86_64_64` for a
+    `.rodata` pointer). Hand-written, no external crates.
+  - **System-linker integration.** New `k2c build-native --link-libc <file> -o out`
+    (and the `run-native` equivalent) emit the object and link it into a **dynamic**
+    executable by shelling out to the system `cc`/`gcc` (`-no-pie`) as the link
+    driver — exactly as `rustc` invokes the platform linker; the compiler itself
+    stays pure-std. A variadic call zeroes `AL` (the SysV vector-register count) so
+    `printf` reads its arguments correctly. The FFI/link tests gate on `cc`
+    presence and skip cleanly when absent.
+  - The **freestanding native path is unchanged**: `hello`/`errors`/`allocators`
+    still run with `native == VM`, and the ET_EXEC writer / `_start` shim / runtime
+    are untouched (the object path is a parallel entry point).
 - **A second native target: aarch64 (ARMv8-A) Linux + cross-compilation
   (v0.18).** `k2c build-native --target=aarch64-linux <file> -o out` cross-compiles
   hello-class k2 programs to a static, EM_AARCH64 ELF, alongside the original

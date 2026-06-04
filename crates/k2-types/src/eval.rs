@@ -38,6 +38,17 @@ impl crate::check::Checker<'_> {
                 let el = self.eval_type(inner);
                 self.arena.slice(*is_const, el)
             }
+            // A many-item / sentinel pointer (`[*]T` / `[*:0]const u8`) is a raw
+            // single-eightbyte pointer in the type system (the sentinel is a value
+            // contract handled at marshalling, not a layout fact). This makes it
+            // classify `OneInt` and lay out at 8 bytes, exactly like `*T` — which
+            // is what a C `const char *` parameter expects.
+            Expr::ManyPtr {
+                is_const, inner, ..
+            } => {
+                let pointee = self.eval_type(inner);
+                self.arena.ptr(*is_const, pointee)
+            }
             Expr::ArrayType { len, inner, .. } => {
                 let el = self.eval_type(inner);
                 let l = self.eval_array_len(len);
@@ -196,9 +207,21 @@ impl crate::check::Checker<'_> {
             "anytype" => self.arena.t_anytype(),
             // Capability / opaque predeclared types.
             "System" | "Allocator" | "Build" => self.arena.intern_opaque(name),
-            // C-interop integer aliases: model as deferred-width ints (treated
-            // permissively; none appear in the corpus).
-            _ if name.starts_with("c_") => self.arena.t_deferred(),
+            // C-interop integer aliases (v0.19): concrete LP64 (x86-64 / aarch64
+            // Linux) widths so they classify and lay out exactly like the C ABI
+            // scalar they name. `c_int` is a real `i32`, so `@sizeOf(c_int) == 4`
+            // falls straight out of the shared `int_byte_size` math. The 80-bit
+            // `c_longdouble` is deliberately mapped to `f128` here and rejected by
+            // the FFI representability gate (a faithful 80-bit `long double` is
+            // deferred to a later milestone — we never silently miscompile it).
+            _ if c_int_alias(name).is_some() => {
+                let (signed, bits) = c_int_alias(name).expect("just checked Some");
+                self.arena.intern(Type::Int {
+                    signed,
+                    bits: crate::ty::IntBits::Fixed(bits),
+                })
+            }
+            "c_longdouble" => self.arena.intern(Type::Float { bits: 128 }),
             // A predeclared name that is not a type lattice member.
             _ => self.arena.t_deferred(),
         }
@@ -329,6 +352,26 @@ fn module_id(c: &crate::check::Checker<'_>, def: k2_resolve::DefId) -> k2_resolv
     c.resolved.defs[def.index()]
         .module
         .unwrap_or(k2_resolve::ModuleId(0))
+}
+
+/// Maps a C-interop integer alias name to its `(signed, bit-width)` on the LP64
+/// targets (x86-64-linux and aarch64-linux, both LP64). This is the C ABI for the
+/// host/CI target: `char`=8, `short`=16, `int`=32, `long`/`long long`=64. A
+/// `char` is *signed* on x86-64. Returns `None` for any non-alias name (including
+/// `c_longdouble`, whose 80-bit width is handled separately and rejected in FFI).
+pub(crate) fn c_int_alias(name: &str) -> Option<(bool, u16)> {
+    Some(match name {
+        "c_char" => (true, 8),
+        "c_short" => (true, 16),
+        "c_ushort" => (false, 16),
+        "c_int" => (true, 32),
+        "c_uint" => (false, 32),
+        "c_long" => (true, 64),
+        "c_ulong" => (false, 64),
+        "c_longlong" => (true, 64),
+        "c_ulonglong" => (false, 64),
+        _ => return None,
+    })
 }
 
 /// Parses a predeclared integer type name (`u8`, `i32`, `usize`, `u1`, …) into

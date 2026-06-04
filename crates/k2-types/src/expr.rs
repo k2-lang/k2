@@ -12,6 +12,15 @@ impl crate::check::Checker<'_> {
     pub(crate) fn check(&mut self, e: &Expr, expected: TypeId) -> TypeId {
         // Bidirectional special-casing for literals/forms that need the target.
         match e {
+            // A string literal passed where a C-string pointer is expected
+            // (`[*:0]const u8` / `*const u8`, modelled as `Type::Pointer { pointee:
+            // u8 }`) decays to its data pointer — this is the `const char *`
+            // marshalling for an `extern fn puts(s: [*:0]const u8) c_int;` call.
+            // The literal's interned bytes carry a trailing NUL at codegen time.
+            Expr::Str { span, .. } if self.is_c_string_ptr(expected) => {
+                self.record(*span, expected);
+                return expected;
+            }
             Expr::Int { .. } => return self.check_int_literal(e, expected),
             Expr::Null { span } => return self.check_null(*span, expected),
             Expr::Undefined { span } => {
@@ -62,6 +71,23 @@ impl crate::check::Checker<'_> {
             }
         }
         self.finish_check(e.span(), got, expected)
+    }
+
+    /// `true` if `expected` is a C-string pointer — a `*const u8` / `*u8` (the
+    /// representation of `[*:0]const u8` / `[*]const u8`) — so a string literal may
+    /// decay to its data pointer (a `const char *`).
+    fn is_c_string_ptr(&self, expected: TypeId) -> bool {
+        if let Type::Pointer { pointee, .. } = self.arena.get(expected) {
+            matches!(
+                self.arena.get(*pointee),
+                Type::Int {
+                    signed: false,
+                    bits: crate::ty::IntBits::Fixed(8)
+                }
+            )
+        } else {
+            false
+        }
     }
 
     /// Emits a coercion diagnostic if `got` does not coerce to `expected`.
@@ -161,6 +187,7 @@ impl crate::check::Checker<'_> {
             Expr::Optional { .. }
             | Expr::Pointer { .. }
             | Expr::Slice { .. }
+            | Expr::ManyPtr { .. }
             | Expr::ArrayType { .. }
             | Expr::ErrorUnion { .. }
             | Expr::FnType { .. }

@@ -129,6 +129,7 @@ impl FnBuilder<'_, '_> {
             Expr::Optional { .. }
             | Expr::Pointer { .. }
             | Expr::Slice { .. }
+            | Expr::ManyPtr { .. }
             | Expr::ArrayType { .. }
             | Expr::ErrorUnion { .. }
             | Expr::FnType { .. }

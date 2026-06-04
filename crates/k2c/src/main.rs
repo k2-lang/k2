@@ -1331,22 +1331,36 @@ fn front_end_to_mir(path: &str, mode: BuildMode, opt_flag: bool) -> Result<MirPr
     Ok(prog)
 }
 
-/// Parses the `path` + `mode` + `target` flags shared by
-/// `run-native`/`build-native`, returning `(path, mode, opt_flag, target,
-/// remaining)` where `remaining` are the args after the path (forwarded argv /
-/// output options). The first non-flag token is the source path.
+/// The parsed shared flags for `run-native`/`build-native`.
+struct NativeFlags<'a> {
+    /// The source path (or `-` for stdin).
+    path: &'a str,
+    /// The build mode (Debug / ReleaseSafe / ReleaseFast).
+    mode: BuildMode,
+    /// Whether the MIR optimizer was explicitly requested (`--opt`).
+    opt_flag: bool,
+    /// The selected native target.
+    target: Target,
+    /// Whether to emit an object + link it with libc via the system `cc`.
+    link_libc: bool,
+    /// The args after the path (forwarded argv / output options).
+    rest: Vec<&'a String>,
+}
+
+/// Parses the `path` + `mode` + `target` + `--link-libc` flags shared by
+/// `run-native`/`build-native` into a [`NativeFlags`]. The first non-flag token is
+/// the source path; everything after it is forwarded.
 ///
 /// The target is selected with `--target=<triple>` (or its `-Dtarget=<triple>`
 /// alias); the default is `x86_64-linux`. Supported triples are documented in the
-/// usage banner and `docs/aarch64.md`.
-fn parse_native_flags<'a>(
-    args: &'a [String],
-    cmd: &str,
-) -> Result<(&'a str, BuildMode, bool, Target, Vec<&'a String>), String> {
+/// usage banner and `docs/aarch64.md`. `--link-libc` selects the v0.19 C-interop
+/// object-emit + system-`cc` link path.
+fn parse_native_flags<'a>(args: &'a [String], cmd: &str) -> Result<NativeFlags<'a>, String> {
     let mut path: Option<&str> = None;
     let mut mode = BuildMode::Debug;
     let mut opt_flag = false;
     let mut target = Target::default();
+    let mut link_libc = false;
     let mut rest: Vec<&String> = Vec::new();
     let mut seen_path = false;
     for arg in args {
@@ -1367,6 +1381,7 @@ fn parse_native_flags<'a>(
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
             "--opt" => opt_flag = true,
+            "--link-libc" => link_libc = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown `{cmd}` flag `{other}`"));
             }
@@ -1378,7 +1393,76 @@ fn parse_native_flags<'a>(
     }
     let path =
         path.ok_or_else(|| format!("`{cmd}` needs a <file.k2> argument (or `-` for stdin)"))?;
-    Ok((path, mode, opt_flag, target, rest))
+    Ok(NativeFlags {
+        path,
+        mode,
+        opt_flag,
+        target,
+        link_libc,
+        rest,
+    })
+}
+
+/// Locates a usable C compiler to drive the link step (`--link-libc`). Probes
+/// `$CC` if set, then `cc`, then `gcc`, returning the first whose `--version` runs.
+/// Returns `None` when no C toolchain is present — the caller then reports an
+/// actionable error (build-native) or skips cleanly (the FFI tests).
+///
+/// NOTE: `--link-libc` is the only place the k2 toolchain shells out to an
+/// external program. The compiler itself stays pure-std; linking uses the system
+/// `cc`/`gcc` as the link driver — exactly as `rustc` invokes the platform linker —
+/// so crt startup + libc are pulled in correctly.
+fn find_cc() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(cc) = env::var("CC") {
+        if !cc.is_empty() {
+            candidates.push(cc);
+        }
+    }
+    candidates.push("cc".to_string());
+    candidates.push("gcc".to_string());
+    for cand in candidates {
+        let ok = std::process::Command::new(&cand)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Links a relocatable object into a dynamic executable by invoking the system
+/// `cc`/`gcc` as the link driver. Uses `-no-pie` so the object's absolute
+/// `.rodata` relocations (`R_X86_64_64`) resolve correctly. On failure, returns
+/// the driver's captured stderr so the user sees the real linker error.
+fn link_object_with_cc(
+    cc: &str,
+    obj_path: &Path,
+    out_path: &Path,
+    extra_inputs: &[String],
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(cc);
+    cmd.arg("-no-pie")
+        .arg("-o")
+        .arg(out_path)
+        .arg(obj_path)
+        .args(extra_inputs);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("could not run the link driver `{cc}`: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "the system linker (`{cc}`) failed to link the object:\n{stderr}"
+        ))
+    }
 }
 
 /// The `build-native` subcommand: compile a k2 program to a static x86-64 Linux
@@ -1390,12 +1474,19 @@ fn parse_native_flags<'a>(
 fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
     // Split off `-o <out>` before the shared flag parse (it is build-only).
     let (out_path, rest) = take_output_flag(args)?;
-    let (path, mode, opt_flag, target, _forwarded) = parse_native_flags(&rest, "build-native")?;
+    let flags = parse_native_flags(&rest, "build-native")?;
+    let (path, target) = (flags.path, flags.target);
 
-    let prog = match front_end_to_mir(path, mode, opt_flag) {
+    let prog = match front_end_to_mir(path, flags.mode, flags.opt_flag) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+
+    // ---- C-interop path: emit a relocatable object and link it with libc. ----
+    if flags.link_libc {
+        let out = out_path.unwrap_or_else(|| default_native_output(path));
+        return build_native_libc(&prog, path, target, &out);
+    }
 
     let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
         Ok(img) => img,
@@ -1435,6 +1526,126 @@ fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `build-native --link-libc` path: emit a relocatable object from `prog`,
+/// write it next to the output, and link it into a dynamic executable with the
+/// system `cc` (`-no-pie`). Documents that linking shells out to the system C
+/// compiler. Returns FAILURE (not a panic) on a missing toolchain or a link error.
+fn build_native_libc(
+    prog: &MirProgram,
+    path: &str,
+    target: Target,
+    out: &str,
+) -> Result<ExitCode, String> {
+    if target != Target::default() {
+        return Err(format!(
+            "`--link-libc` is x86-64-linux only; `{}` is not supported",
+            target.triple()
+        ));
+    }
+    let obj = match k2_codegen::compile_program_to_object(prog, target) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = writeln!(
+                io::stderr(),
+                "error: native backend ({}): {e}\nnote: this program is outside the FFI/libc \
+                 native subset; run it on the VM with `{PROG} run {path}`",
+                target.triple()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let Some(cc) = find_cc() else {
+        let _ = writeln!(
+            io::stderr(),
+            "error: `--link-libc` needs a system C compiler (`cc`/`gcc`) to link against libc, \
+             but none was found on PATH (set $CC, or install a C toolchain)"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+    // Write the object beside the output, then link it.
+    let obj_path = std::path::PathBuf::from(format!("{out}.o"));
+    if let Err(e) = fs::write(&obj_path, &obj.bytes) {
+        return Err(format!("could not write `{}`: {e}", obj_path.display()));
+    }
+    let result = link_object_with_cc(&cc, &obj_path, Path::new(out), &[]);
+    let _ = fs::remove_file(&obj_path);
+    match result {
+        Ok(()) => {
+            set_executable(out);
+            let _ = writeln!(
+                io::stderr(),
+                "wrote {out} (linked with libc via `{cc} -no-pie`, {})",
+                target.triple()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// The `run-native --link-libc` path: emit an object, link it with libc via the
+/// system `cc` into a temp executable, run it (inheriting stdio so libc's `puts`
+/// output appears on the driver's stdout), and propagate the child's exit code.
+fn run_native_libc(
+    prog: &MirProgram,
+    path: &str,
+    target: Target,
+    forwarded: &[&String],
+) -> Result<ExitCode, String> {
+    if target != Target::default() {
+        return Err(format!(
+            "`--link-libc` is x86-64-linux only; `{}` is not supported",
+            target.triple()
+        ));
+    }
+    let obj = match k2_codegen::compile_program_to_object(prog, target) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = writeln!(
+                io::stderr(),
+                "error: native backend: {e}\nnote: this program is outside the FFI/libc native \
+                 subset; run it on the VM with `{PROG} run {path}`"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let Some(cc) = find_cc() else {
+        let _ = writeln!(
+            io::stderr(),
+            "error: `--link-libc` needs a system C compiler (`cc`/`gcc`) to link against libc, \
+             but none was found on PATH (set $CC, or install a C toolchain)"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+    let obj_path = native_temp_path().with_extension("o");
+    let exe_path = native_temp_path();
+    if let Err(e) = fs::write(&obj_path, &obj.bytes) {
+        return Err(format!("could not write temp object: {e}"));
+    }
+    let link = link_object_with_cc(&cc, &obj_path, &exe_path, &[]);
+    let _ = fs::remove_file(&obj_path);
+    if let Err(e) = link {
+        let _ = writeln!(io::stderr(), "error: {e}");
+        let _ = fs::remove_file(&exe_path);
+        return Ok(ExitCode::FAILURE);
+    }
+    set_executable(&exe_path);
+    let status = std::process::Command::new(&exe_path)
+        .args(forwarded.iter().map(|s| s.as_str()))
+        .status();
+    let _ = fs::remove_file(&exe_path);
+    match status {
+        Ok(st) => {
+            let code = native_exit_code(&st);
+            Ok(ExitCode::from((code & 0xff) as u8))
+        }
+        Err(e) => Err(format!("could not execute linked binary: {e}")),
+    }
+}
+
 /// The `run-native` subcommand: compile a k2 program to a temporary ELF, execute
 /// it directly, and propagate its exit code. Inherits stdio so the program's
 /// output and exit status are the driver's.
@@ -1442,7 +1653,15 @@ fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
 /// Usage:
 ///   k2c run-native <file.k2> [flags] [-- argv...]
 fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
-    let (path, mode, opt_flag, target, forwarded) = parse_native_flags(args, "run-native")?;
+    let flags = parse_native_flags(args, "run-native")?;
+    let (path, mode, opt_flag, target, link_libc, forwarded) = (
+        flags.path,
+        flags.mode,
+        flags.opt_flag,
+        flags.target,
+        flags.link_libc,
+        flags.rest,
+    );
 
     // `run-native` executes the emitted binary; refuse a non-host target up front
     // (a foreign-ISA binary cannot be executed here — there is no emulator).
@@ -1463,6 +1682,11 @@ fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+
+    // ---- C-interop path: object -> cc-link -> run, propagating the exit code. ----
+    if link_libc {
+        return run_native_libc(&prog, path, target, &forwarded);
+    }
 
     let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
         Ok(img) => img,

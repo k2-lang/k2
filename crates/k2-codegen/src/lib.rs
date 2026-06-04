@@ -75,6 +75,7 @@ mod layout;
 mod link;
 mod lower;
 mod mir_ids;
+mod obj;
 mod reg;
 mod regalloc;
 mod runtime;
@@ -84,6 +85,8 @@ mod target;
 mod tests;
 
 pub use elf::ElfImage;
+pub use link::compile_program_to_object;
+pub use obj::ObjectImage;
 pub use target::Target;
 
 use k2_mir::MirProgram;
