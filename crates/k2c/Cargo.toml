@@ -23,5 +23,6 @@ k2-std = { path = "../k2-std" }
 k2-mir = { path = "../k2-mir" }
 k2-opt = { path = "../k2-opt" }
 k2-vm = { path = "../k2-vm" }
+k2-codegen = { path = "../k2-codegen" }
 k2-fmt = { path = "../k2-fmt" }
 k2-lsp = { path = "../k2-lsp" }

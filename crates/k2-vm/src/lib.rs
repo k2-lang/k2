@@ -235,13 +235,11 @@ fn run_inner_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u
             (RunOutcome::Errored(name), 1)
         }
         Err(Halt::Panic(info)) => (RunOutcome::Panicked(info.message()), 134),
-        Err(Halt::Exit(c)) => {
-            if c == 0 {
-                (RunOutcome::Ok, 0)
-            } else {
-                (RunOutcome::Errored(format!("exit {c}")), c)
-            }
-        }
+        // An explicit process exit, including an integer-returning `main` whose
+        // result is the exit code. This is a *clean* termination, not an error, so
+        // no diagnostic line is emitted — matching the native backend, which exits
+        // with the code and prints nothing. The code passes straight through.
+        Err(Halt::Exit(c)) => (RunOutcome::Ok, c),
     };
     let count = vm.instr_count();
     (outcome, code, vm.stdout, vm.stderr, count)

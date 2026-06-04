@@ -475,6 +475,43 @@ fn run_release_fast_skips_the_trap() {
 }
 
 // =========================================================================
+//  Native backend: signal-killed child vs real panic-trap exit code
+//  (Finding 6). Gated to x86_64 Linux, where `run-native` executes the ELF.
+// =========================================================================
+
+/// A genuine k2 panic-trap under `run-native` exits 134 (the binary prints a
+/// `panic:` line then `exit(134)`), while a signal-killed child (a SIGSEGV from
+/// native stack exhaustion on deep recursion) is reported as `128 + signo`
+/// (139 for SIGSEGV) — distinguishable from the trap, not conflated with it.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_native_distinguishes_signal_from_trap() {
+    // (a) A real overflow trap: exit 134, with the `panic:` line on stderr.
+    let trap = b"pub fn main(sys: *System) u8 { var x: u8 = 255; x = x + 1; return x; }";
+    let (code, _out, stderr) = run_with_code(&["run-native", "-"], trap);
+    assert_eq!(code, 134, "a real trap exits 134 via run-native");
+    assert!(
+        stderr.contains("panic:"),
+        "the trap prints a panic line, got: {stderr}"
+    );
+
+    // (b) Deep recursion exhausts the native process stack -> SIGSEGV. The driver
+    // reports 128 + SIGSEGV (11) = 139, NOT 134, so the crash is not silently
+    // reported as an ordinary k2 trap. No `panic:` line is printed (a raw fault).
+    let segv = b"fn sum(n: i64) i64 { if (n == 0) { return 0; } return n + sum(n - 1); } \
+          pub fn main(sys: *System) u8 { var r: i64 = sum(50000000); return 7; }";
+    let (code, _out, stderr) = run_with_code(&["run-native", "-"], segv);
+    assert_eq!(
+        code, 139,
+        "a SIGSEGV-killed child reports 128+signo (139), not the trap's 134"
+    );
+    assert!(
+        !stderr.contains("panic:"),
+        "a raw signal fault prints no k2 panic line, got: {stderr}"
+    );
+}
+
+// =========================================================================
 //  Standard library (v0.10): `@import("std")` as a REAL compiled module
 // =========================================================================
 

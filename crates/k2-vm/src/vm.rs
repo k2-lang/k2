@@ -278,13 +278,27 @@ impl<'p> Vm<'p> {
     /// is a single fiber whose dispatch matches the old single-stack path exactly.
     pub fn run_main(&mut self) -> Result<(), Halt> {
         let main = self.find_main().ok_or(Halt::Exit(0))?;
+        // Whether `main` declares a concrete integer return type. Such a `main`
+        // propagates its result as the process exit code (truncated to a u8),
+        // matching the native backend's `_start` shim. An `!void` main keeps the
+        // success->0 / escaped-error->1 convention on both backends.
+        let int_main = matches!(
+            self.prog.arena.get(self.prog.funcs[main.index()].ret),
+            k2_types::Type::Int { .. }
+        );
         // Build the root `*System` capability and seed the root fiber.
         let sys = Value::Cap(Capability::System);
         let root = self.spawn_fiber_for(main, vec![sys])?;
         self.event_loop()?;
-        // `main` returns `!void`: inspect the root fiber's result.
+        // Inspect the root fiber's result.
         match self.sched.fibers[root as usize].result.take() {
             Some(Value::ErrVal(tag)) => Err(Halt::ProgramError(tag)),
+            // `pub fn main(...) <Int>`: exit with the integer result (low 8 bits),
+            // agreeing with native's integer-main exit-code convention.
+            Some(v) if int_main => {
+                let code = v.as_i128().unwrap_or(0);
+                Err(Halt::Exit((code as u8) as i32))
+            }
             _ => Ok(()),
         }
     }
@@ -988,7 +1002,19 @@ impl<'p> Vm<'p> {
         match kind {
             CastKind::IntToFloat => Value::Float(a.as_f64().unwrap_or(0.0)),
             CastKind::FloatToInt => Value::int(a.as_f64().unwrap_or(0.0) as i128, to),
-            CastKind::PtrReinterpret => a.clone(),
+            CastKind::PtrReinterpret => {
+                // An integer `@bitCast` lowers to `PtrReinterpret`. Two's-complement
+                // bit reinterpretation re-reprs the value to the *destination*
+                // integer type, so `@bitCast(i8 -1) -> u8` is `255` and
+                // `@bitCast(u8 255) -> i8` is `-1` — matching the native backend,
+                // which normalizes to the target width/signedness. A genuine
+                // pointer (or other non-integer) reinterpretation has no integer
+                // value to re-repr, so it is passed through unchanged.
+                match (a.as_i128(), to_float) {
+                    (Some(bits), false) => Value::int(bits, to),
+                    _ => a.clone(),
+                }
+            }
             CastKind::Widen | CastKind::IntNarrow => {
                 if to_float {
                     Value::Float(a.as_f64().unwrap_or(0.0))

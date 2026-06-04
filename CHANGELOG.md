@@ -115,6 +115,39 @@ is being designed in the open and nothing is stable yet.
     `k2c build run -Dexample=hello` prints `Hello, k2!`, and `k2c build test` runs
     the example tests.
 
+- **Native x86-64 backend foundation (v0.14).** A new pure-std crate
+  `k2-codegen` that turns a *subset* of the monomorphized MIR into a real,
+  static, directly-runnable x86-64 Linux ELF — with **no** Cranelift, **no**
+  LLVM, **no** libc, and **no** third-party crates. It has three hand-rolled
+  layers: a byte-exact **x86-64 instruction encoder** (REX/ModRM/SIB by hand:
+  `mov`/`add`/`sub`/`imul`/`cqo`+`idiv`, `cmp`/`test`, `and`/`or`/`xor`,
+  `shl`/`shr`/`sar`, `setcc`/`movzx`/`movsx`/`movsxd`, `lea`, `push`/`pop`,
+  near `call`/`jmp`/`jcc` with `rel32` fixups, `syscall`, and the `[rbp - N]`
+  stack-slot + immediate addressing modes), an **ELF64 writer** that emits a
+  static non-PIE `ET_EXEC` at base `0x400000` (entry `0x401000`, one RX `PT_LOAD`
+  for headers+code and an R-only `PT_LOAD` for `.rodata`, no dynamic linker / no
+  section headers), and a **MIR → machine-code lowering** that gives each MIR
+  local an `[rbp - 8*(i+1)]` stack slot and lowers width-correct integer
+  arithmetic / compare / bitwise / shift, `Goto`/`Branch`/`Switch`/`Return`/
+  `Trap`/`Unreachable`, System V AMD64 direct calls (args in
+  `rdi/rsi/rdx/rcx/r8/r9`, result in `rax`, 16-byte-aligned call sites), the
+  `@no_*_overflow`/`narrow_fits` safety predicates that guard a `Trap`, and the
+  `write`/`exit` syscall intrinsics (`sys.io.stdout()`/`stderr()` → an fd token;
+  a fixed-string `print` → a `write(fd, ptr, len)` of `.rodata` bytes; a `Trap`
+  → `panic: …` on stderr + `exit(134)`, matching the VM). A `_start` shim runs
+  `main` and `exit()`s with its result. Two new driver subcommands wire it in:
+  **`k2c run-native <file.k2>`** compiles to a temp ELF, executes it, and
+  propagates the exit code, and **`k2c build-native <file.k2> -o <out>`** writes
+  the `chmod +x`-able ELF. Anything outside the subset (floats, aggregates,
+  projected places, runtime-formatted `print`, …) is rejected up-front with a
+  clean `error: native backend: …` message that points back to `k2c run` — it is
+  never miscompiled, and all existing subcommands are untouched. The encoder
+  asserts exact bytes against `as`/`objdump`-verified encodings and the ELF
+  writer validates its header / segment invariants on **every** host; the
+  native-execution tests (which actually **run** the emitted binary and assert
+  exit code + stdout, **differentially against `k2c run`**) are gated to
+  `x86_64`-Linux so CI exercises them while other hosts still build.
+
 - **Project infrastructure.** Continuous integration (`fmt` · `clippy` ·
   `build` · `test`, plus an examples smoke-test), contributor and security
   policies, dual MIT / Apache-2.0 licensing, and a development roadmap.

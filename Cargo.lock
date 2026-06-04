@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "k2-codegen"
+version = "0.1.0"
+dependencies = [
+ "k2-mir",
+ "k2-opt",
+ "k2-parse",
+ "k2-resolve",
+ "k2-std",
+ "k2-syntax",
+ "k2-types",
+ "k2-vm",
+]
+
+[[package]]
 name = "k2-fmt"
 version = "0.1.0"
 dependencies = [
@@ -101,6 +115,7 @@ dependencies = [
 name = "k2c"
 version = "0.1.0"
 dependencies = [
+ "k2-codegen",
  "k2-fmt",
  "k2-lexer",
  "k2-lsp",

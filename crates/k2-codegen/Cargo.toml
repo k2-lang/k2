@@ -1,0 +1,33 @@
+[package]
+name = "k2-codegen"
+version = "0.1.0"
+edition = "2021"
+description = "The k2 pure-std x86-64 native backend (v0.14 foundation): instruction encoder, ELF64 writer, and MIR -> machine-code lowering."
+license = "MIT OR Apache-2.0"
+
+# The library produced by this crate.
+[lib]
+name = "k2_codegen"
+path = "src/lib.rs"
+
+# Standard library only, plus the MIR and type crates by path. The whole backend
+# — the x86-64 encoder, the static-ELF writer, and the MIR lowering — is written
+# against `std` with NO third-party crates (no Cranelift, no LLVM, no libc), so
+# the toolchain still builds and links fully offline. The portable encoder/ELF
+# logic builds on every host; only the *execution* tests are gated to x86-64
+# Linux (see `tests.rs`).
+[dependencies]
+k2-mir = { path = "../k2-mir" }
+k2-types = { path = "../k2-types" }
+
+# The native-execution tests lower k2 source strings to MIR through the real
+# front-end, then run the emitted ELF and compare against the VM, so they need
+# the front-end + VM crates. These are test-only (std-only, offline) and the
+# execution assertions are `#[cfg(all(target_arch = "x86_64", target_os = "linux"))]`.
+[dev-dependencies]
+k2-syntax = { path = "../k2-syntax" }
+k2-parse = { path = "../k2-parse" }
+k2-resolve = { path = "../k2-resolve" }
+k2-std = { path = "../k2-std" }
+k2-opt = { path = "../k2-opt" }
+k2-vm = { path = "../k2-vm" }

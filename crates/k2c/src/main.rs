@@ -102,6 +102,8 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "check" => cmd_check(rest),
         "mir" => cmd_mir(rest),
         "run" => cmd_run(rest),
+        "run-native" => cmd_run_native(rest),
+        "build-native" => cmd_build_native(rest),
         "build" => build_cmd::cmd_build(rest),
         "bench" => cmd_bench(rest),
         "lsp" => cmd_lsp(rest),
@@ -1188,6 +1190,381 @@ fn run_multi_file(
     ))
 }
 
+/// Runs the shared single-file front-end pipeline (parse -> resolve -> check ->
+/// lower -> optimize -> verify) and returns the verified [`MirProgram`], or an
+/// `Err(ExitCode)` after printing the front-end diagnostics. This is the exact
+/// pipeline `cmd_run` uses, factored so the native subcommands compile to the
+/// same verified MIR the VM path runs — guaranteeing the differential property.
+///
+/// Multi-file (`@import("./...")`) programs are out of the native subset for now
+/// (the VM path via `k2c run` handles them); a path-import program is rejected
+/// here with a clear message.
+fn front_end_to_mir(path: &str, mode: BuildMode, opt_flag: bool) -> Result<MirProgram, ExitCode> {
+    let (source, label) = read_source(path).map_err(|e| {
+        let _ = writeln!(io::stderr(), "{PROG}: error: {e}");
+        ExitCode::FAILURE
+    })?;
+
+    if multi::has_path_imports(&source) {
+        let _ = writeln!(
+            io::stderr(),
+            "{label}: error: the native backend does not yet support `@import(\"./...\")` \
+             multi-file programs; use `{PROG} run` (VM) for this program"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+
+    let pres = parse_program(&source);
+    if !pres.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &pres.diagnostics {
+            if diag.severity == Severity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot compile {label}: it has parse errors");
+        return Err(ExitCode::FAILURE);
+    }
+
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &resolved.diagnostics {
+            if diag.severity == ResolveSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(
+            err,
+            "error: cannot compile {label}: it has resolution errors"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+
+    let typed = check_file(&pres.file, &resolved);
+    if !typed.is_ok() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &typed.diagnostics {
+            if diag.severity == TypeSeverity::Error {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+        }
+        let _ = writeln!(err, "error: cannot compile {label}: it has type errors");
+        return Err(ExitCode::FAILURE);
+    }
+
+    let mut prog = match lower_program(&pres.file, &resolved, typed, mode) {
+        Ok(p) => p,
+        Err(diags) => {
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            for diag in &diags {
+                let _ = writeln!(
+                    err,
+                    "{label}:{}:{}: error: {}",
+                    diag.span.line, diag.span.col, diag.message
+                );
+            }
+            let _ = writeln!(err, "error: cannot compile {label}: lowering failed");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    let mut error_count = 0usize;
+    {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for diag in &prog.diagnostics {
+            if diag.severity == MirSeverity::Error {
+                error_count += 1;
+            }
+            let sev = match diag.severity {
+                MirSeverity::Error => "error",
+                MirSeverity::Warning => "warning",
+            };
+            let _ = writeln!(
+                err,
+                "{label}:{}:{}: {sev}: {}",
+                diag.span.line, diag.span.col, diag.message
+            );
+        }
+    }
+    if error_count > 0 {
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot compile {label}: lowering had errors"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+
+    if let Err(e) = run_optimizer(&mut prog, mode, opt_flag) {
+        let _ = writeln!(io::stderr(), "{PROG}: error: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+
+    let problems = prog.verify();
+    if !problems.is_empty() {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
+        for p in &problems {
+            let _ = writeln!(err, "error: malformed MIR: {}", p.message);
+        }
+        return Err(ExitCode::FAILURE);
+    }
+
+    Ok(prog)
+}
+
+/// Parses the `path` + `mode` flags shared by `run-native`/`build-native`,
+/// returning `(path, mode, opt_flag, remaining)` where `remaining` are the args
+/// after the path (forwarded argv / output options). The first non-flag token is
+/// the source path.
+fn parse_native_flags<'a>(
+    args: &'a [String],
+    cmd: &str,
+) -> Result<(&'a str, BuildMode, bool, Vec<&'a String>), String> {
+    let mut path: Option<&str> = None;
+    let mut mode = BuildMode::Debug;
+    let mut opt_flag = false;
+    let mut rest: Vec<&String> = Vec::new();
+    let mut seen_path = false;
+    for arg in args {
+        if seen_path {
+            rest.push(arg);
+            continue;
+        }
+        match arg.as_str() {
+            "--release-fast" => mode = BuildMode::ReleaseFast,
+            "--release-safe" => mode = BuildMode::ReleaseSafe,
+            "--debug" => mode = BuildMode::Debug,
+            "--opt" => opt_flag = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown `{cmd}` flag `{other}`"));
+            }
+            other => {
+                path = Some(other);
+                seen_path = true;
+            }
+        }
+    }
+    let path =
+        path.ok_or_else(|| format!("`{cmd}` needs a <file.k2> argument (or `-` for stdin)"))?;
+    Ok((path, mode, opt_flag, rest))
+}
+
+/// The `build-native` subcommand: compile a k2 program to a static x86-64 Linux
+/// ELF and write it to disk (default output: the input stem). The emitted file
+/// is `chmod +x`-ed and runs directly with no dynamic linker.
+///
+/// Usage:
+///   k2c build-native <file.k2> [-o <out>] [--release-fast|--release-safe|--debug]
+fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
+    // Split off `-o <out>` before the shared flag parse (it is build-only).
+    let (out_path, rest) = take_output_flag(args)?;
+    let (path, mode, opt_flag, _forwarded) = parse_native_flags(&rest, "build-native")?;
+
+    let prog = match front_end_to_mir(path, mode, opt_flag) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+
+    let img = match k2_codegen::compile_program_to_elf(&prog) {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = writeln!(
+                io::stderr(),
+                "error: native backend: {e}\nnote: this program is outside the v0.14 native \
+                 subset; run it on the VM with `{PROG} run {path}`"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    let out = out_path.unwrap_or_else(|| default_native_output(path));
+    if let Err(e) = fs::write(&out, &img.bytes) {
+        return Err(format!("could not write `{out}`: {e}"));
+    }
+    set_executable(&out);
+    let _ = writeln!(io::stderr(), "wrote {} ({} bytes)", out, img.bytes.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `run-native` subcommand: compile a k2 program to a temporary ELF, execute
+/// it directly, and propagate its exit code. Inherits stdio so the program's
+/// output and exit status are the driver's.
+///
+/// Usage:
+///   k2c run-native <file.k2> [flags] [-- argv...]
+fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
+    let (path, mode, opt_flag, forwarded) = parse_native_flags(args, "run-native")?;
+
+    let prog = match front_end_to_mir(path, mode, opt_flag) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+
+    let img = match k2_codegen::compile_program_to_elf(&prog) {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = writeln!(
+                io::stderr(),
+                "error: native backend: {e}\nnote: this program is outside the v0.14 native \
+                 subset; run it on the VM with `{PROG} run {path}`"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    // `run-native` executes the emitted binary, which only works on x86-64 Linux.
+    // On other hosts the ELF is still valid; tell the user to use `build-native`.
+    if !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
+        let _ = writeln!(
+            io::stderr(),
+            "error: `run-native` requires an x86_64 Linux host to execute the emitted ELF; \
+             use `{PROG} build-native {path}` to write it for transfer to a target"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Write to a unique temp file, make it executable, run it, propagate the
+    // child's exit code, and clean up.
+    let tmp = native_temp_path();
+    if let Err(e) = fs::write(&tmp, &img.bytes) {
+        return Err(format!("could not write temp executable: {e}"));
+    }
+    set_executable(&tmp);
+
+    let forwarded_args: Vec<&String> = forwarded;
+    let status = std::process::Command::new(&tmp)
+        .args(forwarded_args.iter().map(|s| s.as_str()))
+        .status();
+    let _ = fs::remove_file(&tmp);
+
+    match status {
+        Ok(st) => {
+            // A clean child exit propagates its exit code. A child killed by a
+            // signal (e.g. SIGSEGV from native stack exhaustion on deep recursion,
+            // or SIGFPE) has no exit code; report it as a shell does — `128 + signo`
+            // — so a SIGSEGV (139) is *distinguishable* from a real k2 panic-trap
+            // (exit 134), which the emitted binary produces by an explicit
+            // `exit(134)` after printing its `panic:` line. Conflating the two
+            // would mask a genuine native crash as an ordinary trap.
+            let code = native_exit_code(&st);
+            Ok(ExitCode::from((code & 0xff) as u8))
+        }
+        Err(e) => Err(format!("could not execute emitted binary: {e}")),
+    }
+}
+
+/// Maps a finished child's [`ExitStatus`] to a process exit code. A normal exit
+/// yields its code; a signal death yields `128 + signo` (the shell convention),
+/// so a signal-killed child (e.g. SIGSEGV = 139) is not silently reported as a
+/// k2 panic-trap (134). Falls back to `134` only if neither is available (which
+/// `wait(2)` never reports on Linux).
+#[cfg(unix)]
+fn native_exit_code(st: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = st.code() {
+        code
+    } else if let Some(signo) = st.signal() {
+        128 + signo
+    } else {
+        134
+    }
+}
+
+/// Non-Unix fallback (the executing path is gated to x86_64 Linux, so this is
+/// never reached at run time; it keeps the function total for other targets).
+#[cfg(not(unix))]
+fn native_exit_code(st: &std::process::ExitStatus) -> i32 {
+    st.code().unwrap_or(134)
+}
+
+/// Splits an optional `-o <out>` pair out of `args`, returning the output path
+/// (if given) and the remaining arguments. Used by `build-native`.
+fn take_output_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut out: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "`-o` needs an output path".to_string())?;
+                out = Some(v.clone());
+                i += 2;
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    Ok((out, rest))
+}
+
+/// The default native output path for `build-native`: the input file's stem
+/// (e.g. `compute.k2` -> `compute`), or `a.out` for stdin / a stem-less path.
+fn default_native_output(input: &str) -> String {
+    if input == "-" {
+        return "a.out".to_string();
+    }
+    Path::new(input)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "a.out".to_string())
+}
+
+/// A unique temp path for a `run-native` executable, keyed by pid + a nanosecond
+/// timestamp so concurrent runs do not collide.
+fn native_temp_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    env::temp_dir().join(format!("k2c-native-{}-{}", std::process::id(), nanos))
+}
+
+/// Marks a file executable (`0o755`) on unix; a no-op with a warning elsewhere.
+fn set_executable(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = writeln!(
+            io::stderr(),
+            "warning: cannot set the executable bit on this platform; chmod +x the file manually"
+        );
+    }
+}
+
 /// The result of one benchmark: its executed-instruction counts under each mode.
 struct BenchResult {
     name: String,
@@ -1532,6 +1909,8 @@ fn print_usage() {
          \x20   mir --release-fast <f>  Lower + optimize with safety checks stripped.\n\
          \x20   run <file.k2>        Compile to bytecode and execute `main` (Debug mode).\n\
          \x20   run --release-fast <f>  Optimize + execute with safety checks stripped.\n\
+         \x20   run-native <file.k2>  Compile to a native x86-64 ELF, execute it, propagate exit code.\n\
+         \x20   build-native <f> -o <out>  Compile to a static x86-64 Linux ELF written to <out>.\n\
          \x20   bench [file.k2 ...]  Benchmark Debug vs ReleaseFast executed VM instructions.\n\
          \x20   lsp                  Run the language server over stdio (LSP / JSON-RPC).\n\
          \x20   help                 Show this help.\n\
