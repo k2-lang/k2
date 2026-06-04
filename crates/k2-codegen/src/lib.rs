@@ -1,4 +1,13 @@
-//! k2 v0.15 — the pure-std x86-64 native backend (near-full coverage).
+//! k2 — the pure-std native backend (x86-64 + aarch64).
+//!
+//! v0.18 adds a second native target, **aarch64 (ARMv8-A) Linux**, alongside the
+//! original x86-64 backend. The two targets are selected by [`Target`] and share
+//! the same monomorphized MIR; the x86-64 path is unchanged (it is reached through
+//! [`Target::X86_64Linux`], the default). The aarch64 path (see the `aarch64`
+//! module) cross-compiles hello-class programs to a static EM_AARCH64 ELF and is
+//! **structurally validated, not executed**, in this environment — see
+//! [`target`] and `docs/aarch64.md`. The rest of this doc describes the original
+//! x86-64 backend.
 //!
 //! This crate is k2's native code path: it turns a *subset* of a monomorphized
 //! [`k2_mir::MirProgram`] into a real, static, directly-runnable x86-64 Linux ELF
@@ -57,6 +66,7 @@
 //! // chmod +x a.out && ./a.out
 //! ```
 
+mod aarch64;
 mod elf;
 mod encode;
 mod fmt_native;
@@ -68,11 +78,13 @@ mod mir_ids;
 mod reg;
 mod regalloc;
 mod runtime;
+mod target;
 
 #[cfg(test)]
 mod tests;
 
 pub use elf::ElfImage;
+pub use target::Target;
 
 use k2_mir::MirProgram;
 
@@ -148,7 +160,24 @@ impl RoData {
 /// `chmod +x`, and run. This function never panics the host process on a
 /// subset-valid program — out-of-subset constructs become an `Err`, not a panic.
 pub fn compile_program_to_elf(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
-    link::compile_program(prog)
+    link::compile_program(prog, Target::X86_64Linux)
+}
+
+/// Compiles a monomorphized [`MirProgram`] to a static ELF for the given
+/// [`Target`]: the default x86-64 Linux backend (build + run + `native == VM`
+/// verified) or the v0.18 aarch64 Linux backend (cross-compiled + structurally
+/// validated, **not executed** in this environment — see [`target`] and
+/// `docs/aarch64.md`).
+///
+/// Like [`compile_program_to_elf`], the gate runs before any byte is emitted, so a
+/// construct outside the selected target's subset fails cleanly with a
+/// [`CodegenError::Unsupported`] rather than miscompiling, and the host process is
+/// never panicked.
+pub fn compile_program_to_elf_for(
+    prog: &MirProgram,
+    target: Target,
+) -> Result<ElfImage, CodegenError> {
+    link::compile_program(prog, target)
 }
 
 /// Before/after code-size statistics for the machine-level peephole pass, used by
@@ -188,8 +217,8 @@ impl CodegenStats {
 pub fn compile_program_to_elf_stats(
     prog: &MirProgram,
 ) -> Result<(ElfImage, CodegenStats), CodegenError> {
-    let before = encode::with_peephole(false, || link::compile_program(prog))?;
-    let after = link::compile_program(prog)?;
+    let before = encode::with_peephole(false, || link::compile_program(prog, Target::X86_64Linux))?;
+    let after = link::compile_program(prog, Target::X86_64Linux)?;
     let stats = CodegenStats {
         text_bytes_before: before.text_len,
         text_bytes_after: after.text_len,

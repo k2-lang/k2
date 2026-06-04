@@ -12,6 +12,43 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **A second native target: aarch64 (ARMv8-A) Linux + cross-compilation
+  (v0.18).** `k2c build-native --target=aarch64-linux <file> -o out` cross-compiles
+  hello-class k2 programs to a static, EM_AARCH64 ELF, alongside the original
+  x86-64 backend. The same monomorphized MIR drives both targets. Components:
+  - A **target abstraction** (`Target` enum + `SysNr` syscall table): the ELF
+    `e_machine`, the per-arch Linux syscall numbers, and supported-triple parsing
+    live in one place. The x86-64 path is preserved **bit-for-bit** — it is reached
+    through `Target::X86_64Linux` (the default) with zero changes to its
+    encoder/lowering/runtime, so `hello`/`errors`/`allocators` still run with
+    `native == VM` and the speedup holds (verified).
+  - A **fixed-32-bit-little-endian aarch64 instruction encoder**
+    (`movz`/`movk`/`movn`, `add`/`sub`/`mul`/`sdiv`/`udiv`/`msub`, `and`/`orr`/
+    `eor`/`mvn`/`neg`, register + immediate shifts, `cmp`/`subs`/`cset`, `ldr`/
+    `str` in all four sizes signed+unsigned with `[fp,#off]` addressing, `stp`/
+    `ldp` frame pairs, `b`/`b.cc`/`bl`/`ret`, `adrp`/`add`, `svc #0`, and the
+    `fadd`/`fsub`/… scalar-double family), with **~45 byte-exact unit tests** each
+    cross-checked against the ARM ARM (DDI 0487) encoding tables.
+  - An **EM_AARCH64 ELF writer** (the shared layout writer parameterized by
+    `e_machine`) and an aarch64 **AAPCS64 MIR lowering** covering the hello-class
+    subset: the `stp x29,x30,[sp,#-16]!` frame, parameter receipt (`x0`–`x7`),
+    scalar/compare/bitwise/shift arithmetic (width-correct via `ubfm`/`sbfm`), the
+    `print` formatter (literals + `{s}`/`{d}`/`{}`/`{x}`/`{X}`/`{b}`/`{o}`/`{c}`,
+    incl. 64- and 128-bit decimals via `msub`-remainder long division), the CFG
+    terminators, the escaped-`main`-error path, the safety-check `Trap` lowering,
+    and the `write`/`exit_group` syscalls. The `*System` heap runtime is **not yet
+    ported** to aarch64: a program that needs it is refused with a clean
+    `Unsupported` deferral (never a miscompile), matching how the x86 backend
+    rejects out-of-subset constructs.
+  - **HONESTY (verification constraint).** aarch64 binaries are **cross-compiled
+    and structurally validated, never executed** in this environment — there is no
+    `qemu-aarch64`, no aarch64 binutils, and the host `objdump` cannot disassemble
+    aarch64. Correctness rests on the byte-exact encoder tests vs the published ARM
+    ARM encodings, plus parsing the emitted ELF header (EM_AARCH64=183, ET_EXEC, a
+    valid entry/PT_LOAD) and `readelf -h`/`file` confirming an ARM aarch64
+    executable. The binaries are *expected* to run on real aarch64 Linux; that has
+    **not** been demonstrated here. See `docs/aarch64.md`.
+
 - **Native optimization + machine-level peephole + native-vs-VM benchmark
   (v0.17).** The MIR optimizer is now wired into the native pipeline:
   `k2c run-native`/`build-native` honor `--debug` (unopt, checks on),

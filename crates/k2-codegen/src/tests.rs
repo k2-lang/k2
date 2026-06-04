@@ -2628,3 +2628,346 @@ mod exec {
         }
     }
 }
+
+// =========================================================================
+//  Tier 2 — aarch64 ELF validity + cross-compilation (host-independent)
+// =========================================================================
+//
+// These tests compile real k2 MIR through the aarch64 backend and validate the
+// emitted EM_AARCH64 ELF *structurally* — they never execute it (there is no
+// aarch64 emulator on this host). They run on EVERY host (the bytes are built
+// and parsed, not run). This is the honest correctness evidence for the aarch64
+// ELF writer + the same-MIR cross-compilation property.
+mod aarch64_cross {
+    use crate::Target;
+    use k2_mir::{lower_program, BuildMode, MirProgram};
+
+    /// Lowers a self-contained k2 source string to a verified `MirProgram`,
+    /// mirroring the gated `exec::lower` but available on every host (no
+    /// execution). The aarch64 path only *builds* bytes, so this is portable.
+    fn lower(source: &str) -> MirProgram {
+        let mut combined = String::new();
+        combined.push_str(source);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&k2_std::std_root_item_source());
+        let mut pres = k2_parse::parse(&combined);
+        rewrite_std_imports(&mut pres.file);
+        assert!(pres.is_ok(), "parse errors in test program");
+        let resolved = k2_resolve::resolve_file(&pres.file);
+        assert!(resolved.is_ok(), "resolution errors in test program");
+        let typed = k2_types::check_file(&pres.file, &resolved);
+        assert!(typed.is_ok(), "type errors in test program");
+        let mut prog =
+            lower_program(&pres.file, &resolved, typed, BuildMode::Debug).expect("lowering failed");
+        assert!(prog.is_ok(), "lowering diagnostics in test program");
+        k2_opt::optimize(&mut prog, k2_opt::OptLevel::None);
+        let problems = prog.verify();
+        assert!(problems.is_empty(), "malformed MIR: {problems:?}");
+        prog
+    }
+
+    fn rewrite_std_imports(file: &mut k2_syntax::SourceFile) {
+        use k2_syntax::{Expr, Item};
+        for item in &mut file.items {
+            if let Item::Const { value, .. } = item {
+                let is_std = matches!(
+                    value,
+                    Expr::Builtin { name, args, .. }
+                        if name == "@import"
+                            && matches!(args.as_slice(), [Expr::Str { text, .. }] if text.trim_matches('"') == "std")
+                );
+                if is_std {
+                    let span = value.span();
+                    *value = Expr::Ident {
+                        name: k2_std::STD_ROOT_NAME.to_string(),
+                        span,
+                    };
+                }
+            }
+        }
+    }
+
+    /// The smallest hello-class program: a bare `write`/`exit` via `print`.
+    const HELLO: &str = r#"
+        const std = @import("std");
+        pub fn main(sys: *System) !void {
+            const out = sys.io.stdout();
+            try out.print("Hello, k2!\n", .{});
+        }
+    "#;
+
+    fn read_u16(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([b[at], b[at + 1]])
+    }
+    fn read_u32(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn read_u64(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn aarch64_elf_header_invariants() {
+        let prog = lower(HELLO);
+        let img = crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux)
+            .expect("aarch64 cross-compile of a hello-class program");
+        let b = &img.bytes;
+        // ELF magic + class/data/version.
+        assert_eq!(&b[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(b[4], 2, "EI_CLASS == ELFCLASS64");
+        assert_eq!(b[5], 1, "EI_DATA == ELFDATA2LSB");
+        // e_type == ET_EXEC (2), e_machine == EM_AARCH64 (183).
+        assert_eq!(read_u16(b, 16), 2, "e_type == ET_EXEC");
+        assert_eq!(read_u16(b, 18), 183, "e_machine == EM_AARCH64");
+        // e_entry == 0x401000 (one page in).
+        assert_eq!(read_u64(b, 24), 0x40_1000, "e_entry");
+        assert_eq!(img.text_vaddr, 0x40_1000);
+        // e_phoff/e_ehsize/e_phentsize.
+        assert_eq!(read_u64(b, 32), 64);
+        assert_eq!(read_u16(b, 52), 64); // e_ehsize
+        assert_eq!(read_u16(b, 54), 56); // e_phentsize
+        let phnum = read_u16(b, 56);
+        assert!(phnum >= 1, "at least one PT_LOAD");
+    }
+
+    #[test]
+    fn aarch64_elf_has_valid_text_pt_load() {
+        let prog = lower(HELLO);
+        let img = crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux).unwrap();
+        let b = &img.bytes;
+        // Phdr 0 is the text segment (PT_LOAD, R+X) mapping the headers + code.
+        let p0 = 64;
+        assert_eq!(read_u32(b, p0), 1, "p_type == PT_LOAD");
+        assert_eq!(read_u32(b, p0 + 4), 5, "p_flags == PF_R|PF_X");
+        assert_eq!(read_u64(b, p0 + 8), 0, "p_offset (maps the headers)");
+        assert_eq!(read_u64(b, p0 + 16), 0x40_0000, "p_vaddr == load base");
+        assert_eq!(read_u64(b, p0 + 48), 0x1000, "p_align == 4 KiB page");
+        // The entry instruction (the `_start` shim) is at file offset 0x1000 and is
+        // a valid 32-bit aarch64 word (the image is a whole number of words).
+        let text_off = 0x1000usize;
+        assert!(b.len() > text_off + 4, "image has a text segment");
+        assert_eq!(
+            img.text_len % 4,
+            0,
+            "text is a whole number of 32-bit words"
+        );
+        // The first text word is `mov x0, #0` == movz x0,#0 == 0xD2800000.
+        assert_eq!(
+            read_u32(b, text_off),
+            0xD280_0000,
+            "_start begins with movz x0,#0"
+        );
+    }
+
+    #[test]
+    fn aarch64_rodata_segment_congruence() {
+        // A program that prints a string literal emits a `.rodata` PT_LOAD; the
+        // kernel's mapping congruence `p_vaddr ≡ p_offset (mod p_align)` must hold.
+        let prog = lower(HELLO);
+        let img = crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux).unwrap();
+        let b = &img.bytes;
+        let phnum = read_u16(b, 56);
+        assert!(phnum >= 2, "a printing program has a rodata segment");
+        let p1 = 64 + 56;
+        assert_eq!(read_u32(b, p1), 1, "p_type == PT_LOAD");
+        assert_eq!(read_u32(b, p1 + 4), 4, "p_flags == PF_R");
+        let r_off = read_u64(b, p1 + 8);
+        let r_vaddr = read_u64(b, p1 + 16);
+        assert_eq!(read_u64(b, p1 + 48), 0x1000);
+        assert_eq!(
+            r_vaddr % 0x1000,
+            r_off % 0x1000,
+            "vaddr ≡ offset (mod page)"
+        );
+        assert_eq!(r_vaddr, img.rodata_vaddr);
+    }
+
+    #[test]
+    fn same_mir_drives_both_targets() {
+        // The decisive property: ONE MIR compiles to BOTH targets. The x86 image is
+        // a runnable EM_X86_64 ELF; the aarch64 image is a valid EM_AARCH64 ELF.
+        let prog = lower(HELLO);
+        let x86 = crate::compile_program_to_elf_for(&prog, Target::X86_64Linux).unwrap();
+        let arm = crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux).unwrap();
+        assert_eq!(read_u16(&x86.bytes, 18), 0x3E, "x86 image is EM_X86_64");
+        assert_eq!(read_u16(&arm.bytes, 18), 183, "aarch64 image is EM_AARCH64");
+        // Both are ET_EXEC with a valid entry one page in.
+        assert_eq!(read_u64(&x86.bytes, 24), 0x40_1000);
+        assert_eq!(read_u64(&arm.bytes, 24), 0x40_1000);
+    }
+
+    #[test]
+    fn aarch64_defers_heap_runtime_cleanly() {
+        // A program needing the *System heap runtime is refused with a clean
+        // `Unsupported` deferral on aarch64 (never a miscompile), while x86-64
+        // compiles it.
+        let src = r#"
+            const std = @import("std");
+            pub fn main(sys: *System) !void {
+                const a = sys.heap;
+                const p = try a.create(u64);
+                p.* = 7;
+                a.destroy(p);
+            }
+        "#;
+        let prog = lower(src);
+        // x86 compiles it (the runtime is ported there).
+        assert!(crate::compile_program_to_elf_for(&prog, Target::X86_64Linux).is_ok());
+        // aarch64 defers cleanly.
+        match crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux) {
+            Err(crate::CodegenError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("runtime") || msg.contains("aarch64"),
+                    "deferral message should mention the runtime/aarch64: {msg}"
+                );
+            }
+            Err(other) => panic!("expected a clean Unsupported deferral, got {other:?}"),
+            Ok(_) => panic!("aarch64 should defer the heap runtime, not compile it"),
+        }
+    }
+
+    #[test]
+    fn target_triple_parsing() {
+        assert_eq!(
+            Target::parse_triple("x86_64-linux").unwrap(),
+            Target::X86_64Linux
+        );
+        assert_eq!(
+            Target::parse_triple("aarch64-linux").unwrap(),
+            Target::Aarch64Linux
+        );
+        assert_eq!(
+            Target::parse_triple("aarch64-unknown-linux-gnu").unwrap(),
+            Target::Aarch64Linux
+        );
+        assert_eq!(
+            Target::parse_triple("x86_64-unknown-linux-gnu").unwrap(),
+            Target::X86_64Linux
+        );
+        let err = Target::parse_triple("riscv64-linux").unwrap_err();
+        assert!(err.contains("x86_64-linux") && err.contains("aarch64-linux"));
+    }
+
+    // =====================================================================
+    //  Full-encoder oracle audit (llvm-objdump, gated on availability)
+    // =====================================================================
+    //
+    // The byte-exact UNIT tests above are the always-on, host-portable correctness
+    // evidence. This integration test is an ADDITIONAL whole-program cross-check:
+    // it disassembles the actually-emitted `hello.aarch64` with `llvm-objdump` (our
+    // aarch64 oracle) and asserts the prologue reserves the frame and locals are
+    // addressed correctly — the exact properties the v0.18 defects violated
+    // (`neg xzr` instead of `sub sp`, `[fp,#0]`-aliased locals). It is NOT a runtime
+    // check (aarch64 is not executed here), and `llvm-objdump` is ONLY a dev/test
+    // oracle — never a build- or run-time dependency of the compiler. If the tool is
+    // absent (some CI hosts), the test skips cleanly so it cannot break the build.
+
+    /// Locates `llvm-objdump` on `PATH`, returning its path or `None` (→ skip).
+    fn find_llvm_objdump() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            for name in ["llvm-objdump", "llvm-objdump-21", "llvm-objdump-20"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn aarch64_hello_disassembly_oracle_audit() {
+        let Some(objdump) = find_llvm_objdump() else {
+            eprintln!("skipping: llvm-objdump not found on PATH (oracle unavailable)");
+            return;
+        };
+
+        // Emit the real hello.aarch64 ELF (frame > 4095, so it hits the large-frame
+        // SP-sub path AND has negative local homes — the two fatal v0.18 sites).
+        let prog = lower(HELLO);
+        let img = crate::compile_program_to_elf_for(&prog, Target::Aarch64Linux).unwrap();
+        let dir = std::env::temp_dir();
+        let elf = dir.join(format!("k2_oracle_hello_{}.aarch64", std::process::id()));
+        std::fs::write(&elf, &img.bytes).expect("write temp elf");
+
+        let out = std::process::Command::new(&objdump)
+            .args(["-d", "--triple=aarch64"])
+            .arg(&elf)
+            .output()
+            .expect("run llvm-objdump");
+        let _ = std::fs::remove_file(&elf);
+        assert!(
+            out.status.success(),
+            "llvm-objdump failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let disasm = String::from_utf8_lossy(&out.stdout).to_lowercase();
+
+        // (1) The frame is reserved by a REAL `sub sp, ...` (immediate or
+        // extended-register), NOT mis-encoded as `neg xzr` / `sub xzr`.
+        assert!(
+            !disasm.contains("neg\t") && !disasm.contains("neg "),
+            "prologue must not contain `neg` (frame never reserved!):\n{disasm}"
+        );
+        assert!(
+            disasm.contains("sub\tsp,") || disasm.contains("sub sp,"),
+            "prologue must reserve the frame with `sub sp, ...`:\n{disasm}"
+        );
+        // No instruction may write the zero register where SP was intended: a
+        // `sub xzr,`/`add xzr,` in the frame path is the XZR-vs-SP bug.
+        assert!(
+            !disasm.contains("sub\txzr,") && !disasm.contains("add\txzr,"),
+            "no `sub/add xzr` (XZR-where-SP-intended):\n{disasm}"
+        );
+
+        // (2) Locals (negative fp homes) are accessed via the unscaled signed
+        // ldur/stur family (or a correct register-offset form), never collapsed to
+        // `[x29, #0]`. The old miscompile produced `stur`/`ldur`-less code where
+        // every local was `str/ldr x?, [x29]` (no displacement). Require that at
+        // least one `stur`/`ldur` appears (the negative homes) and that there is no
+        // bare `[x29]` store/load (a zero-displacement fp access is the alias bug).
+        assert!(
+            disasm.contains("stur") || disasm.contains("ldur"),
+            "negative fp-relative locals must use stur/ldur:\n{disasm}"
+        );
+        // llvm-objdump prints a zero-displacement memory operand as `[x29]` (no
+        // `#imm`); any such fp access would be the collapsed-to-[fp,#0] alias.
+        for line in disasm.lines() {
+            assert!(
+                !line.contains("[x29]"),
+                "a local collapsed to [x29,#0] (the alias bug): {line}"
+            );
+        }
+
+        // (3) The exit/syscall sequence is present and correct: an `svc #0`
+        // syscall terminates the program (llvm-objdump renders it `svc\t#0`).
+        assert!(
+            disasm.contains("svc\t#0") || disasm.contains("svc #0"),
+            "expected an `svc #0` syscall in the emitted program:\n{disasm}"
+        );
+
+        // (4) Spot the specific corrected prologue word: the large frame is
+        // reserved via the extended-register sub (`sub sp, sp, x11` family). Confirm
+        // the exact bytes 0xCB2B63FF appear in the text (independent of objdump's
+        // textual rendering) — the very word the v0.18 backend got wrong.
+        let text = &img.bytes[0x1000..0x1000 + img.text_len];
+        let has_sub_sp_x11 = text
+            .chunks_exact(4)
+            .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 0xCB2B_63FF);
+        assert!(
+            has_sub_sp_x11,
+            "emitted text must contain the corrected `sub sp, sp, x11` = 0xCB2B63FF"
+        );
+        // And the bogus `neg xzr, x11` = 0xCB0B03FF must be GONE.
+        let has_neg_xzr = text
+            .chunks_exact(4)
+            .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 0xCB0B_03FF);
+        assert!(
+            !has_neg_xzr,
+            "the bogus `neg xzr, x11` (0xCB0B03FF) must be gone"
+        );
+    }
+}

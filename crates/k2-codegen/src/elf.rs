@@ -96,13 +96,28 @@ pub fn state_vaddr_for(text_len: usize, rodata_len: usize) -> u64 {
     LOAD_BASE + state_off
 }
 
+/// Builds the complete ELF image for the **default x86-64 target**
+/// (`e_machine = EM_X86_64`). A thin wrapper over [`write_elf_for`], kept so every
+/// existing caller and test compiles and emits byte-identically.
+pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
+    write_elf_for(text, rodata, state_size, 0x3E)
+}
+
 /// Builds the complete ELF image from the finalized `.text` machine code, the
 /// concatenated `.rodata` bytes, and the writable state segment size (the
-/// allocator registry / clock / RNG `.bss`). A single executable `PT_LOAD` is
-/// always emitted; a read-only `PT_LOAD` for `.rodata` and a read-write `PT_LOAD`
-/// for the zero-mapped state segment are added when nonzero. `e_phnum` is sized
-/// accordingly.
-pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
+/// allocator registry / clock / RNG `.bss`), targeting the given ELF
+/// `e_machine`. A single executable `PT_LOAD` is always emitted; a read-only
+/// `PT_LOAD` for `.rodata` and a read-write `PT_LOAD` for the zero-mapped state
+/// segment are added when nonzero. `e_phnum` is sized accordingly.
+///
+/// The layout math is endian/architecture-neutral (both x86-64 and aarch64 are
+/// LP64 little-endian with a 4 KiB page); only `e_machine` differs between
+/// targets. For aarch64 Linux, a 4 KiB page is the configuration this writer
+/// targets: `p_align = 0x1000` with `p_vaddr ≡ p_offset (mod p_align)` is
+/// satisfied (both segments start on a page boundary), so the kernel maps the
+/// static image directly. (aarch64 also supports 16K/64K pages; this writer
+/// documents and targets the 4 KiB configuration.)
+pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16) -> ElfImage {
     let has_rodata = !rodata.is_empty();
     let has_state = state_size > 0;
     let phnum: u16 = 1 + u16::from(has_rodata) + u16::from(has_state);
@@ -134,7 +149,7 @@ pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
     bytes.push(0); // EI_ABIVERSION
     bytes.extend_from_slice(&[0; 7]); // e_ident padding (to 16 bytes)
     push_u16(&mut bytes, 2); // e_type      = ET_EXEC
-    push_u16(&mut bytes, 0x3E); // e_machine   = EM_X86_64
+    push_u16(&mut bytes, e_machine); // e_machine (EM_X86_64=0x3E / EM_AARCH64=183)
     push_u32(&mut bytes, 1); // e_version
     push_u64(&mut bytes, text_vaddr); // e_entry = _start (start of .text)
     push_u64(&mut bytes, EHDR_SIZE); // e_phoff (phdrs follow the ehdr)

@@ -115,6 +115,30 @@ impl Cc {
             Cc::Ns => 0x9,
         }
     }
+
+    /// The AArch64 4-bit condition field (`cond`), used by `b.cc` and `cset`. The
+    /// values are from the ARM ARM (DDI 0487) condition-code table. They differ
+    /// from x86's `tttn`; this is the per-target re-expression of the *same*
+    /// logical condition the shared lowering selected. `Cc::Ns` (not-sign) maps to
+    /// `pl` (N==0), and `Cc::C`/`Cc::B` both map to `hs`/`cs` (carry set) as on
+    /// x86, where they share an encoding.
+    pub fn cond4(self) -> u8 {
+        match self {
+            Cc::E => 0b0000,  // EQ  Z==1
+            Cc::Ne => 0b0001, // NE  Z==0
+            Cc::Ge => 0b1010, // GE  N==V
+            Cc::L => 0b1011,  // LT  N!=V
+            Cc::G => 0b1100,  // GT  Z==0 && N==V
+            Cc::Le => 0b1101, // LE  Z==1 || N!=V
+            Cc::C => 0b0010,  // CS/HS  C==1 (unsigned carry / overflow)
+            Cc::B => 0b0011,  // CC/LO  C==0 (unsigned below)
+            Cc::Ae => 0b0010, // HS  C==1 (unsigned above-or-equal)
+            Cc::A => 0b1000,  // HI  C==1 && Z==0
+            Cc::Be => 0b1001, // LS  C==0 || Z==1
+            Cc::O => 0b0110,  // VS  V==1 (signed overflow)
+            Cc::Ns => 0b0101, // PL  N==0
+        }
+    }
 }
 
 /// An identifier for a label local to one function. Labels mark basic-block

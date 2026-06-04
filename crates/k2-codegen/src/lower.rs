@@ -68,23 +68,26 @@ const IDX_SCRATCH: Gpr = Gpr::R10;
 
 /// The integer representation of a scalar: bit width + signedness. Mirrors the
 /// VM's `IntRepr` so narrowing/sign-extension match byte-for-byte.
+///
+/// Shared with the aarch64 lowering ([`crate::aarch64::lower`]), which reuses the
+/// same width/signedness facts to pick width-correct loads/stores and narrows.
 #[derive(Clone, Copy)]
-struct Repr {
+pub(crate) struct Repr {
     /// The bit width (`8`/`16`/`32`/`64`; `0` for an unsized `comptime_int`).
-    width: u16,
+    pub(crate) width: u16,
     /// `true` for a signed integer.
-    signed: bool,
+    pub(crate) signed: bool,
 }
 
 impl Repr {
     /// `true` if a result of this repr needs width normalization (sub-64 fixed).
-    fn needs_normalize(self) -> bool {
+    pub(crate) fn needs_normalize(self) -> bool {
         self.width != 0 && self.width < 64
     }
 }
 
 /// Resolves the [`Repr`] of a type. Non-integer scalars are full-width unsigned.
-fn repr_of(prog: &MirProgram, ty: TypeId) -> Repr {
+pub(crate) fn repr_of(prog: &MirProgram, ty: TypeId) -> Repr {
     match prog.arena.get(ty) {
         Type::Int { signed, bits } => Repr {
             width: match bits {
@@ -4822,8 +4825,13 @@ enum ArithKind {
 }
 
 /// The SysV argument class of a type (simplified to what the corpus needs).
+///
+/// AAPCS64 agrees with SysV for the native corpus (ints/pointers in registers,
+/// ≤16-byte all-int aggregates in two registers, >16-byte / float-containing
+/// aggregates in memory), so the aarch64 lowering reuses this classification —
+/// only the argument-register *count and identities* differ (a per-target table).
 #[derive(Clone, Copy, Debug)]
-enum ArgClass {
+pub(crate) enum ArgClass {
     /// One integer eightbyte (scalar int/ptr/bool, or a ≤8-byte all-int aggregate).
     OneInt,
     /// Two integer eightbytes (9–16-byte all-int aggregate, incl. a slice).
@@ -4838,7 +4846,7 @@ enum ArgClass {
 }
 
 /// Classifies a type for SysV argument passing.
-fn classify(prog: &MirProgram, ty: TypeId) -> ArgClass {
+pub(crate) fn classify(prog: &MirProgram, ty: TypeId) -> ArgClass {
     if matches!(prog.arena.get(ty), Type::Float { .. } | Type::ComptimeFloat) {
         return ArgClass::Sse;
     }
@@ -4876,7 +4884,7 @@ fn aggregate_has_float(prog: &MirProgram, ty: TypeId) -> bool {
 }
 
 /// `true` if `func` contains a `print` intrinsic (so a print buffer is reserved).
-fn func_prints(func: &MirFunction) -> bool {
+pub(crate) fn func_prints(func: &MirFunction) -> bool {
     func.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| match s {
             Statement::Assign { rvalue, .. } | Statement::Eval { rvalue, .. } => {
@@ -4899,7 +4907,7 @@ fn is_print_rvalue(rv: &Rvalue) -> bool {
 /// plus a fixed scratch reservation for the print digit/working buffers (used by
 /// `emit_u64_digits`/`render_decimal_128`). The outgoing-args region doubles as
 /// that scratch, so it is always at least 64 bytes when the function prints.
-fn outgoing_args_bytes(prog: &MirProgram, func: &MirFunction) -> i32 {
+pub(crate) fn outgoing_args_bytes(prog: &MirProgram, func: &MirFunction) -> i32 {
     let mut max_stack = 0i32;
     for block in &func.blocks {
         for stmt in &block.stmts {
@@ -4974,7 +4982,7 @@ fn operand_type_global(prog: &MirProgram, op: &Operand) -> Option<TypeId> {
 }
 
 /// Rounds `x` up to a multiple of `a` (a power of two), in `i32`.
-fn round_up_i32(x: i32, a: i32) -> i32 {
+pub(crate) fn round_up_i32(x: i32, a: i32) -> i32 {
     (x + a - 1) & !(a - 1)
 }
 
@@ -4988,13 +4996,13 @@ fn type_min(r: Repr) -> i64 {
 }
 
 /// `true` for a relational/equality operator.
-fn is_comparison(op: BinOp) -> bool {
+pub(crate) fn is_comparison(op: BinOp) -> bool {
     use BinOp::*;
     matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
 }
 
 /// The condition code a comparison maps to.
-fn compare_cc(op: BinOp, signed: bool) -> Cc {
+pub(crate) fn compare_cc(op: BinOp, signed: bool) -> Cc {
     use BinOp::*;
     match op {
         Eq => Cc::E,
@@ -5038,7 +5046,7 @@ fn compare_cc(op: BinOp, signed: bool) -> Cc {
 /// panic wording is backend-independent. (Exit codes and strip behavior already
 /// match; this aligns the stderr message too, e.g. for a future stderr-comparing
 /// differential.) When adding or changing a trap string, update BOTH tables.
-fn trap_message(reason: TrapReason) -> &'static str {
+pub(crate) fn trap_message(reason: TrapReason) -> &'static str {
     match reason {
         TrapReason::Bounds => "index out of bounds",
         TrapReason::Overflow => "integer overflow",

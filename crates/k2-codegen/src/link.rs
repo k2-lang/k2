@@ -24,11 +24,13 @@ use std::collections::HashMap;
 
 use k2_mir::{FnId, MirProgram};
 
+use crate::aarch64;
 use crate::elf::{self, ElfImage};
 use crate::encode::{Asm, FixupKind};
 use crate::lower::FnLower;
 use crate::reg::Gpr;
 use crate::runtime::{self, RuntimeFn};
+use crate::target::Target;
 use crate::{CodegenError, RoData};
 
 /// The fixed seed for the deterministic splitmix64 PRNG, matching the VM
@@ -49,10 +51,23 @@ struct LoweredFn {
     text_off: usize,
 }
 
-/// Compiles a whole [`MirProgram`] to a runnable ELF image, or fails with a
-/// [`CodegenError`] if any reached function is outside the v0.14 subset (the
-/// error names the offending construct).
-pub fn compile_program(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
+/// Compiles a whole [`MirProgram`] to a runnable ELF image for `target`, or fails
+/// with a [`CodegenError`] if any reached function is outside the selected
+/// target's subset (the error names the offending construct).
+///
+/// The x86-64 path is the original pipeline, byte-for-byte. The aarch64 path
+/// (cross-compilation only) uses the [`crate::aarch64`] encoder + lowering and is
+/// dispatched separately because its `_start` shim and relocation widths differ.
+pub fn compile_program(prog: &MirProgram, target: Target) -> Result<ElfImage, CodegenError> {
+    match target {
+        Target::X86_64Linux => compile_program_x86(prog),
+        Target::Aarch64Linux => aarch64::link::compile_program_aarch64(prog),
+    }
+}
+
+/// Compiles a whole [`MirProgram`] to a runnable x86-64 ELF image (the original
+/// pipeline, unchanged).
+fn compile_program_x86(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
     let main_id = find_main(prog).ok_or(CodegenError::NoMain)?;
 
     // ---- Lower every function, collecting code + fixups + the rodata blob. ----
@@ -245,8 +260,9 @@ fn build_start_shim(main_id: FnId, needs_runtime: bool) -> Asm {
 }
 
 /// Locates the entry `main` function id (by name, falling back to the first
-/// declared entry), matching the VM's `find_main`.
-fn find_main(prog: &MirProgram) -> Option<FnId> {
+/// declared entry), matching the VM's `find_main`. Shared with the aarch64 link
+/// pass.
+pub(crate) fn find_main(prog: &MirProgram) -> Option<FnId> {
     if let Some(f) = prog.funcs.iter().find(|f| f.name == "main") {
         return Some(f.id);
     }

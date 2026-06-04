@@ -49,6 +49,7 @@ use std::process::ExitCode;
 
 use std::path::Path;
 
+use k2_codegen::Target;
 use k2_fmt::format_source;
 use k2_lexer::{tokenize, Token, TokenKind};
 use k2_mir::{dump_mir, lower_program, BuildMode, MirProgram, Severity as MirSeverity};
@@ -1330,17 +1331,22 @@ fn front_end_to_mir(path: &str, mode: BuildMode, opt_flag: bool) -> Result<MirPr
     Ok(prog)
 }
 
-/// Parses the `path` + `mode` flags shared by `run-native`/`build-native`,
-/// returning `(path, mode, opt_flag, remaining)` where `remaining` are the args
-/// after the path (forwarded argv / output options). The first non-flag token is
-/// the source path.
+/// Parses the `path` + `mode` + `target` flags shared by
+/// `run-native`/`build-native`, returning `(path, mode, opt_flag, target,
+/// remaining)` where `remaining` are the args after the path (forwarded argv /
+/// output options). The first non-flag token is the source path.
+///
+/// The target is selected with `--target=<triple>` (or its `-Dtarget=<triple>`
+/// alias); the default is `x86_64-linux`. Supported triples are documented in the
+/// usage banner and `docs/aarch64.md`.
 fn parse_native_flags<'a>(
     args: &'a [String],
     cmd: &str,
-) -> Result<(&'a str, BuildMode, bool, Vec<&'a String>), String> {
+) -> Result<(&'a str, BuildMode, bool, Target, Vec<&'a String>), String> {
     let mut path: Option<&str> = None;
     let mut mode = BuildMode::Debug;
     let mut opt_flag = false;
+    let mut target = Target::default();
     let mut rest: Vec<&String> = Vec::new();
     let mut seen_path = false;
     for arg in args {
@@ -1348,7 +1354,15 @@ fn parse_native_flags<'a>(
             rest.push(arg);
             continue;
         }
-        match arg.as_str() {
+        let a = arg.as_str();
+        if let Some(triple) = a
+            .strip_prefix("--target=")
+            .or_else(|| a.strip_prefix("-Dtarget="))
+        {
+            target = Target::parse_triple(triple)?;
+            continue;
+        }
+        match a {
             "--release-fast" => mode = BuildMode::ReleaseFast,
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
@@ -1364,7 +1378,7 @@ fn parse_native_flags<'a>(
     }
     let path =
         path.ok_or_else(|| format!("`{cmd}` needs a <file.k2> argument (or `-` for stdin)"))?;
-    Ok((path, mode, opt_flag, rest))
+    Ok((path, mode, opt_flag, target, rest))
 }
 
 /// The `build-native` subcommand: compile a k2 program to a static x86-64 Linux
@@ -1376,20 +1390,22 @@ fn parse_native_flags<'a>(
 fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
     // Split off `-o <out>` before the shared flag parse (it is build-only).
     let (out_path, rest) = take_output_flag(args)?;
-    let (path, mode, opt_flag, _forwarded) = parse_native_flags(&rest, "build-native")?;
+    let (path, mode, opt_flag, target, _forwarded) = parse_native_flags(&rest, "build-native")?;
 
     let prog = match front_end_to_mir(path, mode, opt_flag) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
 
-    let img = match k2_codegen::compile_program_to_elf(&prog) {
+    let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
         Ok(img) => img,
         Err(e) => {
             let _ = writeln!(
                 io::stderr(),
-                "error: native backend: {e}\nnote: this program is outside the v0.14 native \
-                 subset; run it on the VM with `{PROG} run {path}`"
+                "error: native backend ({}): {e}\nnote: this program is outside the {} native \
+                 subset; run it on the VM with `{PROG} run {path}`",
+                target.triple(),
+                target.triple()
             );
             return Ok(ExitCode::FAILURE);
         }
@@ -1400,7 +1416,22 @@ fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
         return Err(format!("could not write `{out}`: {e}"));
     }
     set_executable(&out);
-    let _ = writeln!(io::stderr(), "wrote {} ({} bytes)", out, img.bytes.len());
+    // aarch64 binaries are cross-compiled + structurally validated here, never
+    // executed (no emulator); say so plainly so nobody mistakes a successful build
+    // for a successful run.
+    let note = if target == Target::Aarch64Linux {
+        " [aarch64: cross-compiled + structurally validated; not executed here]"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        io::stderr(),
+        "wrote {} ({} bytes, {}){}",
+        out,
+        img.bytes.len(),
+        target.triple(),
+        note
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1411,14 +1442,29 @@ fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
 /// Usage:
 ///   k2c run-native <file.k2> [flags] [-- argv...]
 fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
-    let (path, mode, opt_flag, forwarded) = parse_native_flags(args, "run-native")?;
+    let (path, mode, opt_flag, target, forwarded) = parse_native_flags(args, "run-native")?;
+
+    // `run-native` executes the emitted binary; refuse a non-host target up front
+    // (a foreign-ISA binary cannot be executed here — there is no emulator).
+    if !target.is_host() {
+        let _ = writeln!(
+            io::stderr(),
+            "error: cannot execute a {} binary on this host; use \
+             `{PROG} build-native --target={} {path} -o <out>` to cross-compile it for \
+             transfer to a {} target (it is structurally validated but not run here)",
+            target.triple(),
+            target.triple(),
+            target.triple()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
 
     let prog = match front_end_to_mir(path, mode, opt_flag) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
 
-    let img = match k2_codegen::compile_program_to_elf(&prog) {
+    let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
         Ok(img) => img,
         Err(e) => {
             let _ = writeln!(
@@ -2215,7 +2261,11 @@ fn print_usage() {
          \x20   run <file.k2>        Compile to bytecode and execute `main` (Debug mode).\n\
          \x20   run --release-fast <f>  Optimize + execute with safety checks stripped.\n\
          \x20   run-native <file.k2>  Compile to a native x86-64 ELF, execute it, propagate exit code.\n\
-         \x20   build-native <f> -o <out>  Compile to a static x86-64 Linux ELF written to <out>.\n\
+         \x20   build-native <f> -o <out>  Compile to a static Linux ELF written to <out>.\n\
+         \x20       --target=<triple>  Select the target ISA. Supported triples:\n\
+         \x20         x86_64-linux   (default; build + run + native==VM verified)\n\
+         \x20         aarch64-linux  (cross-compile; structurally validated, NOT executed here —\n\
+         \x20                         no emulator on this host; expected to run on real aarch64 Linux)\n\
          \x20   bench [file.k2 ...]  Benchmark Debug vs ReleaseFast executed VM instructions.\n\
          \x20   lsp                  Run the language server over stdio (LSP / JSON-RPC).\n\
          \x20   help                 Show this help.\n\

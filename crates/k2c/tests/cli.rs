@@ -1886,3 +1886,133 @@ fn bench_native_reports_speedup() {
         "bench --native must report the native-vs-VM speedup, got:\n{stdout}"
     );
 }
+
+/// `build-native --target=aarch64-linux` cross-compiles a hello-class program to
+/// a valid EM_AARCH64 static ELF. This validates the cross-compilation wiring
+/// end-to-end via the driver and (when the host has `readelf`/`file`) confirms the
+/// emitted file is what the standard tools recognize as an ARM aarch64 executable.
+///
+/// HONEST NOTE: the aarch64 binary is NEVER executed here — there is no
+/// `qemu-aarch64` and no aarch64 hardware. The test validates the ELF
+/// *structurally* (header bytes + `readelf`/`file`), exactly as the milestone's
+/// verification constraint requires.
+#[test]
+fn build_native_aarch64_cross_compiles_valid_elf() {
+    let src = examples_dir().join("hello.k2");
+    let out_path = std::env::temp_dir().join(format!("k2c_hello_aarch64_{}", std::process::id()));
+    let out = k2c()
+        .args(["build-native", "--target=aarch64-linux"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build-native --target=aarch64-linux should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&out_path).expect("aarch64 ELF written");
+    // Structural header check (host-independent): EM_AARCH64 (183), ET_EXEC, entry.
+    assert_eq!(&bytes[0..4], &[0x7f, b'E', b'L', b'F'], "ELF magic");
+    assert_eq!(bytes[4], 2, "ELFCLASS64");
+    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 2, "ET_EXEC");
+    assert_eq!(
+        u16::from_le_bytes([bytes[18], bytes[19]]),
+        183,
+        "e_machine == EM_AARCH64"
+    );
+
+    // External tool validation, only where binutils/file are present.
+    if let Ok(re) = Command::new("readelf").arg("-h").arg(&out_path).output() {
+        if re.status.success() {
+            let s = String::from_utf8_lossy(&re.stdout);
+            assert!(
+                s.contains("AArch64"),
+                "readelf -h should report Machine: AArch64, got:\n{s}"
+            );
+        }
+    }
+    if let Ok(f) = Command::new("file").arg(&out_path).output() {
+        if f.status.success() {
+            let s = String::from_utf8_lossy(&f.stdout);
+            assert!(
+                s.contains("aarch64") || s.contains("ARM"),
+                "file should report an ARM aarch64 executable, got:\n{s}"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// `build-native --target=x86_64-linux` (the explicit default) produces the SAME
+/// bytes as the implicit default, proving the default-target wiring is a no-op.
+#[test]
+fn build_native_explicit_x86_target_matches_default() {
+    let src = examples_dir().join("hello.k2");
+    let dir = std::env::temp_dir();
+    let a = dir.join(format!("k2c_def_{}", std::process::id()));
+    let b = dir.join(format!("k2c_x86_{}", std::process::id()));
+    let r1 = k2c()
+        .args(["build-native"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&a)
+        .output()
+        .unwrap();
+    let r2 = k2c()
+        .args(["build-native", "--target=x86_64-linux"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert!(r1.status.success() && r2.status.success());
+    let ba = std::fs::read(&a).unwrap();
+    let bb = std::fs::read(&b).unwrap();
+    assert_eq!(
+        ba, bb,
+        "explicit x86_64-linux must equal the default output"
+    );
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// `run-native --target=aarch64-linux` refuses to execute a foreign-ISA binary on
+/// this host with an actionable message (it cannot be run; no emulator).
+#[test]
+fn run_native_aarch64_refuses_on_x86_host() {
+    let src = examples_dir().join("hello.k2");
+    let out = k2c()
+        .args(["run-native", "--target=aarch64-linux"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "run-native of a foreign target must fail"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot execute") && err.contains("aarch64"),
+        "refusal message should explain the host mismatch, got:\n{err}"
+    );
+}
+
+/// An unknown `--target` triple is rejected with a message listing the supported
+/// triples.
+#[test]
+fn build_native_unknown_target_errors() {
+    let src = examples_dir().join("hello.k2");
+    let out = k2c()
+        .args(["build-native", "--target=sparc-solaris"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unknown target must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("x86_64-linux") && err.contains("aarch64-linux"),
+        "error should list supported triples, got:\n{err}"
+    );
+}
