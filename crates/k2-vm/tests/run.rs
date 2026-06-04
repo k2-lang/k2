@@ -638,3 +638,41 @@ fn top_level_typed_const_materializes_in_format_arg() {
         "42\n",
     );
 }
+
+#[test]
+fn regression_store_through_pointer_then_print_decimal() {
+    // v0.15 finding 4: a `var x: i32` mutated through a `*i32` pointer, then
+    // printed with `{d}`. An `address_taken` local's register holds a boxed
+    // `Value::Ptr`, so a bare *value* read used to capture the raw pointer and the
+    // formatter rendered `<int>` instead of the stored number. The bare read now
+    // dereferences the box, so `{d}` prints the actual value (matching native).
+    let src = r#"
+fn bump(p: *i32) void {
+    p.* = p.* + 1;
+}
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var x: i32 = 42;
+    bump(&x);
+    try out.print("x={d}\n", .{x});
+}
+"#;
+    assert_stdout(src, "x=43\n");
+}
+
+#[test]
+fn regression_address_taken_local_reads_current_value() {
+    // The same boxing fix, without a store-through-pointer: simply taking a
+    // local's address and then reading it by value must still render the number
+    // (not the `<int>` placeholder).
+    let src = r#"
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var x: i32 = 5;
+    const p = &x;
+    _ = p;
+    try out.print("x={d}\n", .{x});
+}
+"#;
+    assert_stdout(src, "x=5\n");
+}

@@ -169,6 +169,21 @@ impl<'p> FnCompiler<'p> {
     /// `Load*` instructions into `scratch`.
     fn place_to_reg(&mut self, place: &Place, scratch: Reg) -> Reg {
         if place.proj.is_empty() {
+            // An `address_taken` local's register holds a *boxed* `Value::Ptr` (the
+            // entry `InitAddrLocal` / `&x` boxes it so a store-through-pointer is
+            // visible). A bare *value* read of such a local must therefore
+            // dereference the box, else it would yield the raw pointer — which the
+            // formatter renders as `<int>` and which differs from the (correct)
+            // native backend that reads the local's stack home. `LoadDeref`'s
+            // runtime `deref` is a no-op on a non-pointer value, so this is safe
+            // even when a prior bare store left the raw value in the register.
+            if self.func.locals[place.base.index()].address_taken {
+                self.emit(Instr::LoadDeref {
+                    dst: scratch,
+                    ptr: place.base.0,
+                });
+                return scratch;
+            }
             return place.base.0;
         }
         // Start from the base register, then apply each projection into scratch.
@@ -479,7 +494,16 @@ impl<'p> FnCompiler<'p> {
         let mut scratch_n = 0usize;
         for op in ops {
             match op {
-                Operand::Copy(p) if p.proj.is_empty() => regs.push(p.base.0),
+                // A bare local reads its register directly — UNLESS it is
+                // `address_taken`, whose register holds a boxed `Value::Ptr`; that
+                // must be dereferenced into a scratch (see `place_to_reg`), else an
+                // aggregate/print argument captures the raw pointer and renders as
+                // `<int>` instead of the stored value.
+                Operand::Copy(p)
+                    if p.proj.is_empty() && !self.func.locals[p.base.index()].address_taken =>
+                {
+                    regs.push(p.base.0)
+                }
                 _ => {
                     let s = self.op_scratch(scratch_n);
                     scratch_n += 1;

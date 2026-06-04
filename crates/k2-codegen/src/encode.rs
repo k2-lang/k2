@@ -221,6 +221,42 @@ impl Asm {
         }
     }
 
+    /// Emits a `[base + disp]` memory ModRM (+ SIB/displacement bytes) for an
+    /// arbitrary base register, with the 3-bit `reg_field` (a register's low 3
+    /// bits, or a `/digit` opcode extension) in the reg slot.
+    ///
+    /// Three architectural special cases are handled:
+    ///
+    /// * **`rsp`/`r12` as base** (`rm=100`): the `rm=100` encoding means "a SIB
+    ///   byte follows", so a SIB with `index=100` (no index) and `base=100`/`100`
+    ///   is appended to actually address `[rsp]`/`[r12]`.
+    /// * **`rbp`/`r13` with disp 0** (`rm=101`): `mod=00 rm=101` is the
+    ///   RIP-relative escape, so a zero displacement must still use the `disp8`
+    ///   form (`mod=01`, one `0x00` byte) — exactly as `modrm_rbp_disp` does.
+    /// * Every other base uses the plain `disp8`/`disp32` form.
+    ///
+    /// The caller must already have set REX.B from `base.is_ext()` and REX.R from
+    /// the reg operand. `base.low3()` selects the rm/SIB-base field.
+    fn modrm_mem(&mut self, reg_field: u8, base: Gpr, disp: i32) {
+        let rm = base.low3();
+        let needs_sib = rm == 0b100; // rsp / r12
+                                     // Always emit a displacement (disp8 when it fits a signed byte, else
+                                     // disp32), so we never select the `mod=00 rm=101` RIP-relative escape for
+                                     // an rbp/r13 base — a zero displacement still encodes a one-byte disp8.
+        let use_disp8 = (-128..=127).contains(&disp);
+        let mod_bits: u8 = if use_disp8 { 0b01 } else { 0b10 };
+        self.byte((mod_bits << 6) | ((reg_field & 0b111) << 3) | rm);
+        if needs_sib {
+            // SIB: scale=00, index=100 (none), base=rm.
+            self.byte((0b100 << 3) | rm);
+        }
+        if use_disp8 {
+            self.byte(disp as i8 as u8);
+        } else {
+            self.imm32(disp);
+        }
+    }
+
     // ---------------------------------------------------------------------
     //  MOV family
     // ---------------------------------------------------------------------
@@ -293,6 +329,234 @@ impl Asm {
         self.modrm_rbp_disp(dst.low3(), disp);
     }
 
+    /// `lea dst, [base + disp]` (address of an arbitrary memory operand):
+    /// `REX.W 8D /r`. Used to compute the effective address of a projected place
+    /// (the base register already holds an interior pointer).
+    pub fn lea_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x8D);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    // ---------------------------------------------------------------------
+    //  Sized loads / stores through an arbitrary base register
+    // ---------------------------------------------------------------------
+
+    /// `mov dst, [base + disp]` (64-bit load): `REX.W 8B /r`.
+    pub fn mov_load_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x8B);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `mov [base + disp], src` (64-bit store): `REX.W 89 /r`.
+    pub fn mov_store_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.rex(true, src.is_ext(), false, base.is_ext());
+        self.byte(0x89);
+        self.modrm_mem(src.low3(), base, disp);
+    }
+
+    /// `movzx dst, byte [base + disp]`: `REX.W 0F B6 /r` (zero-extend a byte).
+    pub fn movzx8_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x0F);
+        self.byte(0xB6);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `movsx dst, byte [base + disp]`: `REX.W 0F BE /r` (sign-extend a byte).
+    pub fn movsx8_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x0F);
+        self.byte(0xBE);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `movzx dst, word [base + disp]`: `REX.W 0F B7 /r` (zero-extend a word).
+    pub fn movzx16_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x0F);
+        self.byte(0xB7);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `movsx dst, word [base + disp]`: `REX.W 0F BF /r` (sign-extend a word).
+    pub fn movsx16_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x0F);
+        self.byte(0xBF);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `mov dst32, [base + disp]` (32-bit load, **no** `REX.W`): `8B /r`. The CPU
+    /// zero-extends bits 32–63, the correct way to load an unsigned 32-bit field.
+    pub fn mov_load32_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        if dst.is_ext() || base.is_ext() {
+            self.rex(false, dst.is_ext(), false, base.is_ext());
+        }
+        self.byte(0x8B);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `movsxd dst, [base + disp]` (32-bit sign-extending load): `REX.W 63 /r`.
+    pub fn movsxd_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.rex(true, dst.is_ext(), false, base.is_ext());
+        self.byte(0x63);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `mov byte [base + disp], src8`: `88 /r` — stores the low byte of `src`.
+    /// A REX prefix is emitted whenever the base is extended OR `src` is one of
+    /// `rsp`/`rbp`/`rsi`/`rdi`/`r8`–`r15`, because without REX the `88 /r` reg
+    /// field `4..7` would name `ah/ch/dh/bh` rather than `spl/bpl/sil/dil`.
+    pub fn mov_store8_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        if src.is_ext() || base.is_ext() || src.num() >= 4 {
+            self.rex(false, src.is_ext(), false, base.is_ext());
+        }
+        self.byte(0x88);
+        self.modrm_mem(src.low3(), base, disp);
+    }
+
+    /// `mov word [base + disp], src16`: `66 89 /r` (the `66` operand-size prefix
+    /// selects a 16-bit store of the low word of `src`).
+    pub fn mov_store16_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.byte(0x66);
+        if src.is_ext() || base.is_ext() {
+            self.rex(false, src.is_ext(), false, base.is_ext());
+        }
+        self.byte(0x89);
+        self.modrm_mem(src.low3(), base, disp);
+    }
+
+    /// `mov dword [base + disp], src32`: `89 /r` (no `REX.W`) — 32-bit store of
+    /// the low dword of `src`.
+    pub fn mov_store32_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        if src.is_ext() || base.is_ext() {
+            self.rex(false, src.is_ext(), false, base.is_ext());
+        }
+        self.byte(0x89);
+        self.modrm_mem(src.low3(), base, disp);
+    }
+
+    /// `rep movsb`: `F3 A4` — copy RCX bytes from `[rsi]` to `[rdi]`, advancing
+    /// both. Clobbers RSI/RDI/RCX. Used for the larger aggregate `memcpy`.
+    pub fn rep_movsb(&mut self) {
+        self.byte(0xF3);
+        self.byte(0xA4);
+    }
+
+    // ---------------------------------------------------------------------
+    //  SSE2 scalar-double (f64) family
+    // ---------------------------------------------------------------------
+
+    /// Emits the optional REX for an SSE instruction whose `reg`/`rm` may be an
+    /// extended xmm register. The mandatory prefix (`F2`/`66`) is emitted by the
+    /// caller *before* this REX, then `0F` and the opcode follow.
+    fn sse_rex(&mut self, w: bool, reg_ext: bool, base_ext: bool) {
+        if w || reg_ext || base_ext {
+            self.rex(w, reg_ext, false, base_ext);
+        }
+    }
+
+    /// `movsd dst, [base + disp]` (load an f64): `F2 0F 10 /r`.
+    pub fn movsd_load(&mut self, dst: crate::reg::Xmm, base: Gpr, disp: i32) {
+        self.byte(0xF2);
+        self.sse_rex(false, dst.is_ext(), base.is_ext());
+        self.byte(0x0F);
+        self.byte(0x10);
+        self.modrm_mem(dst.low3(), base, disp);
+    }
+
+    /// `movsd [base + disp], src` (store an f64): `F2 0F 11 /r`.
+    pub fn movsd_store(&mut self, base: Gpr, disp: i32, src: crate::reg::Xmm) {
+        self.byte(0xF2);
+        self.sse_rex(false, src.is_ext(), base.is_ext());
+        self.byte(0x0F);
+        self.byte(0x11);
+        self.modrm_mem(src.low3(), base, disp);
+    }
+
+    /// `movsd dst, src` (xmm→xmm copy): `F2 0F 10 /r` with a register-direct
+    /// ModRM (`dst` in reg, `src` in rm).
+    pub fn movsd_rr(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.byte(0xF2);
+        self.sse_rex(false, dst.is_ext(), src.is_ext());
+        self.byte(0x0F);
+        self.byte(0x10);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
+    /// The shared `F2 0F <op> /r` register-direct scalar-double ALU shape
+    /// (`dst` in reg, `src` in rm).
+    fn sse_alu_rr(&mut self, op: u8, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.byte(0xF2);
+        self.sse_rex(false, dst.is_ext(), src.is_ext());
+        self.byte(0x0F);
+        self.byte(op);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
+    /// `addsd dst, src`: `F2 0F 58 /r`.
+    pub fn addsd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.sse_alu_rr(0x58, dst, src);
+    }
+    /// `subsd dst, src`: `F2 0F 5C /r`.
+    pub fn subsd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.sse_alu_rr(0x5C, dst, src);
+    }
+    /// `mulsd dst, src`: `F2 0F 59 /r`.
+    pub fn mulsd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.sse_alu_rr(0x59, dst, src);
+    }
+    /// `divsd dst, src`: `F2 0F 5E /r`.
+    pub fn divsd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.sse_alu_rr(0x5E, dst, src);
+    }
+
+    /// `ucomisd dst, src`: `66 0F 2E /r` — an ordered f64 compare that sets the
+    /// ZF/PF/CF flags a `setcc`/`jcc` then reads.
+    pub fn ucomisd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.byte(0x66);
+        self.sse_rex(false, dst.is_ext(), src.is_ext());
+        self.byte(0x0F);
+        self.byte(0x2E);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
+    /// `movq dst, src` (GPR→xmm bit-copy): `66 REX.W 0F 6E /r` — moves the raw
+    /// 64-bit bit pattern of GPR `src` into the low quadword of xmm `dst` (zeroing
+    /// the high quadword). Used to materialize an `f64` *constant* directly from a
+    /// GPR holding its bit pattern, avoiding any stack-memory round trip (and so
+    /// never aliasing the outgoing-args region). The mandatory `66` prefix is
+    /// emitted before REX, matching the SSE encoding rule the other methods follow.
+    pub fn movq_xmm_r64(&mut self, dst: crate::reg::Xmm, src: Gpr) {
+        self.byte(0x66);
+        self.rex(true, dst.is_ext(), false, src.is_ext());
+        self.byte(0x0F);
+        self.byte(0x6E);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
+    /// `cvtsi2sd dst, src` (int→f64): `F2 REX.W 0F 2A /r` — converts the 64-bit
+    /// GPR `src` to a double in xmm `dst`.
+    pub fn cvtsi2sd(&mut self, dst: crate::reg::Xmm, src: Gpr) {
+        self.byte(0xF2);
+        self.rex(true, dst.is_ext(), false, src.is_ext());
+        self.byte(0x0F);
+        self.byte(0x2A);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
+    /// `cvttsd2si dst, src` (f64→int, truncating): `F2 REX.W 0F 2C /r` — converts
+    /// the double in xmm `src` to a 64-bit GPR `dst`, rounding toward zero.
+    pub fn cvttsd2si(&mut self, dst: Gpr, src: crate::reg::Xmm) {
+        self.byte(0xF2);
+        self.rex(true, dst.is_ext(), false, src.is_ext());
+        self.byte(0x0F);
+        self.byte(0x2C);
+        self.byte(0b11_000_000 | (dst.low3() << 3) | src.low3());
+    }
+
     /// `mov dst, imm64` whose 8 immediate bytes are a `.rodata` pointer hole.
     /// Records a [`FixupKind::Data`] so the layout pass writes the string's
     /// absolute virtual address. Always uses the full `B8+rd io` form so the
@@ -331,6 +595,19 @@ impl Asm {
     /// `xor dst, src`: `REX.W 31 /r`.
     pub fn xor_rr(&mut self, dst: Gpr, src: Gpr) {
         self.alu_rr(0x31, dst, src);
+    }
+    /// `adc dst, src`: `REX.W 11 /r` (add-with-carry — `dst = dst + src + CF`).
+    /// Forms the high limb of a two-limb 128-bit add: an `add_rr` of the low
+    /// limbs sets CF, and this `adc_rr` of the high limbs folds it in.
+    pub fn adc_rr(&mut self, dst: Gpr, src: Gpr) {
+        self.alu_rr(0x11, dst, src);
+    }
+    /// `sbb dst, src`: `REX.W 19 /r` (subtract-with-borrow — `dst = dst - src -
+    /// CF`). Forms the high limb of a two-limb 128-bit subtract: a `sub_rr` of
+    /// the low limbs sets CF (the borrow), and this `sbb_rr` of the high limbs
+    /// propagates it.
+    pub fn sbb_rr(&mut self, dst: Gpr, src: Gpr) {
+        self.alu_rr(0x19, dst, src);
     }
     /// `cmp dst, src`: `REX.W 39 /r` (the `CMP r/m64, r64` direction, so flags
     /// are set as for `dst - src`).
@@ -477,6 +754,33 @@ impl Asm {
         self.byte(0x81);
         self.modrm_rr_op(7, dst);
         self.imm32(imm);
+    }
+
+    /// `add dst, imm32`: `REX.W 81 /0 id` (sign-extended). Folds a field offset
+    /// or a scaled index into an address register.
+    pub fn add_ri(&mut self, dst: Gpr, imm: i32) {
+        self.rex(true, false, false, dst.is_ext());
+        self.byte(0x81);
+        self.modrm_rr_op(0, dst);
+        self.imm32(imm);
+    }
+
+    /// `imul dst, src, imm32`: `REX.W 69 /r id` — `dst = src * imm32`. Computes a
+    /// scaled element index (`index * elem_size`) for a non-power-of-two stride.
+    pub fn imul_rri(&mut self, dst: Gpr, src: Gpr, imm: i32) {
+        self.rex(true, dst.is_ext(), false, src.is_ext());
+        self.byte(0x69);
+        self.modrm_rr(dst, src);
+        self.imm32(imm);
+    }
+
+    /// `shl dst, imm8`: `REX.W C1 /4 ib` — left-shift by a constant (a
+    /// power-of-two element-size scale).
+    pub fn shl_ri(&mut self, dst: Gpr, imm: u8) {
+        self.rex(true, false, false, dst.is_ext());
+        self.byte(0xC1);
+        self.modrm_rr_op(4, dst);
+        self.byte(imm);
     }
 
     /// `sub rsp, imm32`: `REX.W 81 /5 id` (allocate stack frame).
@@ -636,6 +940,33 @@ impl Asm {
             "label id out of reserved range"
         );
         self.label_offsets[i] = Some(self.pos());
+    }
+
+    /// Allocates a fresh, dynamically-created local label (used by the runtime
+    /// print formatter's render loops, which are emitted inline within a block and
+    /// need their own jump targets beyond the per-basic-block reserved labels).
+    /// The returned [`LabelId`] is resolved by [`Asm::finish`] exactly like a
+    /// block label.
+    pub fn new_local_label(&mut self) -> LabelId {
+        let id = LabelId(self.label_offsets.len() as u32);
+        self.label_offsets.push(None);
+        id
+    }
+
+    /// Binds a dynamically-allocated local label at the current position.
+    pub fn bind_local(&mut self, label: LabelId) {
+        self.label_offsets[label.0 as usize] = Some(self.pos());
+    }
+
+    /// An unconditional jump to a local label (alias of [`Asm::jmp`], named for the
+    /// render-loop call sites).
+    pub fn jmp_local(&mut self, label: LabelId) {
+        self.jmp(label);
+    }
+
+    /// A conditional jump to a local label (alias of [`Asm::jcc`]).
+    pub fn jcc_local(&mut self, cc: Cc, label: LabelId) {
+        self.jcc(cc, label);
     }
 
     /// Finalizes this function's code: resolves every intra-function

@@ -15,7 +15,7 @@
 //!    CI (x86-64 Linux) and are simply absent on other hosts.
 
 use crate::encode::{Asm, Cc, LabelId};
-use crate::reg::Gpr;
+use crate::reg::{Gpr, Xmm};
 
 // =========================================================================
 //  Tier 1 — encoder: instruction -> exact bytes
@@ -83,6 +83,36 @@ fn alu_rr_bytes() {
     assert_eq!(enc(|a| a.test_rr(Gpr::Rax, Gpr::Rax)), [0x48, 0x85, 0xc0]);
     // xor rdi, rdi -> 48 31 ff.
     assert_eq!(enc(|a| a.xor_rr(Gpr::Rdi, Gpr::Rdi)), [0x48, 0x31, 0xff]);
+}
+
+#[test]
+fn adc_sbb_bytes() {
+    // The two-limb 128-bit add/sub carry-propagation pair.
+    // adc rax, rcx -> 48 11 c8 ; adc rdx, r11 -> 4c 11 da.
+    assert_eq!(enc(|a| a.adc_rr(Gpr::Rax, Gpr::Rcx)), [0x48, 0x11, 0xc8]);
+    assert_eq!(enc(|a| a.adc_rr(Gpr::Rdx, Gpr::R11)), [0x4c, 0x11, 0xda]);
+    // sbb rax, rcx -> 48 19 c8 ; sbb r14, r9 -> 4d 19 ce.
+    assert_eq!(enc(|a| a.sbb_rr(Gpr::Rax, Gpr::Rcx)), [0x48, 0x19, 0xc8]);
+    assert_eq!(enc(|a| a.sbb_rr(Gpr::R14, Gpr::R9)), [0x4d, 0x19, 0xce]);
+}
+
+#[test]
+fn movq_xmm_r64_bytes() {
+    // movq xmm0, rax  -> 66 48 0f 6e c0 (GPR bit pattern into xmm, no memory).
+    assert_eq!(
+        enc(|a| a.movq_xmm_r64(Xmm::Xmm0, Gpr::Rax)),
+        [0x66, 0x48, 0x0f, 0x6e, 0xc0]
+    );
+    // movq xmm1, r11 -> 66 49 0f 6e cb (REX.B for r11).
+    assert_eq!(
+        enc(|a| a.movq_xmm_r64(Xmm::Xmm1, Gpr::R11)),
+        [0x66, 0x49, 0x0f, 0x6e, 0xcb]
+    );
+    // movq xmm8, rcx -> 66 4c 0f 6e c1 (REX.R for xmm8).
+    assert_eq!(
+        enc(|a| a.movq_xmm_r64(Xmm::Xmm8, Gpr::Rcx)),
+        [0x66, 0x4c, 0x0f, 0x6e, 0xc1]
+    );
 }
 
 #[test]
@@ -311,6 +341,198 @@ fn prologue_sequence_concatenation() {
     );
 }
 
+// ---- v0.15 encoder additions: byte-exact vs the system assembler ----
+
+#[test]
+fn lea_mem_arbitrary_base_bytes() {
+    // lea rax, [rcx+8]  -> 48 8d 41 08.
+    assert_eq!(
+        enc(|a| a.lea_mem(Gpr::Rax, Gpr::Rcx, 8)),
+        [0x48, 0x8d, 0x41, 0x08]
+    );
+    // lea rsi, [rsp+0] (rsp base needs a SIB; our encoder always emits an explicit
+    // disp8, so [rsp+0] is `mod=01 rm=100 SIB(base=rsp) disp8=0`) -> 48 8d 74 24 00.
+    // (The system assembler picks the shorter mod=00 form `48 8d 34 24`; both
+    // address [rsp] identically. We assert our own deterministic encoding.)
+    assert_eq!(
+        enc(|a| a.lea_mem(Gpr::Rsi, Gpr::Rsp, 0)),
+        [0x48, 0x8d, 0x74, 0x24, 0x00]
+    );
+    // mov rax, [r13+0] (r13 base, disp 0 must still emit disp8) -> 49 8b 45 00.
+    assert_eq!(
+        enc(|a| a.mov_load_mem(Gpr::Rax, Gpr::R13, 0)),
+        [0x49, 0x8b, 0x45, 0x00]
+    );
+    // mov rax, [r12+8] (r12 base needs a SIB) -> 49 8b 44 24 08.
+    assert_eq!(
+        enc(|a| a.mov_load_mem(Gpr::Rax, Gpr::R12, 8)),
+        [0x49, 0x8b, 0x44, 0x24, 0x08]
+    );
+}
+
+#[test]
+fn sized_mem_loads_bytes() {
+    // movzx rax, byte [rcx+4]  -> 48 0f b6 41 04.
+    assert_eq!(
+        enc(|a| a.movzx8_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x48, 0x0f, 0xb6, 0x41, 0x04]
+    );
+    // movsx rax, byte [rcx+4]  -> 48 0f be 41 04.
+    assert_eq!(
+        enc(|a| a.movsx8_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x48, 0x0f, 0xbe, 0x41, 0x04]
+    );
+    // movzx rax, word [rcx+4]  -> 48 0f b7 41 04.
+    assert_eq!(
+        enc(|a| a.movzx16_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x48, 0x0f, 0xb7, 0x41, 0x04]
+    );
+    // movsx rax, word [rcx+4]  -> 48 0f bf 41 04.
+    assert_eq!(
+        enc(|a| a.movsx16_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x48, 0x0f, 0xbf, 0x41, 0x04]
+    );
+    // mov eax, [rcx+4] (32-bit, zero-extends, no REX.W) -> 8b 41 04.
+    assert_eq!(
+        enc(|a| a.mov_load32_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x8b, 0x41, 0x04]
+    );
+    // movsxd rax, [rcx+4]  -> 48 63 41 04.
+    assert_eq!(
+        enc(|a| a.movsxd_mem(Gpr::Rax, Gpr::Rcx, 4)),
+        [0x48, 0x63, 0x41, 0x04]
+    );
+}
+
+#[test]
+fn sized_mem_stores_bytes() {
+    // mov byte [rcx+4], al  -> 88 41 04.
+    assert_eq!(
+        enc(|a| a.mov_store8_mem(Gpr::Rcx, 4, Gpr::Rax)),
+        [0x88, 0x41, 0x04]
+    );
+    // mov byte [rcx+4], sil (needs REX for spl/sil) -> 40 88 71 04.
+    assert_eq!(
+        enc(|a| a.mov_store8_mem(Gpr::Rcx, 4, Gpr::Rsi)),
+        [0x40, 0x88, 0x71, 0x04]
+    );
+    // mov word [rcx+4], ax  -> 66 89 41 04.
+    assert_eq!(
+        enc(|a| a.mov_store16_mem(Gpr::Rcx, 4, Gpr::Rax)),
+        [0x66, 0x89, 0x41, 0x04]
+    );
+    // mov dword [rcx+4], eax  -> 89 41 04.
+    assert_eq!(
+        enc(|a| a.mov_store32_mem(Gpr::Rcx, 4, Gpr::Rax)),
+        [0x89, 0x41, 0x04]
+    );
+    // mov [rcx+8], rax  -> 48 89 41 08.
+    assert_eq!(
+        enc(|a| a.mov_store_mem(Gpr::Rcx, 8, Gpr::Rax)),
+        [0x48, 0x89, 0x41, 0x08]
+    );
+}
+
+#[test]
+fn rep_movsb_and_index_arith_bytes() {
+    // rep movsb -> f3 a4.
+    assert_eq!(enc(|a| a.rep_movsb()), [0xf3, 0xa4]);
+    // shl rax, 3 -> 48 c1 e0 03.
+    assert_eq!(enc(|a| a.shl_ri(Gpr::Rax, 3)), [0x48, 0xc1, 0xe0, 0x03]);
+    // add rax, 16 (imm32 form) -> 48 81 c0 10 00 00 00.
+    assert_eq!(
+        enc(|a| a.add_ri(Gpr::Rax, 16)),
+        [0x48, 0x81, 0xc0, 0x10, 0x00, 0x00, 0x00]
+    );
+    // imul rcx, rcx, 12 (imm32 form) -> 48 69 c9 0c 00 00 00.
+    assert_eq!(
+        enc(|a| a.imul_rri(Gpr::Rcx, Gpr::Rcx, 12)),
+        [0x48, 0x69, 0xc9, 0x0c, 0x00, 0x00, 0x00]
+    );
+}
+
+#[test]
+fn sse_double_family_bytes() {
+    // movsd xmm0, [rax] — our encoder emits an explicit disp8=0 (mod=01) rather
+    // than the assembler's shorter mod=00; both address [rax]. -> f2 0f 10 40 00.
+    assert_eq!(
+        enc(|a| a.movsd_load(Xmm::Xmm0, Gpr::Rax, 0)),
+        [0xf2, 0x0f, 0x10, 0x40, 0x00]
+    );
+    // movsd [rax], xmm0  -> f2 0f 11 40 00.
+    assert_eq!(
+        enc(|a| a.movsd_store(Gpr::Rax, 0, Xmm::Xmm0)),
+        [0xf2, 0x0f, 0x11, 0x40, 0x00]
+    );
+    // movsd xmm8, [rax] (REX.R) -> f2 44 0f 10 40 00.
+    assert_eq!(
+        enc(|a| a.movsd_load(Xmm::Xmm8, Gpr::Rax, 0)),
+        [0xf2, 0x44, 0x0f, 0x10, 0x40, 0x00]
+    );
+    // addsd/subsd/mulsd/divsd xmm0, xmm1.
+    assert_eq!(
+        enc(|a| a.addsd(Xmm::Xmm0, Xmm::Xmm1)),
+        [0xf2, 0x0f, 0x58, 0xc1]
+    );
+    assert_eq!(
+        enc(|a| a.subsd(Xmm::Xmm0, Xmm::Xmm1)),
+        [0xf2, 0x0f, 0x5c, 0xc1]
+    );
+    assert_eq!(
+        enc(|a| a.mulsd(Xmm::Xmm0, Xmm::Xmm1)),
+        [0xf2, 0x0f, 0x59, 0xc1]
+    );
+    assert_eq!(
+        enc(|a| a.divsd(Xmm::Xmm0, Xmm::Xmm1)),
+        [0xf2, 0x0f, 0x5e, 0xc1]
+    );
+    // ucomisd xmm0, xmm1  -> 66 0f 2e c1.
+    assert_eq!(
+        enc(|a| a.ucomisd(Xmm::Xmm0, Xmm::Xmm1)),
+        [0x66, 0x0f, 0x2e, 0xc1]
+    );
+    // cvtsi2sd xmm0, rax  -> f2 48 0f 2a c0.
+    assert_eq!(
+        enc(|a| a.cvtsi2sd(Xmm::Xmm0, Gpr::Rax)),
+        [0xf2, 0x48, 0x0f, 0x2a, 0xc0]
+    );
+    // cvttsd2si rax, xmm0  -> f2 48 0f 2c c0.
+    assert_eq!(
+        enc(|a| a.cvttsd2si(Gpr::Rax, Xmm::Xmm0)),
+        [0xf2, 0x48, 0x0f, 0x2c, 0xc0]
+    );
+    // movsd xmm0, xmm1 (reg-reg) -> f2 0f 10 c1.
+    assert_eq!(
+        enc(|a| a.movsd_rr(Xmm::Xmm0, Xmm::Xmm1)),
+        [0xf2, 0x0f, 0x10, 0xc1]
+    );
+}
+
+// =========================================================================
+//  Tier 1b — layout oracle: byte sizes/offsets vs reflect.rs
+// =========================================================================
+
+#[test]
+fn layout_oracle_scalar_sizes() {
+    use crate::layout::{int_byte_size, round_up};
+    use k2_types::IntBits;
+    // int_byte_size matches reflect::int_byte_size (power-of-two rounding).
+    assert_eq!(int_byte_size(IntBits::Fixed(1)), 1);
+    assert_eq!(int_byte_size(IntBits::Fixed(8)), 1);
+    assert_eq!(int_byte_size(IntBits::Fixed(9)), 2);
+    assert_eq!(int_byte_size(IntBits::Fixed(16)), 2);
+    assert_eq!(int_byte_size(IntBits::Fixed(17)), 4);
+    assert_eq!(int_byte_size(IntBits::Fixed(32)), 4);
+    assert_eq!(int_byte_size(IntBits::Fixed(33)), 8);
+    assert_eq!(int_byte_size(IntBits::Fixed(64)), 8);
+    assert_eq!(int_byte_size(IntBits::Usize), 8);
+    // round_up identity for align <= 1 and standard rounding otherwise.
+    assert_eq!(round_up(5, 1), 5);
+    assert_eq!(round_up(5, 8), 8);
+    assert_eq!(round_up(8, 8), 8);
+    assert_eq!(round_up(9, 8), 16);
+}
+
 // =========================================================================
 //  Tier 2 — ELF validity
 // =========================================================================
@@ -480,7 +702,20 @@ mod exec {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
 
-        let out = Command::new(&path).output().expect("exec native binary");
+        // Executing a freshly-written file can transiently fail with ETXTBSY
+        // ("Text file busy") if the writer's file descriptor is still being
+        // flushed by the kernel; retry a few times with a short backoff.
+        let mut attempt = 0;
+        let out = loop {
+            match Command::new(&path).output() {
+                Ok(o) => break o,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("exec native binary: {e:?}"),
+            }
+        };
         let _ = std::fs::remove_file(&path);
         let code = out.status.code().unwrap_or(-1);
         (code, out.stdout, out.stderr)
@@ -659,9 +894,15 @@ mod exec {
 
     #[test]
     fn unsupported_program_is_clean_error() {
-        // A float program is outside the subset: codegen must return a clean
-        // Unsupported error, never panic the host process.
-        let prog = lower("pub fn main() u8 { var f: f64 = 1.5; return @intFromFloat(f); }");
+        // A heap-allocating program is outside the native subset (the heap is
+        // v0.16): codegen must return a clean Unsupported error, never panic the
+        // host process or miscompile.
+        let prog = lower(
+            "const std = @import(\"std\");\n\
+             pub fn main(sys: *System) !void { \
+                const p = try sys.heap.create(u32); \
+                p.* = 7; sys.heap.destroy(p); }",
+        );
         match crate::compile_program_to_elf(&prog) {
             Err(crate::CodegenError::Unsupported(_)) => {}
             Err(crate::CodegenError::NoMain) => panic!("expected Unsupported, got NoMain"),
@@ -922,5 +1163,620 @@ mod exec {
                 try o.print(\"hi\\n\", .{}); }",
         );
         assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    // =====================================================================
+    //  v0.15 differential corpus: aggregates, projections, optionals, error
+    //  unions, runtime formatting, recursion, many-arg calls, pointers,
+    //  floats. Each asserts native stdout + exit code == the VM's.
+    // =====================================================================
+
+    /// A `main(sys)`-shaped program wrapper for the corpus snippets.
+    fn main_io(body: &str) -> String {
+        format!(
+            "const std = @import(\"std\");\n\
+             pub fn main(sys: *System) !void {{ const o = sys.io.stdout(); {body} }}"
+        )
+    }
+
+    #[test]
+    fn diff_hello_k2_exact_output() {
+        // The headline acceptance: examples/hello.k2 native == VM, byte-identical
+        // (tuple aggregate, {s} runtime string, {d} 128-bit decimal, multi-print,
+        // stderr writer, error-union try success path).
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/hello.k2"
+        ))
+        .expect("read hello.k2");
+        let prog = lower(&src);
+        let (n_code, n_out, n_err) = run_native(&prog);
+        let (v_code, v_out, v_err) = run_vm(&prog);
+        assert_eq!(n_out, v_out, "hello.k2 stdout native==VM");
+        assert_eq!(n_err, v_err, "hello.k2 stderr native==VM");
+        assert_eq!(n_code, v_code, "hello.k2 exit native==VM");
+        assert_eq!(
+            n_out,
+            b"Hello, k2!\nk2 directs every joule of Sol: ~384600000000000000000000000 W.\n"
+        );
+        assert_eq!(n_err, b"(this line went to stderr)\n");
+        assert_eq!(n_code, 0);
+    }
+
+    #[test]
+    fn diff_struct_field_math() {
+        let prog = lower(&format!(
+            "const Point = struct {{ x: i32, y: i32 }};\n{}",
+            main_io(
+                "const p = Point{ .x = 6, .y = 7 }; const r = p.x * p.y + p.y; \
+                 try o.print(\"r={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_nested_struct_projected_store() {
+        let prog = lower(&format!(
+            "const Inner = struct {{ a: i32, b: i32 }};\n\
+             const Outer = struct {{ p: Inner, q: u8 }};\n{}",
+            main_io(
+                "var s = Outer{ .p = Inner{ .a = 1, .b = 2 }, .q = 5 }; s.p.a = 100; \
+                 try o.print(\"{d} {d} {d}\\n\", .{ s.p.a, s.p.b, s.q });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_array_index_sum() {
+        let prog = lower(&main_io(
+            "const a = [_]i32{ 1, 2, 3, 4, 5 }; var s: i32 = 0; var i: usize = 0; \
+             while (i < a.len) : (i += 1) { s += a[i]; } try o.print(\"sum={d}\\n\", .{s});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_array_index_store() {
+        let prog = lower(&main_io(
+            "var a: [4]u32 = undefined; var i: usize = 0; \
+             while (i < 4) : (i += 1) { a[i] = @intCast(i * i); } \
+             try o.print(\"{d} {d} {d} {d}\\n\", .{ a[0], a[1], a[2], a[3] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_array_bounds_trap() {
+        // An out-of-bounds index traps (exit 134) on both backends.
+        let prog = lower(&main_io(
+            "const a = [_]i32{ 1, 2, 3 }; var k: usize = 5; const v = a[k]; \
+             try o.print(\"{d}\\n\", .{v});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 134);
+    }
+
+    #[test]
+    fn diff_slice_len_and_index() {
+        let prog = lower(&main_io(
+            "var a = [_]i32{ 10, 20, 30, 40 }; const s = a[1..3]; \
+             try o.print(\"len={d} a={d} b={d}\\n\", .{ s.len, s[0], s[1] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_optional_some_none() {
+        let prog = lower(&format!(
+            "fn maybe(b: bool) ?i32 {{ if (b) {{ return 7; }} return null; }}\n{}",
+            main_io(
+                "const v = maybe(true) orelse 0; const w = maybe(false) orelse 99; \
+                 try o.print(\"v={d} w={d}\\n\", .{ v, w });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_error_union_try_and_catch() {
+        let prog = lower(&format!(
+            "const E = error{{ Bad }};\n\
+             fn get(b: bool) E!u32 {{ if (b) {{ return 42; }} return E.Bad; }}\n{}",
+            main_io(
+                "const v = get(true) catch 0; const w = get(false) catch 88; \
+                 try o.print(\"v={d} w={d}\\n\", .{ v, w });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_error_escapes_main_exit_1() {
+        // An error escaping main prints `error: <name>` to stderr and exits 1 on
+        // both backends.
+        let prog = lower(
+            "const std = @import(\"std\");\n\
+             const E = error{ Boom };\n\
+             fn fail() E!void { return E.Boom; }\n\
+             pub fn main(sys: *System) !void { try fail(); }",
+        );
+        let (n_code, _n_out, n_err) = run_native(&prog);
+        let (v_code, _v_out, _v_err) = run_vm(&prog);
+        assert_eq!(n_code, 1, "escaped error exits 1 (native)");
+        assert_eq!(v_code, 1, "escaped error exits 1 (VM)");
+        // The native binary writes `error: <name>\n` to its own stderr; the VM's
+        // captured-stderr buffer does not include this line (the driver, not the
+        // VM core, emits it), so we assert the native form directly and only the
+        // exit codes against the VM.
+        assert_eq!(n_err, b"error: Boom\n");
+    }
+
+    #[test]
+    fn diff_deref_load_store() {
+        // Read back through the pointer (`p.*`): both backends agree on the
+        // pointer-aliased value. (Reading the *original local* after a pointer
+        // store is a VM tagged-value aliasing limitation — native aliases
+        // correctly there, so that exact form is intentionally avoided here.)
+        let prog = lower(&main_io(
+            "var x: i32 = 3; const p = &x; p.* = 9; const y = p.* + 1; \
+             try o.print(\"y={d} z={d}\\n\", .{ y, p.* });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_pointer_to_struct_field() {
+        // Read back through the interior pointer for the same VM-aliasing reason.
+        let prog = lower(&format!(
+            "const P = struct {{ x: i32, y: i32 }};\n{}",
+            main_io(
+                "var s = P{ .x = 1, .y = 2 }; const px = &s.x; px.* = 50; \
+                 try o.print(\"{d} {d}\\n\", .{ px.*, s.y });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_runtime_fmt_multi() {
+        let prog = lower(&main_io(
+            "const a: i32 = 42; const b: u64 = 1000; const name = \"k2\"; \
+             try o.print(\"{s}: a={d}, b={d}\\n\", .{ name, a, b });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_fmt_hex_bin_oct_char() {
+        let prog = lower(&main_io(
+            "const x: u32 = 255; const y: u8 = 10; const n: i8 = -1; const c: u8 = 65; \
+             try o.print(\"{x} {X} {b} {o} {x} {c}\\n\", .{ x, x, y, y, n, c });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_fmt_default_verb() {
+        let prog = lower(&main_io(
+            "const n: i32 = 7; const b = true; const name = \"hi\"; \
+             try o.print(\"{} {} {}\\n\", .{ n, b, name });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_negative_decimal() {
+        let prog = lower(&main_io(
+            "const a: i32 = -12345; const b: i64 = -9000000000; \
+             try o.print(\"{d} {d}\\n\", .{ a, b });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_u128_decimal() {
+        // The hello.k2 128-bit decimal path, isolated.
+        let prog = lower(&main_io(
+            "const big: u128 = 384600000000000000000000000; try o.print(\"{d}\\n\", .{big});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_recursion_fib() {
+        let prog = lower(&format!(
+            "fn fib(n: u64) u64 {{ if (n < 2) {{ return n; }} return fib(n-1) + fib(n-2); }}\n{}",
+            main_io("try o.print(\"fib={d}\\n\", .{fib(25)});")
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_many_args_7_and_9() {
+        let prog = lower(&format!(
+            "fn s7(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64) u64 \
+                {{ return a+b+c+d+e+f+g; }}\n\
+             fn s9(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64) u64 \
+                {{ return a+b+c+d+e+f+g+h+i; }}\n{}",
+            main_io(
+                "const x = s7(1,2,3,4,5,6,7); const y = s9(1,2,3,4,5,6,7,8,9); \
+                 try o.print(\"{d} {d}\\n\", .{ x, y });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_struct_return_small_and_16() {
+        // A 2×i32 struct returns in RAX (8 bytes); a 2×u64 struct in RAX:RDX (16).
+        let prog = lower(&format!(
+            "const P = struct {{ x: i32, y: i32 }};\n\
+             const Q = struct {{ a: u64, b: u64 }};\n\
+             fn mkp(a: i32, b: i32) P {{ return P{{ .x = a, .y = b }}; }}\n\
+             fn mkq(a: u64, b: u64) Q {{ return Q{{ .a = a, .b = b }}; }}\n{}",
+            main_io(
+                "const p = mkp(3, 4); const q = mkq(100, 200); \
+                 try o.print(\"{d} {d} {d} {d}\\n\", .{ p.x, p.y, q.a, q.b });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_struct_return_memory_sret() {
+        // A >16-byte struct returns via a hidden sret pointer.
+        let prog = lower(&format!(
+            "const Big = struct {{ a: u64, b: u64, c: u64 }};\n\
+             fn mk(a: u64, b: u64, c: u64) Big {{ return Big{{ .a = a, .b = b, .c = c }}; }}\n{}",
+            main_io(
+                "const g = mk(11, 22, 33); \
+                 try o.print(\"{d} {d} {d}\\n\", .{ g.a, g.b, g.c });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_switch_value() {
+        let prog = lower(&format!(
+            "fn pick(n: u8) u8 {{ switch (n) {{ 0 => {{ return 10; }}, 1 => {{ return 20; }}, \
+                else => {{ return 30; }} }} }}\n{}",
+            main_io("try o.print(\"{d}\\n\", .{pick(1) + pick(9)});")
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_float_arith_compare() {
+        // f64 arithmetic + compare + branch (compile-time-constant float print).
+        let prog = lower(&main_io(
+            "var a: f64 = 3.0; var b: f64 = 4.0; const c = a * b; \
+             if (c > 10.0) { try o.print(\"big\\n\", .{}); } \
+             else { try o.print(\"small\\n\", .{}); }",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_float_int_casts() {
+        let prog = lower(&main_io(
+            "const i: i32 = 7; const f: f64 = @floatFromInt(i); \
+             const back: i32 = @intFromFloat(f * 2.0); try o.print(\"back={d}\\n\", .{back});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_regalloc_spill_stress() {
+        // Many simultaneously-live locals + nested loops force spills; the result
+        // must still match the VM exactly.
+        let prog = lower(&main_io(
+            "var a: u64 = 1; var b: u64 = 2; var c: u64 = 3; var d: u64 = 4; \
+             var e: u64 = 5; var f: u64 = 6; var g: u64 = 7; var h: u64 = 8; \
+             var i: usize = 0; \
+             while (i < 100) : (i += 1) { \
+                a = a + b; b = b + c; c = c + d; d = d + e; \
+                e = e + f; f = f + g; g = g + h; h = h + 1; \
+                a = a & 0xffff; b = b & 0xffff; c = c & 0xffff; d = d & 0xffff; \
+                e = e & 0xffff; f = f & 0xffff; g = g & 0xffff; h = h & 0xffff; \
+             } \
+             try o.print(\"{d} {d} {d} {d}\\n\", .{ a, b, c, d });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_callee_saved_roundtrip() {
+        // A caller using several long-lived locals across a call: the callee-saved
+        // registers must be preserved across the recursion.
+        let prog = lower(&format!(
+            "fn add(a: u64, b: u64) u64 {{ return a + b; }}\n{}",
+            main_io(
+                "var acc: u64 = 0; var i: u64 = 0; \
+                 while (i < 10) : (i += 1) { acc = add(acc, i); } \
+                 try o.print(\"acc={d}\\n\", .{acc});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_enum_switch() {
+        // A `switch` over an enum value (the `Union` discriminant -> tag integer).
+        let prog = lower(&format!(
+            "const Color = enum {{ Red, Green, Blue }};\n\
+             fn pick(c: Color) u8 {{ switch (c) {{ .Red => {{ return 1; }}, \
+                .Green => {{ return 2; }}, .Blue => {{ return 3; }} }} }}\n{}",
+            main_io("try o.print(\"{d} {d} {d}\\n\", .{ pick(.Red), pick(.Green), pick(.Blue) });")
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_float_args_and_return() {
+        // f64 arguments in XMM registers + an f64 return, with a compile-time
+        // constant float result printed.
+        let prog = lower(&format!(
+            "fn fma(a: f64, b: f64, c: f64) f64 {{ return a * b + c; }}\n{}",
+            main_io(
+                "const r = fma(2.0, 3.0, 1.0); \
+                 if (r > 6.5) { try o.print(\"big\\n\", .{}); } \
+                 else { try o.print(\"small\\n\", .{}); }"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_optional_coercion_from_computed_value() {
+        // `return n * 2` into a `?u32`: the computed scalar coerces to `Some(v)`.
+        let prog = lower(&format!(
+            "fn find(n: u32) ?u32 {{ if (n > 5) {{ return n * 2; }} return null; }}\n{}",
+            main_io(
+                "var total: u32 = 0; var i: u32 = 0; \
+                 while (i < 10) : (i += 1) { if (find(i)) |v| { total += v; } } \
+                 try o.print(\"total={d}\\n\", .{total});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    // ---- Clean-refusal (Unsupported) tests ----
+
+    #[test]
+    fn concurrency_program_refused() {
+        // A spawn/channel program is outside the native subset (the scheduler is
+        // v0.16): codegen must cleanly refuse, never miscompile.
+        let prog = lower(
+            "const std = @import(\"std\");\n\
+             fn work(x: u32) u32 { return x + 1; }\n\
+             pub fn main(sys: *System) !void { \
+                var ex = sys.concurrency.executor(); \
+                const t = ex.spawn(work, .{ @as(u32, 5) }); _ = t; }",
+        );
+        match crate::compile_program_to_elf(&prog) {
+            Err(crate::CodegenError::Unsupported(_)) => {}
+            Err(crate::CodegenError::NoMain) => panic!("expected Unsupported, got NoMain"),
+            Ok(_) => panic!("expected Unsupported, but codegen succeeded"),
+        }
+    }
+
+    /// Asserts native codegen cleanly REFUSES `prog` with an `Unsupported` error
+    /// (the in-subset-or-refuse invariant), never panicking or miscompiling.
+    fn assert_native_refused(prog: &MirProgram) {
+        match crate::compile_program_to_elf(prog) {
+            Err(crate::CodegenError::Unsupported(_)) => {}
+            Err(crate::CodegenError::NoMain) => panic!("expected Unsupported, got NoMain"),
+            Ok(_) => panic!("expected Unsupported, but codegen succeeded"),
+        }
+    }
+
+    // =====================================================================
+    //  v0.15 native-vs-VM differential regression tests. Each pins one of the
+    //  four review findings (128-bit arithmetic miscompile, the RCX
+    //  argument-clobber, the f64-constant stack-arg alias, and the VM
+    //  store-through-pointer `{d}` render bug).
+    // =====================================================================
+
+    // ---- Finding 1: 128-bit (i128/u128) two-limb arithmetic ----
+
+    #[test]
+    fn diff_i128_negation_prints_signed() {
+        // `const n: i128 = -5` was miscompiled to a 64-bit `neg`, printing the
+        // magnitude mod 2^64 (18446744073709551611) with the high limb stale at 0.
+        // The two-limb negation now prints `-5` on both backends.
+        let prog = lower(&main_io(
+            "const n: i128 = -5; try o.print(\"n={d}\\n\", .{n});",
+        ));
+        let code = assert_native_eq_vm(&prog);
+        assert_eq!(code, 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"n=-5\n");
+    }
+
+    #[test]
+    fn diff_i128_negation_large_magnitude() {
+        // A negative i128 literal larger than 2^64: native used to drop the sign
+        // and print the magnitude mod 2^64. Both backends now print the full value.
+        let prog = lower(&main_io(
+            "const neg: i128 = -123456789012345678901234567890; \
+             try o.print(\"{d}\\n\", .{neg});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"-123456789012345678901234567890\n");
+    }
+
+    #[test]
+    fn diff_u128_add_no_spurious_trap() {
+        // `u128::MAX(=2^64-1) + 1` used to PANIC natively (the @no_add_overflow
+        // check ran on the low 64 bits, which carried). The two-limb add + signed-
+        // i128 overflow check now agrees with the VM: no trap, result 2^64.
+        let prog = lower(&main_io(
+            "var a: u128 = 18446744073709551615; const c: u128 = a + 1; \
+             try o.print(\"c={d}\\n\", .{c});",
+        ));
+        let code = assert_native_eq_vm(&prog);
+        assert_eq!(code, 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"c=18446744073709551616\n");
+    }
+
+    #[test]
+    fn diff_i128_widening_cast_and_add() {
+        // `@as(i128, x)` of a 64-bit value then `w + w`: the widening cast must
+        // sign-extend into the high limb and the add must carry across limbs.
+        let prog = lower(&main_io(
+            "var x: i64 = 9000000000000000000; const w: i128 = @as(i128, x); \
+             const s: i128 = w + w; try o.print(\"s={d}\\n\", .{s});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"s=18000000000000000000\n");
+    }
+
+    #[test]
+    fn diff_i128_subtraction_two_limb() {
+        // A two-limb subtract with a borrow across the limb boundary.
+        let prog = lower(&main_io(
+            "var a: i128 = 5; var b: i128 = 100; const c: i128 = a - b; \
+             try o.print(\"{d}\\n\", .{c});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"-95\n");
+    }
+
+    #[test]
+    fn diff_u128_widen_from_u64_zero_extends() {
+        // A widening cast of an unsigned 64-bit value must ZERO-extend the high
+        // limb (not sign-extend), so a u64 with the top bit set stays positive.
+        let prog = lower(&main_io(
+            "var x: u64 = 18446744073709551615; const w: u128 = @as(u128, x); \
+             try o.print(\"{d}\\n\", .{w});",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"18446744073709551615\n");
+    }
+
+    #[test]
+    fn refuse_i128_multiply() {
+        // 128-bit multiply is not implemented; codegen must cleanly refuse (fall to
+        // the VM) rather than miscompile to a 64-bit `imul`.
+        let prog = lower(&main_io(
+            "var a: i128 = 1000000; var b: i128 = 1000000; const c: i128 = a * b; \
+             try o.print(\"{d}\\n\", .{c});",
+        ));
+        assert_native_refused(&prog);
+    }
+
+    #[test]
+    fn refuse_u128_divide() {
+        // 128-bit divide is not implemented; codegen must cleanly refuse.
+        let prog = lower(&main_io(
+            "var a: u128 = 1000000; var b: u128 = 7; const c: u128 = a / b; \
+             try o.print(\"{d}\\n\", .{c});",
+        ));
+        assert_native_refused(&prog);
+    }
+
+    // ---- Finding 2: SysV argument marshalling must not clobber RCX ----
+
+    #[test]
+    fn diff_call_arg4_in_rcx_not_clobbered_by_index() {
+        // A call with >=4 int args where a LATER argument indexes an array: the 4th
+        // integer arg lands in RCX, and the index scaling used to overwrite RCX
+        // (it scratched the scaled index there). With the index scratch moved to a
+        // non-argument register (R10), arg #4 survives — native must match the VM.
+        let prog = lower(&format!(
+            "fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64) i64 {{ return d; }}\n{}",
+            main_io(
+                "var arr: [3]i64 = [3]i64{ 11, 22, 33 }; \
+                 const r: i64 = f(0, 0, 0, 7, arr[0], arr[2]); \
+                 try o.print(\"d={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"d=7\n");
+    }
+
+    #[test]
+    fn diff_call_sums_with_indexed_args() {
+        // A broader version: the function actually uses every argument, several of
+        // which are array elements evaluated after the RCX slot is filled.
+        let prog = lower(&format!(
+            "fn g(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) i64 \
+                {{ return a + b + c + d + e + f; }}\n{}",
+            main_io(
+                "var arr: [4]i64 = [4]i64{ 100, 200, 300, 400 }; \
+                 const r: i64 = g(1, 2, 3, arr[0], arr[1], arr[3]); \
+                 try o.print(\"r={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 1+2+3+100+200+400 = 706.
+        assert_eq!(out, b"r=706\n");
+    }
+
+    // ---- Finding 3: f64 constant arg must not alias the outgoing-args area ----
+
+    #[test]
+    fn diff_f64_const_arg_with_stack_arg() {
+        // A 7-int-arg call (the 7th spills to [rsp+0]) plus an f64 CONSTANT arg in
+        // xmm0. The float-const materialization used to round-trip through [rsp+0],
+        // clobbering the spilled 7th integer argument. With `movq xmm, r64` (no
+        // memory) the stack arg survives — native must match the VM.
+        let prog = lower(&format!(
+            "fn f(i1: i64, i2: i64, i3: i64, i4: i64, i5: i64, i6: i64, i7: i64, a: f64) i64 \
+                {{ return i1 + i2 + i3 + i4 + i5 + i6 + i7 + @as(i64, @intFromFloat(a)); }}\n{}",
+            main_io(
+                "const r: i64 = f(1, 2, 3, 4, 5, 6, 7, 100.0); \
+                 try o.print(\"r={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 1+2+3+4+5+6+7 + 100 = 128.
+        assert_eq!(out, b"r=128\n");
+    }
+
+    #[test]
+    fn diff_f64_const_arg_with_memory_aggregate() {
+        // A >16-byte (MEMORY-class) aggregate passed by value lands at [rsp+0],
+        // together with an f64 constant arg — the same aliasing hazard, now fixed.
+        let prog = lower(&format!(
+            "const Big = struct {{ a: i64, b: i64, c: i64 }};\n\
+             fn f(v: Big, x: f64) i64 \
+                {{ return v.a + v.b + v.c + @as(i64, @intFromFloat(x)); }}\n{}",
+            main_io(
+                "const r: i64 = f(Big{ .a = 1, .b = 2, .c = 3 }, 100.0); \
+                 try o.print(\"r={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        // 1+2+3 + 100 = 106.
+        assert_eq!(out, b"r=106\n");
+    }
+
+    // ---- Finding 4: VM store-through-pointer then `{d}` (native already correct)
+
+    #[test]
+    fn diff_store_through_pointer_then_print_decimal() {
+        // `bump(&x)` mutates `x` through a `*i32`, then `x` is printed with `{d}`.
+        // The VM used to read the boxed pointer for the address-taken local and
+        // render `<int>`; native (reading the stack home) correctly prints 43. Both
+        // backends now agree on `x=43`.
+        let prog = lower(&format!(
+            "fn bump(p: *i32) void {{ p.* = p.* + 1; }}\n{}",
+            main_io("var x: i32 = 42; bump(&x); try o.print(\"x={d}\\n\", .{x});")
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+        let (_c, out, _e) = run_native(&prog);
+        assert_eq!(out, b"x=43\n");
     }
 }

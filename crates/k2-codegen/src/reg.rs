@@ -1,14 +1,13 @@
 //! The x86-64 general-purpose register file.
 //!
-//! v0.14 uses a deliberately tiny register discipline (correctness over speed —
-//! a real allocator is v0.15): every MIR local lives in an `[rbp - N]` stack
-//! slot, and the body computes through exactly two scratch registers,
-//! **RAX** (the primary accumulator / scratch-A) and **RCX** (scratch-B, also
-//! the shift-count register, which we exploit for `shl`/`shr`/`sar`). RDX is
-//! used transiently for `idiv` (the high half of the dividend / the remainder).
-//! RDI/RSI/RDX/RCX/R8/R9 are loaded only at SysV call sites, immediately before
-//! the `call`. RBX and R12–R15 are never touched, which sidesteps callee-saved
-//! bookkeeping entirely.
+//! v0.15 splits the file into fixed scratch and an allocatable pool. The lowering
+//! threads arithmetic operands through **RAX**/**RCX** (RCX also being the shift
+//! count) with **RDX** for `idiv`/remainder, and reserves **R11** as an address /
+//! `memcpy` / print-cursor scratch; **RDI/RSI/RDX/RCX/R8/R9** carry SysV call
+//! arguments and the print-render code freely clobbers the caller-saved set. The
+//! linear-scan allocator ([`crate::regalloc`]) assigns the **callee-saved** pool
+//! (`RBX`, `R12`–`R15`) to long-lived scalar locals, saving/restoring them once in
+//! the prologue/epilogue; values it cannot place spill to a stack home.
 //!
 //! The single fact this module encodes is the **register number** (`0..=15`)
 //! each register carries in the x86-64 instruction format. That number splits
@@ -23,13 +22,12 @@
 /// number, so [`Gpr::num`] is a free cast.
 // The full 16-register file is modeled so the encoder's REX.B extension logic
 // (`is_ext`/`low3`) is exercisable for every `r8`–`r15`, and so callers can name
-// any architectural register by number. v0.14's lowering only touches a handful
-// (RAX/RCX/RDX + the SysV arg registers + RSP/RBP), leaving the callee-saved
-// RBX/R10–R15 unused *by the lowering*; they remain part of the complete,
-// unit-tested register file. The `dead_code` allow documents that deliberate
-// completeness rather than masking an accident.
+// any architectural register by number. The lowering and the allocator together
+// touch most of the file; the `dead_code` allow covers the few enum variants
+// (e.g. `R10`) the current lowering never names by value, keeping the complete,
+// unit-tested register file intact rather than masking an accident.
 #[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Gpr {
     /// `rax` — register 0. The primary accumulator / scratch-A and the SysV
@@ -39,7 +37,7 @@ pub enum Gpr {
     Rcx = 1,
     /// `rdx` — register 2. The `idiv` high half / remainder; SysV arg 3.
     Rdx = 2,
-    /// `rbx` — register 3. Callee-saved; unused in v0.14.
+    /// `rbx` — register 3. Callee-saved; an allocatable vreg register.
     Rbx = 3,
     /// `rsp` — register 4. The stack pointer.
     Rsp = 4,
@@ -53,17 +51,17 @@ pub enum Gpr {
     R8 = 8,
     /// `r9` — register 9. SysV arg 6.
     R9 = 9,
-    /// `r10` — register 10. Callee-clobbered scratch; unused in v0.14.
+    /// `r10` — register 10. Caller-saved scratch.
     R10 = 10,
-    /// `r11` — register 11. Callee-clobbered scratch; unused in v0.14.
+    /// `r11` — register 11. The reserved address / memcpy / print-cursor scratch.
     R11 = 11,
-    /// `r12` — register 12. Callee-saved; unused in v0.14.
+    /// `r12` — register 12. Callee-saved; an allocatable vreg register.
     R12 = 12,
-    /// `r13` — register 13. Callee-saved; unused in v0.14.
+    /// `r13` — register 13. Callee-saved; an allocatable vreg register.
     R13 = 13,
-    /// `r14` — register 14. Callee-saved; unused in v0.14.
+    /// `r14` — register 14. Callee-saved; an allocatable vreg register.
     R14 = 14,
-    /// `r15` — register 15. Callee-saved; unused in v0.14.
+    /// `r15` — register 15. Callee-saved; an allocatable vreg register.
     R15 = 15,
 }
 
@@ -88,7 +86,99 @@ impl Gpr {
 }
 
 /// The System V AMD64 integer argument registers, in call order:
-/// `rdi, rsi, rdx, rcx, r8, r9`. The native backend supports calls of at most
-/// six integer arguments (the v0.14 corpus never exceeds one), so a callee's
-/// arguments are loaded directly into these registers with no stack spill.
+/// `rdi, rsi, rdx, rcx, r8, r9`. Arguments beyond the sixth integer go on the
+/// stack (the v0.15 backend handles `>6` args via the reserved outgoing-args
+/// region of the caller's frame).
 pub const ARG_REGS: [Gpr; 6] = [Gpr::Rdi, Gpr::Rsi, Gpr::Rdx, Gpr::Rcx, Gpr::R8, Gpr::R9];
+
+/// The integer registers the linear-scan allocator may assign to a vreg.
+///
+/// v0.15 allocates **only callee-saved** registers (`rbx`, `r12`–`r15`). They
+/// survive a `call`/`syscall` automatically (no per-call save/restore traffic),
+/// which keeps the allocator correctness-first: the lowering's scratch /
+/// print-render / `memcpy` code freely clobbers every caller-saved register
+/// (`rax`/`rcx`/`rdx`/`rsi`/`rdi`/`r8`–`r11`) without disturbing any vreg. A
+/// future milestone can widen this pool with spill-around-call logic for the
+/// caller-saved registers; here a value the allocator cannot place in a
+/// callee-saved register simply spills to a stack home.
+///
+/// Deliberately excluded: `rax`/`rcx`/`rdx` (fixed arithmetic/`idiv`/`shift`
+/// scratch), `rsi`/`rdi`/`r8`–`r11` (caller-saved scratch the render/`memcpy`
+/// code clobbers), and `rsp`/`rbp`.
+pub const ALLOC_REGS: [Gpr; 5] = [Gpr::Rbx, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15];
+
+/// `true` if `r` is a caller-saved (volatile) register — clobbered across a
+/// `call`/`syscall`, so a vreg living in one must be spilled around a call.
+pub fn is_caller_saved(r: Gpr) -> bool {
+    !matches!(
+        r,
+        Gpr::Rbx | Gpr::R12 | Gpr::R13 | Gpr::R14 | Gpr::R15 | Gpr::Rsp | Gpr::Rbp
+    )
+}
+
+/// An x86-64 SSE register (`xmm0`–`xmm15`). The discriminant IS the architectural
+/// register number, so the encoder reads `low3`/`is_ext` exactly as for [`Gpr`].
+#[allow(dead_code)] // The full 16-register file is modeled; the f64 lowering uses a subset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Xmm {
+    /// `xmm0` — SSE arg/return register 0.
+    Xmm0 = 0,
+    /// `xmm1`.
+    Xmm1 = 1,
+    /// `xmm2`.
+    Xmm2 = 2,
+    /// `xmm3`.
+    Xmm3 = 3,
+    /// `xmm4`.
+    Xmm4 = 4,
+    /// `xmm5`.
+    Xmm5 = 5,
+    /// `xmm6`.
+    Xmm6 = 6,
+    /// `xmm7` — the last SSE arg register.
+    Xmm7 = 7,
+    /// `xmm8`.
+    Xmm8 = 8,
+    /// `xmm9`.
+    Xmm9 = 9,
+    /// `xmm10`.
+    Xmm10 = 10,
+    /// `xmm11`.
+    Xmm11 = 11,
+    /// `xmm12`.
+    Xmm12 = 12,
+    /// `xmm13`.
+    Xmm13 = 13,
+    /// `xmm14`.
+    Xmm14 = 14,
+    /// `xmm15`.
+    Xmm15 = 15,
+}
+
+impl Xmm {
+    /// The architectural register number `0..=15`.
+    pub fn num(self) -> u8 {
+        self as u8
+    }
+    /// The low 3 bits (the ModRM `reg`/`rm` field).
+    pub fn low3(self) -> u8 {
+        self.num() & 0b111
+    }
+    /// `true` for `xmm8`–`xmm15` (needs a REX `R`/`B` extension bit).
+    pub fn is_ext(self) -> bool {
+        self.num() >= 8
+    }
+}
+
+/// The System V SSE argument/return registers, in call order: `xmm0`–`xmm7`.
+pub const SSE_ARG_REGS: [Xmm; 8] = [
+    Xmm::Xmm0,
+    Xmm::Xmm1,
+    Xmm::Xmm2,
+    Xmm::Xmm3,
+    Xmm::Xmm4,
+    Xmm::Xmm5,
+    Xmm::Xmm6,
+    Xmm::Xmm7,
+];
