@@ -150,3 +150,49 @@ impl RoData {
 pub fn compile_program_to_elf(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
     link::compile_program(prog)
 }
+
+/// Before/after code-size statistics for the machine-level peephole pass, used by
+/// the size-reduction test and the `k2c bench --native` report. The "before"
+/// figure is the `.text` size with the peephole forced *off* for the same program;
+/// the "after" figure is the shipped, peepholed size. The reduction is real and
+/// measured, never fabricated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodegenStats {
+    /// `.text` bytes with the peephole disabled.
+    pub text_bytes_before: usize,
+    /// `.text` bytes with the peephole enabled (the shipped image).
+    pub text_bytes_after: usize,
+}
+
+impl CodegenStats {
+    /// The number of `.text` bytes the peephole removed.
+    pub fn bytes_saved(&self) -> usize {
+        self.text_bytes_before.saturating_sub(self.text_bytes_after)
+    }
+
+    /// The percentage of `.text` the peephole removed (0.0 when there is none).
+    pub fn percent_saved(&self) -> f64 {
+        if self.text_bytes_before == 0 {
+            0.0
+        } else {
+            100.0 * self.bytes_saved() as f64 / self.text_bytes_before as f64
+        }
+    }
+}
+
+/// Compiles `prog` twice — once with the peephole disabled, once enabled — and
+/// returns the peepholed [`ElfImage`] alongside the [`CodegenStats`] comparing the
+/// two `.text` sizes. The peepholed image is byte-for-byte what
+/// [`compile_program_to_elf`] returns; this entry point exists so a caller can
+/// *report* the size reduction without changing the shipped output.
+pub fn compile_program_to_elf_stats(
+    prog: &MirProgram,
+) -> Result<(ElfImage, CodegenStats), CodegenError> {
+    let before = encode::with_peephole(false, || link::compile_program(prog))?;
+    let after = link::compile_program(prog)?;
+    let stats = CodegenStats {
+        text_bytes_before: before.text_len,
+        text_bytes_after: after.text_len,
+    };
+    Ok((after, stats))
+}

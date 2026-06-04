@@ -126,6 +126,10 @@ impl PanicInfo {
     }
 
     /// The human-readable panic message (without the `panic: ` prefix).
+    ///
+    /// Kept **byte-identical** to the native backend's `trap_message`
+    /// (`crates/k2-codegen/src/lower.rs`) so a trap prints the same text on both
+    /// backends. When changing a string here, update that table too.
     pub fn message(&self) -> String {
         let base = match self.reason {
             TrapReason::Bounds => "index out of bounds",
@@ -1045,16 +1049,28 @@ impl<'p> Vm<'p> {
     }
 
     /// Reads element `i` of a slice/array/string/heap pointer.
+    ///
+    /// In **ReleaseFast** the lowerer strips the explicit bounds-`Check`, so this
+    /// internal length test must match the native backend, which also emits no
+    /// check: an out-of-bounds index is undefined behavior on both, and neither
+    /// traps. The native backend reads adjacent stack (true garbage); the VM has no
+    /// such storage, so it CLAMPS the index to the last valid element (the
+    /// documented "ReleaseFast reads clamped" behavior) — a defined, non-trapping,
+    /// non-panicking value. This keeps `native == VM` for the only-observable
+    /// property of an OOB read in ReleaseFast (no trap, exit 0); the *value* of a
+    /// genuine OOB read is UB and need not (cannot) match byte-for-byte. In Debug /
+    /// ReleaseSafe the check is present and a real OOB still traps identically.
     fn index_of(&self, base: &Value, index: &Value) -> Result<Value, Halt> {
         let i = index.as_usize().unwrap_or(usize::MAX);
         match base {
-            Value::Array(elems) => elems
-                .get(i)
-                .cloned()
+            Value::Array(elems) => self
+                .index_clamped(i, elems.len())
+                .and_then(|j| elems.get(j).cloned())
                 .ok_or_else(|| self.bounds_panic(i, elems.len())),
             // Indexing a `[]const u8` string yields its `i`-th byte as a `u8`.
-            Value::Str(bytes) => bytes
-                .get(i)
+            Value::Str(bytes) => self
+                .index_clamped(i, bytes.len())
+                .and_then(|j| bytes.get(j))
                 .map(|&b| {
                     Value::int(
                         b as i128,
@@ -1065,23 +1081,28 @@ impl<'p> Vm<'p> {
                     )
                 })
                 .ok_or_else(|| self.bounds_panic(i, bytes.len())),
-            Value::Slice { ptr, len } => {
-                if i >= *len {
-                    return Err(self.bounds_panic(i, *len));
-                }
-                self.heap
-                    .load_index(*ptr, i)
-                    .map_err(|f| self.heap_panic(f))
-            }
+            Value::Slice { ptr, len } => match self.index_clamped(i, *len) {
+                Some(j) => self
+                    .heap
+                    .load_index(*ptr, j)
+                    .map_err(|f| self.heap_panic(f)),
+                None => Err(self.bounds_panic(i, *len)),
+            },
             Value::Ptr(p) => {
                 // A pointer-to-array used as a slice (e.g. `&arr` passed to a
                 // `[]T` parameter): index through the boxed array/allocation.
                 match self.heap.load(*p) {
-                    Ok(Value::Array(elems)) => elems
-                        .get(i)
-                        .cloned()
+                    Ok(Value::Array(elems)) => self
+                        .index_clamped(i, elems.len())
+                        .and_then(|j| elems.get(j).cloned())
                         .ok_or_else(|| self.bounds_panic(i, elems.len())),
-                    Ok(_) => self.heap.load_index(*p, i).map_err(|f| self.heap_panic(f)),
+                    Ok(_) => {
+                        let n = self.heap.len_of(*p).unwrap_or(0);
+                        match self.index_clamped(i, n) {
+                            Some(j) => self.heap.load_index(*p, j).map_err(|f| self.heap_panic(f)),
+                            None => Err(self.bounds_panic(i, n)),
+                        }
+                    }
                     Err(f) => Err(self.heap_panic(f)),
                 }
             }
@@ -1093,7 +1114,7 @@ impl<'p> Vm<'p> {
                         k2_types::ArrayLen::Known(n) => *n as usize,
                         _ => 0,
                     };
-                    if i >= n {
+                    if self.index_clamped(i, n).is_none() {
                         return Err(self.bounds_panic(i, n));
                     }
                     Ok(default_value(&self.prog.arena, *elem))
@@ -1101,6 +1122,23 @@ impl<'p> Vm<'p> {
                 _ => Err(self.internal("index of non-indexable value")),
             },
             _ => Err(self.internal("index of non-indexable value")),
+        }
+    }
+
+    /// Resolves an index against a container of length `len` into the in-bounds
+    /// element index to actually read/write. Returns `Some(i)` when `i < len`;
+    /// when `i >= len` it returns `None` in checked builds (the caller raises a
+    /// bounds panic) but, in **ReleaseFast** (`checks_off`), CLAMPS to `len - 1`
+    /// so an OOB access does not trap — matching the native backend, which strips
+    /// the bounds check entirely in ReleaseFast. An empty container has no valid
+    /// element to clamp to, so it always yields `None` (no defined read exists).
+    fn index_clamped(&self, i: usize, len: usize) -> Option<usize> {
+        if i < len {
+            Some(i)
+        } else if self.checks_off && len > 0 {
+            Some(len - 1)
+        } else {
+            None
         }
     }
 
@@ -1306,30 +1344,36 @@ impl<'p> Vm<'p> {
                 }
             }
             StoreStep::Index(reg) => {
+                // Mirror `index_of`: in ReleaseFast the bounds check is stripped, so
+                // an OOB store is clamped to the last element (defined, no trap)
+                // rather than panicking — matching the native backend.
                 let i = self.get(*reg).as_usize().unwrap_or(usize::MAX);
                 match slot {
                     Value::Array(elems) => {
                         let v = Rc::make_mut(elems);
                         let n = v.len();
-                        let target = v.get_mut(i).ok_or_else(|| self.bounds_panic(i, n))?;
+                        let j = self
+                            .index_clamped(i, n)
+                            .ok_or_else(|| self.bounds_panic(i, n))?;
+                        let target = &mut v[j];
                         self.store_into(target, rest, value)
                     }
                     Value::Slice { ptr, len } => {
-                        if i >= *len {
-                            return Err(self.bounds_panic(i, *len));
-                        }
+                        let j = self
+                            .index_clamped(i, *len)
+                            .ok_or_else(|| self.bounds_panic(i, *len))?;
                         if rest.is_empty() {
                             self.heap
-                                .store_index(*ptr, i, value)
+                                .store_index(*ptr, j, value)
                                 .map_err(|f| self.heap_panic(f))
                         } else {
                             let mut inner = self
                                 .heap
-                                .load_index(*ptr, i)
+                                .load_index(*ptr, j)
                                 .map_err(|f| self.heap_panic(f))?;
                             self.store_into(&mut inner, rest, value)?;
                             self.heap
-                                .store_index(*ptr, i, inner)
+                                .store_index(*ptr, j, inner)
                                 .map_err(|f| self.heap_panic(f))
                         }
                     }

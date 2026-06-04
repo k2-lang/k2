@@ -1819,3 +1819,70 @@ fn lsp_scripted_session_over_stdio() {
         "formatting edit present: {stdout}"
     );
 }
+
+// =========================================================================
+//  v0.17 — driver-level acceptance: run-native (every mode) == run (VM)
+// =========================================================================
+
+/// Runs `k2c` with `args` and returns `(exit_code, raw_stdout, raw_stderr)`. Passes
+/// a real file path (no stdin), so the child's exit code and byte-exact streams are
+/// captured for the differential comparison.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_native_cli(args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
+    let out = k2c().args(args).output().unwrap();
+    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
+}
+
+/// **HARD ACCEPTANCE**: `k2c run-native` in `--debug`, `--release-safe`, and
+/// `--release-fast` produces stdout + exit byte-identical to `k2c run` (the VM) in
+/// the same mode, and identical to native `--debug`, for hello/errors/allocators.
+/// This is the literal milestone criterion, asserted by running real binaries.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn run_native_matches_vm_in_every_mode() {
+    for example in ["hello", "errors", "allocators"] {
+        let path = examples_dir().join(format!("{example}.k2"));
+        let path = path.to_str().unwrap();
+
+        // The VM reference (Debug); the program is deterministic, so the VM output
+        // is the same across modes for these non-trapping examples.
+        let (vm_code, vm_out, _vm_err) = run_native_cli(&["run", path]);
+        let (nd_code, nd_out, _nd_err) = run_native_cli(&["run-native", "--debug", path]);
+
+        for mode in ["--debug", "--release-safe", "--release-fast"] {
+            let (vc, vout, _ve) = run_native_cli(&["run", mode, path]);
+            let (nc, nout, _ne) = run_native_cli(&["run-native", mode, path]);
+
+            // native(mode) == VM(mode).
+            assert_eq!(
+                nout, vout,
+                "[{example} {mode}] native stdout must equal VM stdout"
+            );
+            assert_eq!(nc, vc, "[{example} {mode}] native exit must equal VM exit");
+
+            // native(mode) == native(Debug) == VM(Debug): these examples do not
+            // trap, so optimization is fully behavior-preserving across modes.
+            assert_eq!(
+                nout, nd_out,
+                "[{example} {mode}] native release stdout must equal native Debug"
+            );
+            assert_eq!(nout, vm_out, "[{example} {mode}] native must equal the VM");
+            let _ = (nd_code, vm_code);
+        }
+    }
+}
+
+/// The `bench` subcommand prints the native-vs-VM speedup line. A light smoke test
+/// that the harness runs end-to-end and reports a speedup (the non-flaky numeric
+/// floor lives in the codegen test `native_is_much_faster_than_vm`).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn bench_native_reports_speedup() {
+    let out = k2c().args(["bench", "--native"]).output().unwrap();
+    assert!(out.status.success(), "bench --native should succeed");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("speedup") && stdout.contains("faster than the VM"),
+        "bench --native must report the native-vs-VM speedup, got:\n{stdout}"
+    );
+}

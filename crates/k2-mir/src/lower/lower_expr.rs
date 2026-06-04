@@ -376,11 +376,37 @@ impl FnBuilder<'_, '_> {
         }
     }
 
+    /// The effective type to drive an `&operand` (`AddrOf`) lowering. The checker
+    /// types the address expression by its *natural* address (`*[N]T` for `&array`,
+    /// `*T` for `&local`), losing the array→slice coercion that the surrounding
+    /// context requests. When the destination is a bare local whose declared type
+    /// is a `Slice`, that slice type is the real target — return it so `&array`
+    /// produces a fat `{ptr, len}` slice (`MakeSlice`) rather than a single pointer.
+    /// Otherwise fall back to the expression's own type at `span`.
+    fn addr_of_target_ty(&self, dst: &Place, span: Span) -> TypeId {
+        if dst.proj.is_empty() {
+            let dty = self.func.locals[dst.base.index()].ty;
+            if matches!(self.lo.typed.arena.get(dty), Type::Slice { .. }) {
+                return dty;
+            }
+        }
+        self.type_at(span)
+    }
+
     /// Lowers a unary operation into `dst`.
     fn lower_unary_into(&mut self, dst: Place, op: AstUnOp, operand: &Expr, span: Span) {
         match op {
             AstUnOp::AddrOf => {
-                let ty = self.type_at(span);
+                // The type of the `&operand` expression itself. The checker records
+                // this as the *natural* address type (`*[N]T` for `&array`), even
+                // when the value is being coerced into a slice parameter/destination
+                // — the slice-ness lives only in the DESTINATION's type. So prefer
+                // the destination local's type when it is a `Slice`: a bare
+                // `&array` passed to a `[]T` parameter must materialize a real fat
+                // `{ptr, len}` slice (a `MakeSlice`), not a single pointer the native
+                // backend would marshal as one register and then read a garbage
+                // `.len` from (yielding e.g. a `for (xs) |x|` loop that sums to 0).
+                let ty = self.addr_of_target_ty(&dst, span);
                 // `&.{}` — the canonical empty slice (`&[0]T` coerced to `[]T`).
                 // It points at no storage, so it is the empty-slice literal, not
                 // a reference to a stack temporary.
@@ -955,10 +981,32 @@ impl FnBuilder<'_, '_> {
         );
     }
 
-    /// The parameter types of a monomorphized callee (from its lowered locals).
+    /// The parameter types of a monomorphized callee.
+    ///
+    /// When the callee is already lowered, its locals carry the resolved param
+    /// types directly. But `enqueue` only RESERVES a placeholder (empty `params`,
+    /// empty `locals`) and defers the body to the worklist, so a forward/recursive
+    /// reference — the common `main` calls `sumArr` before `sumArr` is lowered —
+    /// sees no params and would mistype every argument by its own expression type.
+    /// That mistypes a `&array` argument passed to a `[]T` parameter as `*[N]T`
+    /// (a single pointer) instead of a fat `{ptr, len}` slice, so the native
+    /// backend marshals one register and the callee reads a garbage `.len`. To be
+    /// robust against lowering order, resolve the param types from the callee's AST
+    /// signature (via `param_type`) when its lowered locals are not yet present.
     fn callee_param_types(&self, fid: FnId) -> Vec<TypeId> {
         let f = &self.lo.funcs[fid.index()];
-        f.params.iter().map(|p| f.locals[p.index()].ty).collect()
+        if !f.params.is_empty() {
+            return f.params.iter().map(|p| f.locals[p.index()].ty).collect();
+        }
+        // Not yet lowered: derive the param types from the AST signature.
+        let inst = f.inst.clone();
+        if let Some(Item::Fn { params, .. }) = self.lo.fn_items.get(&inst.fn_def) {
+            return params
+                .iter()
+                .map(|p| self.lo.param_type(&inst, p))
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Resolves a direct/method call to a monomorphized [`FnId`], returning the

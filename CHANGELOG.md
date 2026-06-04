@@ -12,6 +12,44 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **Native optimization + machine-level peephole + native-vs-VM benchmark
+  (v0.17).** The MIR optimizer is now wired into the native pipeline:
+  `k2c run-native`/`build-native` honor `--debug` (unopt, checks on),
+  `--release-safe` (opt + checks kept), and `--release-fast` (opt + checks
+  stripped at lowering) exactly like the VM path — the optimizer runs on the MIR
+  *before* native lowering, and the native output is unchanged by optimization
+  (differential: native-opt == native-unopt == VM, same stdout + exit, verified
+  by running the emitted binaries). Wiring the optimizer in exposed a real
+  miscompile that the old `OptLevel::None`-only native tests could not see —
+  copy/const propagation folds a string constant inline into a print tuple
+  (`Tuple { str#1, … }`), and the deferred-aggregate lowering mis-typed the bare
+  `Const::Str` field as the surrounding tuple type and routed it to the scalar
+  `const_to`, which rejected it (`non-scalar constant Str(..)`). Fixed by typing a
+  string-constant aggregate field as the canonical `[]const u8` slice in both the
+  lowering (`build_aggregate`) and the register allocator's synthetic layout
+  (`operand_decl_type`), so it flows through the existing slice-const store path.
+  - A **machine-level peephole pass** over the emitted instruction stream: the
+    encoder records a lightweight `ITag` classification per instruction, and a
+    fixpoint pass deletes redundant reg-reg self-moves, folds `mov r, 0` into
+    `xor r, r` when the flags are provably dead, removes dead register stores,
+    collapses jump-to-next (fall-through) branches, and threads jump-to-jump
+    forwarding blocks — then re-serializes, re-deriving every fixup/label offset
+    so deletion is just "drop an instruction". Unrecognized instructions are
+    opaque barriers across which no rule reasons, making the pass
+    behavior-preserving by construction (and verified differentially). It shrinks
+    `.text` by ~1–2% on the runtime-heavy corpus (e.g. 361 bytes / 1.7% on
+    `errors`) with byte-identical behavior.
+  - A **native benchmark** (`k2c bench --native`, also appended to the default
+    `k2c bench`) compiles the compute kernels to a native ReleaseFast ELF and
+    measures **wall-clock** native (process exec, best-of-5) vs the VM (in-process,
+    best-of-5) on the *same* optimized MIR, asserts their stdout/exit agree, and
+    reports the speedup. The committed `bench/native_baseline.md` records the
+    measured numbers; the CI gate is a non-flaky conservative `>= 5x` floor
+    (`native_is_much_faster_than_vm`), with the real measured margin many times
+    larger. ReleaseFast safety-check stripping stays correct: a `u8` overflow that
+    traps in Debug native (exit 134) is absent in ReleaseFast native (wraps,
+    exit 0), matching the VM in each mode.
+
 - **Language design.** The full specification of k2 — *Kardashev Type II:
   total control over the machine, with zero waste* — a systems language that
   takes Zig's design philosophy (no hidden control flow, no hidden allocation,
@@ -215,6 +253,72 @@ is being designed in the open and nothing is stable yet.
 
 ### Fixed
 
+- **Native miscompile: `for (slice) |x|` over a slice parameter summed to 0
+  (v0.17 review #1).** A `&array` argument passed to a `[]const u32` parameter was
+  typed by the checker as `*[N]T` and lowered as a single pointer (`OneInt`), but
+  the callee's slice parameter is a fat `{ptr, len}` two-eightbyte value — so the
+  native backend marshalled one register and the callee read a garbage `.len`,
+  making `for (xs) |x| total += x;` loop zero times (`sum=0`) on native in every
+  mode while the VM computed the real sum. Root-fixed in the MIR: the `&array`→slice
+  coercion now emits a `MakeSlice` whenever the *destination* type is a slice
+  (`lower_unary_into`'s `AddrOf` now prefers the destination local's slice type over
+  the address expression's own `*[N]T`), and `callee_param_types` resolves the
+  callee's parameter types from its AST signature when the callee is not yet
+  lowered (forward/recursive calls), so the argument temp is correctly slice-typed.
+  Both backends now see a real fat slice; `for`-over-slice value capture (and the
+  `for (xs, 0..) |x, i|` value+index form, and `for`-over-array) yield `sum=100`
+  native == VM in all modes. `bench/bench_slice_sum.k2` is re-included in the native
+  bench differential gate (`native_bench_files`) so any future native≠VM slice
+  divergence aborts the bench; its baseline instruction counts were regenerated.
+- **Optimization-induced native divergence: const-folded integer printed with
+  `{d}`/`{x}`/… refused in release modes (v0.17 review #2).** Constant folding
+  collapsed a typed integer expression (e.g. a negative literal `const c: i64 = -7`)
+  into an inline `Const::Int` whose *type* stayed `comptime_int` even though its
+  value was masked to the sized destination, and the native print formatter only
+  accepted `Type::Int`/`Bool`/`Deferred` — so the same program that ran in Debug
+  native and on the VM failed to compile in `--release-safe`/`--release-fast` native
+  (exit 1 "decimal format of a non-integer field"), an opt-vs-unopt native
+  divergence. Fixed on both sides: the optimizer (`consts.rs`) now stamps a folded
+  constant with the *sized* destination type when its result type is `comptime_int`
+  (new `stamp_ty`, applied in `fold_unary`/`fold_binary`), and the native print
+  renderers (`render_decimal/radix/char/default_field`) treat `Type::ComptimeInt`
+  as a word-sized integer as defence-in-depth. A negative constant — and any
+  const-foldable integer expression — printed with every integer verb now produces
+  byte-identical output in all native modes == VM.
+- **Unsound machine-level peephole: `mov r,0` → `xor r,r` across a live-flag
+  block edge (v0.17 review #3).** The rule's flag-liveness check scanned only to
+  the end of the current basic block and treated an unconditional `jmp`, a `label`,
+  and the end of the function as proof the flags were dead — ignoring flags that are
+  *live-out* across a jump to a successor block that opens with a `jcc`/`setcc`/`adc`.
+  A `cmp; mov r,0; jmp L; … L: jcc` shape would rewrite the `mov` to an `xor` that
+  clobbers the still-live flags, so the `jcc` branched on garbage (a latent
+  miscompile, masked only by an unchecked front-end invariant). The rule is now
+  sound by construction: it fires only when a flag-CLOBBERING instruction provably
+  executes within the *same block* before any flag reader or block-exit edge
+  (`flags_clobbered_before_use_in_block`); a `jmp`/`label`/end-of-function ends the
+  window UNSAFE. This makes the rewrite fire rarely (the `mov r,0; …; call|ret|xor`
+  shapes), which is the right trade — correctness over the tiny size win. The
+  misleading "a call clobbers flags" comment is corrected: `CALL` preserves
+  `EFLAGS`; the callee clobbers them by the SysV ABI.
+- **ReleaseFast bounds-check stripping diverged native vs VM (v0.17 review #4).**
+  An out-of-bounds index in `--release-fast` stripped the bounds check on native
+  (reads OOB, exit 0) but the VM still kept its internal length test and *panicked*
+  (exit 134), so `native == VM` did not hold per-mode for an OOB program. The VM
+  now also strips the bounds check in ReleaseFast — an OOB index is clamped to the
+  last element (a defined, non-trapping value), matching the documented "ReleaseFast
+  reads clamped" semantics and the native backend's no-trap behavior. Both backends
+  now exit 0 without panicking on an OOB access in ReleaseFast; Debug/ReleaseSafe
+  still trap identically (134). Note: a genuine out-of-bounds *read* is undefined
+  behavior — native reads adjacent stack (true garbage) while the VM yields the
+  clamped element, so the *value* is backend-divergent and need not match; only the
+  observable trap/exit behavior is now symmetric.
+- **Native vs VM trap message text mismatch (v0.17 review #5).** The two
+  trap-message tables disagreed on wording (native "negation overflow" /
+  "cast truncates value" vs VM "negation of minimum integer" / "cast truncated
+  value"), so a trap printed different stderr text on each backend even though exit
+  codes matched. The native `trap_message` (`lower.rs`) is now byte-identical to the
+  VM's `PanicInfo::message` (`vm.rs`) for every trap reason; a cross-referencing
+  comment on both tables keeps them in lockstep.
 - **Native heap: `realloc`/`free` + `deinit` teardown SIGSEGV (v0.16
   blocker).** A non-null `realloc` (or a `free`) through a TRACKED allocator
   (`GeneralPurposeAllocator` / `ArenaAllocator`) `munmap`-ed the old block

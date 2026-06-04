@@ -365,6 +365,33 @@ pub fn main(sys: *System) !void {
     assert_eq!(out, "x = 4\n");
 }
 
+#[test]
+fn release_fast_drops_bounds_check() {
+    // An out-of-bounds index in ReleaseFast must NOT trap on the VM — the bounds
+    // check is stripped, matching the native backend (which also strips it and
+    // reads OOB without trapping). The VM clamps the read to the last element
+    // (a defined, non-panicking value); the exact value of an OOB read is UB and
+    // need not match native byte-for-byte, but the no-trap / exit-0 behavior must.
+    // (In Debug this same program traps with `index out of bounds` — see
+    // `trap_index_out_of_bounds` — so the strip is mode-specific, not a removal of
+    // the check everywhere.)
+    let src = r#"
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const a = [_]u32{ 10, 20, 30, 40 };
+    var i: usize = 9;
+    const x = a[i];
+    try out.print("done {d}\n", .{x});
+}
+"#;
+    let (out, _err, outcome, code) = run_mode(src, BuildMode::ReleaseFast);
+    assert_eq!(outcome, RunOutcome::Ok, "OOB must not trap in ReleaseFast");
+    assert_eq!(code, 0, "ReleaseFast OOB exits 0 (no bounds trap)");
+    // Clamped to the last element (40); the value is defined and the program runs
+    // to completion instead of panicking.
+    assert_eq!(out, "done 40\n");
+}
+
 // =========================================================================
 //  Regression tests for the v0.8 review findings.
 // =========================================================================

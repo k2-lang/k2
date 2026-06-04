@@ -1610,15 +1610,31 @@ fn cmd_lsp(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_bench(args: &[String]) -> Result<ExitCode, String> {
     let mut files: Vec<String> = Vec::new();
     let mut emit_baseline = false;
+    let mut native_only = false;
+    let mut emit_report = false;
     for arg in args {
         match arg.as_str() {
             "--emit-baseline" => emit_baseline = true,
+            // `--native` runs *only* the native-vs-VM wall-clock harness;
+            // `--emit-report` additionally regenerates the committed markdown report.
+            "--native" => native_only = true,
+            "--emit-report" => {
+                native_only = true;
+                emit_report = true;
+            }
             other if other.starts_with("--") => {
                 return Err(format!("unknown `bench` flag `{other}`"));
             }
             other => files.push(other.to_string()),
         }
     }
+
+    // The native wall-clock benchmark: compile the compute kernels to a native
+    // ReleaseFast ELF and time them against the VM running the same optimized MIR.
+    if native_only {
+        return run_native_bench(emit_report);
+    }
+
     // Default corpus: the committed bench/*.k2 next to this crate.
     if files.is_empty() {
         files = default_bench_files();
@@ -1683,7 +1699,296 @@ fn cmd_bench(args: &[String]) -> Result<ExitCode, String> {
         "# ReleaseFast executed {:.1}% fewer instructions than Debug across the suite.",
         reduction
     );
+
+    // Append the native-vs-VM wall-clock comparison so the default `bench` also
+    // reports the real native speedup. It is only meaningful where the emitted ELF
+    // can execute (x86_64 Linux); elsewhere a note is printed instead.
+    println!();
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        if let Err(e) = run_native_bench(false) {
+            // A native-bench failure must not mask the instruction-count results;
+            // report it and continue with a success exit (the deterministic table
+            // above is the committed metric).
+            let _ = writeln!(io::stderr(), "{PROG}: warning: native bench skipped: {e}");
+        }
+    } else {
+        println!("# native-vs-VM wall-clock bench: skipped (requires an x86_64 Linux host).");
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One native-vs-VM wall-clock measurement for a single compute kernel.
+struct NativeBench {
+    /// The kernel's display name.
+    name: String,
+    /// Best-of-N native process wall time (microseconds).
+    native_us: u128,
+    /// Best-of-N in-process VM wall time (microseconds).
+    vm_us: u128,
+    /// `.text` bytes with the peephole disabled.
+    text_before: usize,
+    /// `.text` bytes with the peephole enabled (the shipped image).
+    text_after: usize,
+}
+
+impl NativeBench {
+    /// The wall-clock speedup (VM time / native time).
+    fn speedup(&self) -> f64 {
+        if self.native_us == 0 {
+            0.0
+        } else {
+            self.vm_us as f64 / self.native_us as f64
+        }
+    }
+    /// The peephole `.text` reduction percentage.
+    fn peephole_pct(&self) -> f64 {
+        if self.text_before == 0 {
+            0.0
+        } else {
+            100.0 * (self.text_before - self.text_after) as f64 / self.text_before as f64
+        }
+    }
+}
+
+/// The compute kernels timed by the native-vs-VM benchmark. All are in the native
+/// subset and finish comfortably on the VM (well under its 200M-step budget and 5s
+/// wall guard), so the same optimized MIR runs on both backends.
+fn native_bench_files() -> Vec<String> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/bench");
+    // `bench_slice_sum` is included so the `for (xs) |x|` over-a-slice value
+    // capture is gated native-vs-VM (it once silently summed to 0 on native — a
+    // pointer-to-array passed to a `[]T` parameter was marshalled as a single
+    // register, so the callee read a garbage `.len`). The other kernels are the
+    // fib/loop compute kernels that headline the speedup table.
+    [
+        "bench_fib_rec_native",
+        "bench_fib_rec",
+        "bench_loop_sum",
+        "bench_slice_sum",
+    ]
+    .iter()
+    .map(|n| format!("{dir}/{n}.k2"))
+    .collect()
+}
+
+/// The number of timed repetitions; the *minimum* elapsed time is reported (min
+/// rejects scheduler noise and is the most reproducible "how fast can this run").
+const NATIVE_BENCH_REPS: u32 = 5;
+
+/// Runs the native-vs-VM wall-clock benchmark over the compute kernels, printing a
+/// human-readable table and (when `emit_report`) regenerating the committed
+/// `bench/native_baseline.md`. Each kernel is compiled once to a native
+/// ReleaseFast ELF, executed `NATIVE_BENCH_REPS` times (min wall), and compared
+/// against the same optimized MIR run in-process on the VM the same number of
+/// times. Native and VM stdout/exit are asserted identical — a divergence is a
+/// miscompile and aborts the bench.
+fn run_native_bench(emit_report: bool) -> Result<ExitCode, String> {
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return Err("the native bench requires an x86_64 Linux host to execute the ELF".into());
+    }
+    let mut results: Vec<NativeBench> = Vec::new();
+    for file in native_bench_files() {
+        results.push(measure_native_vs_vm(&file)?);
+    }
+
+    println!(
+        "{:<26} {:>12} {:>12} {:>10} {:>16}",
+        "native bench", "native(ms)", "vm(ms)", "speedup", "peephole .text"
+    );
+    println!("{}", "-".repeat(80));
+    for r in &results {
+        println!(
+            "{:<26} {:>12.3} {:>12.3} {:>9.1}x {:>9} -> {:<5}",
+            r.name,
+            r.native_us as f64 / 1000.0,
+            r.vm_us as f64 / 1000.0,
+            r.speedup(),
+            r.text_before,
+            r.text_after,
+        );
+    }
+    println!("{}", "-".repeat(80));
+    if let Some(best) = results.iter().max_by(|a, b| {
+        a.speedup()
+            .partial_cmp(&b.speedup())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        println!(
+            "# native is up to {:.1}x faster than the VM (best: {}); \
+             wall-clock is best-of-{} on x86_64-linux.",
+            best.speedup(),
+            best.name,
+            NATIVE_BENCH_REPS
+        );
+    }
+
+    if emit_report {
+        write_native_report(&results)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Measures one kernel: compiles to a native ReleaseFast ELF (capturing the
+/// peephole size reduction), times the native binary and the in-process VM
+/// best-of-N, and asserts their stdout/exit agree.
+fn measure_native_vs_vm(file: &str) -> Result<NativeBench, String> {
+    let source = fs::read_to_string(file).map_err(|e| format!("reading `{file}`: {e}"))?;
+    let name = bench_name(file);
+
+    // Lower + optimize under ReleaseFast (the same path `run-native --release-fast`
+    // uses), then build the ELF and capture the peephole size statistics.
+    let prog = lower_to_opt_mir(&source, file, BuildMode::ReleaseFast)?;
+    let (img, stats) = k2_codegen::compile_program_to_elf_stats(&prog)
+        .map_err(|e| format!("native backend: {e} (kernel {name} is outside the native subset)"))?;
+
+    // The expected output + exit, from the VM running the same optimized MIR.
+    let (vm_outcome, vm_code, vm_out, _vm_err, _count) = run_metered(&prog);
+    let _ = matches!(vm_outcome, RunOutcome::Ok);
+
+    // Write the ELF once, make it executable, then exec it best-of-N.
+    let tmp = native_temp_path();
+    fs::write(&tmp, &img.bytes).map_err(|e| format!("writing temp ELF: {e}"))?;
+    set_executable(&tmp);
+
+    let mut native_min = u128::MAX;
+    let mut native_out: Vec<u8> = Vec::new();
+    let mut native_code: i32 = 0;
+    for _ in 0..NATIVE_BENCH_REPS {
+        let (us, code, out) = time_native_exec(&tmp)?;
+        if us < native_min {
+            native_min = us;
+        }
+        native_out = out;
+        native_code = code;
+    }
+    let _ = fs::remove_file(&tmp);
+
+    // The differential gate: native must reproduce the VM's stdout + exit. A
+    // divergence is a miscompile (mirrors `bench_one`), so abort the whole bench.
+    if native_out != vm_out || native_code != vm_code {
+        return Err(format!(
+            "MISCOMPILE in {name}: native output/exit differs from the VM\n  \
+             vm    =({vm_code}) {:?}\n  native=({native_code}) {:?}",
+            String::from_utf8_lossy(&vm_out),
+            String::from_utf8_lossy(&native_out),
+        ));
+    }
+
+    // Time the in-process VM best-of-N on the same optimized MIR.
+    let mut vm_min = u128::MAX;
+    for _ in 0..NATIVE_BENCH_REPS {
+        let t0 = std::time::Instant::now();
+        let _ = run_metered(&prog);
+        let us = t0.elapsed().as_micros();
+        if us < vm_min {
+            vm_min = us;
+        }
+    }
+
+    Ok(NativeBench {
+        name,
+        native_us: native_min,
+        vm_us: vm_min,
+        text_before: stats.text_bytes_before,
+        text_after: stats.text_bytes_after,
+    })
+}
+
+/// Executes a native ELF once and returns `(elapsed_us, exit_code, stdout)`. The
+/// ETXTBSY retry mirrors `run-native`/the codegen test harness: a freshly-written,
+/// not-yet-flushed executable can transiently fail to exec.
+fn time_native_exec(path: &Path) -> Result<(u128, i32, Vec<u8>), String> {
+    let mut attempt = 0;
+    loop {
+        let t0 = std::time::Instant::now();
+        match std::process::Command::new(path).output() {
+            Ok(out) => {
+                let us = t0.elapsed().as_micros();
+                let code = native_exit_code(&out.status);
+                return Ok((us, code, out.stdout));
+            }
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("executing native ELF: {e}")),
+        }
+    }
+}
+
+/// Lowers `source` to a verified, optimized [`MirProgram`] under `mode` (the same
+/// front-end + optimizer path the driver's run/native commands use), returning a
+/// human-readable error on any front-end failure.
+fn lower_to_opt_mir(source: &str, label: &str, mode: BuildMode) -> Result<MirProgram, String> {
+    let pres = parse_program(source);
+    if !pres.is_ok() {
+        return Err(format!("{label}: parse errors"));
+    }
+    let resolved = resolve_file(&pres.file);
+    if !resolved.is_ok() {
+        return Err(format!("{label}: resolution errors"));
+    }
+    let typed = check_file(&pres.file, &resolved);
+    if !typed.is_ok() {
+        return Err(format!("{label}: type errors"));
+    }
+    let mut prog = lower_program(&pres.file, &resolved, typed, mode)
+        .map_err(|_| format!("{label}: lowering failed"))?;
+    if !prog.is_ok() {
+        return Err(format!("{label}: lowering had errors"));
+    }
+    run_optimizer(&mut prog, mode, false)?;
+    let problems = prog.verify();
+    if !problems.is_empty() {
+        return Err(format!("{label}: optimizer produced malformed MIR"));
+    }
+    Ok(prog)
+}
+
+/// Regenerates the committed `bench/native_baseline.md` from freshly-measured
+/// numbers. Every figure in the file is measured here, never hand-written.
+fn write_native_report(results: &[NativeBench]) -> Result<(), String> {
+    let mut md = String::new();
+    md.push_str("# k2 native-vs-VM benchmark baseline\n\n");
+    md.push_str("Host: x86_64-linux. Wall-clock is **best-of-");
+    md.push_str(&NATIVE_BENCH_REPS.to_string());
+    md.push_str(
+        "** (the minimum elapsed time rejects scheduler noise and is the most \
+         reproducible statistic). These numbers are *measured*, regenerated with \
+         `k2c bench --emit-report`, and will vary run-to-run; the CI gate is the \
+         conservative `>= 5x` speedup floor in the test suite, **not** these exact \
+         values. Native time includes a fixed process-spawn/startup cost, so the \
+         pure-compute ratio is higher still.\n\n",
+    );
+    md.push_str(
+        "| kernel | native (ms) | vm (ms) | speedup | peephole .text (bytes) | reduction |\n",
+    );
+    md.push_str("|---|---:|---:|---:|---:|---:|\n");
+    for r in results {
+        md.push_str(&format!(
+            "| `{}` | {:.3} | {:.3} | {:.1}x | {} -> {} | {:.1}% |\n",
+            r.name,
+            r.native_us as f64 / 1000.0,
+            r.vm_us as f64 / 1000.0,
+            r.speedup(),
+            r.text_before,
+            r.text_after,
+            r.peephole_pct(),
+        ));
+    }
+    md.push('\n');
+    md.push_str(
+        "The peephole pass (redundant self-moves, dead stores, `mov r,0`->`xor`, \
+         jump-to-next/jump-to-jump) shrinks `.text` while leaving behavior \
+         byte-identical (verified differentially: native-opt == native-unopt == \
+         VM). The speedup is the headline result: native executes the same program \
+         many times faster than the bytecode VM.\n",
+    );
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/native_baseline.md");
+    fs::write(path, md).map_err(|e| format!("writing {path}: {e}"))?;
+    let _ = writeln!(io::stderr(), "wrote {path}");
+    Ok(())
 }
 
 /// Benchmarks a single program: lowers + runs it under all three modes, asserts

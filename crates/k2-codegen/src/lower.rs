@@ -1706,7 +1706,23 @@ impl<'p> FnLower<'p> {
             };
             let field_tys: Vec<TypeId> = fields
                 .iter()
-                .map(|f| elem_ty.or_else(|| self.operand_type(f)).unwrap_or(ty))
+                .map(|f| {
+                    // A bare string-constant field has no `operand_type` (it is an
+                    // inline `Const::Str`, not a typed local), so the
+                    // `.unwrap_or(ty)` fallback would mis-type it as the *aggregate*
+                    // type and route it to the scalar `const_to`, which rejects a
+                    // string constant ("non-scalar constant Str(..)"). Copy/const
+                    // propagation only newly produces this shape under the optimizer
+                    // (e.g. a folded `const star = "Sol"` inlined into a print
+                    // tuple), which is exactly why the unoptimized native tests never
+                    // saw it. Type it as the canonical `[]const u8` slice so the
+                    // existing `store_field_operand` slice-const path handles it —
+                    // the same code the layoutable-aggregate case already uses.
+                    if matches!(f, Operand::Const(Const::Str(_))) {
+                        return self.prog.arena.t_str();
+                    }
+                    elem_ty.or_else(|| self.operand_type(f)).unwrap_or(ty)
+                })
                 .collect();
             let (_, _, offs) = regalloc::packed_layout(&self.prog.arena, &field_tys);
             for (i, f) in fields.iter().enumerate() {
@@ -3772,7 +3788,14 @@ impl<'p> FnLower<'p> {
         radix: u64,
         upper: bool,
     ) -> Result<(), CodegenError> {
-        if !matches!(self.prog.arena.get(fty), Type::Int { .. } | Type::Bool) {
+        // `ComptimeInt` reaches here when const-fold inlines a comptime-typed
+        // integer into a `{x}`/`{b}`/`{o}` field; it is stored word-sized, so it
+        // formats like any 64-bit integer (the width-0 path below skips masking,
+        // rendering the full word magnitude — matching the VM's comptime radix).
+        if !matches!(
+            self.prog.arena.get(fty),
+            Type::Int { .. } | Type::Bool | Type::ComptimeInt
+        ) {
             return Err(self.unsup("radix format of a non-integer field"));
         }
         if self.layout(fty).size > 8 {
@@ -3853,7 +3876,12 @@ impl<'p> FnLower<'p> {
         foff: u64,
         fty: TypeId,
     ) -> Result<(), CodegenError> {
-        if !matches!(self.prog.arena.get(fty), Type::Int { .. }) {
+        // `ComptimeInt` reaches here when const-fold inlines a comptime-typed
+        // integer into a `{c}` field; treated as a word-sized integer code point.
+        if !matches!(
+            self.prog.arena.get(fty),
+            Type::Int { .. } | Type::ComptimeInt
+        ) {
             return Err(self.unsup("char format of a non-integer field"));
         }
         let h = self
@@ -4025,6 +4053,21 @@ impl<'p> FnLower<'p> {
                 self.asm.mov_load(Gpr::Rax, h + foff as i32);
                 self.render_decimal_64(false)
             }
+            // A `comptime_int` field reaches the backend when const-fold/copy-prop
+            // inlines a comptime-typed integer (e.g. a negative literal) into the
+            // print tuple. The value is stored word-sized and sign-extended (see
+            // `const_int_bits`/`load_sized`'s width-0 path), so render it as a
+            // signed 64-bit decimal — matching the VM's `comptime_int` formatting.
+            // (The optimizer's `stamp_ty` now restamps such folds to their sized
+            // destination type, so this arm is belt-and-suspenders for any
+            // comptime_int that still slips through, keeping native == VM.)
+            Type::ComptimeInt => {
+                let h = self
+                    .home(base)
+                    .ok_or_else(|| self.unsup("print tuple without a home"))?;
+                self.asm.mov_load(Gpr::Rax, h + foff as i32);
+                self.render_decimal_64(true)
+            }
             _ => Err(self.unsup("decimal format of a non-integer field")),
         }
     }
@@ -4037,7 +4080,8 @@ impl<'p> FnLower<'p> {
         fty: TypeId,
     ) -> Result<(), CodegenError> {
         match self.prog.arena.get(fty) {
-            Type::Int { .. } => self.render_decimal_field(base, foff, fty),
+            // `ComptimeInt` from a const-folded field renders like a default int.
+            Type::Int { .. } | Type::ComptimeInt => self.render_decimal_field(base, foff, fty),
             Type::Slice { .. } => self.render_string_field(base, foff, fty),
             Type::Bool => {
                 // {} on bool -> "true"/"false".
@@ -4988,16 +5032,22 @@ fn compare_cc(op: BinOp, signed: bool) -> Cc {
 }
 
 /// The human-readable reason string for a trap.
+///
+/// These strings are kept **byte-identical** to the VM's `PanicInfo::message`
+/// (`crates/k2-vm/src/vm.rs`) so a trap reports the same text on both backends —
+/// panic wording is backend-independent. (Exit codes and strip behavior already
+/// match; this aligns the stderr message too, e.g. for a future stderr-comparing
+/// differential.) When adding or changing a trap string, update BOTH tables.
 fn trap_message(reason: TrapReason) -> &'static str {
     match reason {
         TrapReason::Bounds => "index out of bounds",
         TrapReason::Overflow => "integer overflow",
         TrapReason::DivByZero => "division by zero",
-        TrapReason::NegOverflow => "negation overflow",
-        TrapReason::NarrowLoss => "cast truncates value",
-        TrapReason::LenMismatch => "for-loop length mismatch",
+        TrapReason::NegOverflow => "negation of minimum integer",
+        TrapReason::NarrowLoss => "cast truncated value",
+        TrapReason::LenMismatch => "for loop length mismatch",
         TrapReason::Unreachable => "reached unreachable code",
-        TrapReason::Panic => "panic",
+        TrapReason::Panic => "reached @panic / unwrapped null",
     }
 }
 

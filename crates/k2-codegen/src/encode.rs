@@ -34,6 +34,30 @@
 use crate::reg::Gpr;
 use crate::runtime::RuntimeFn;
 
+thread_local! {
+    /// Whether [`Asm::peephole`] performs any rewrite. Always `true` in normal
+    /// operation; a stats/measurement helper flips it off for the *same* program
+    /// to obtain the un-peepholed baseline `.text` size (see
+    /// [`crate::compile_program_to_elf_stats`]). This is a measurement knob only —
+    /// the shipped pipeline always peepholes.
+    static PEEPHOLE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether the peephole is currently enabled on this thread.
+pub(crate) fn peephole_enabled() -> bool {
+    PEEPHOLE_ON.with(|c| c.get())
+}
+
+/// Runs `f` with the peephole forced on (`on=true`) or off (`on=false`),
+/// restoring the previous setting afterward. Used only to measure the un-optimized
+/// baseline code size against the peepholed size for the same program.
+pub(crate) fn with_peephole<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = PEEPHOLE_ON.with(|c| c.replace(on));
+    let r = f();
+    PEEPHOLE_ON.with(|c| c.set(prev));
+    r
+}
+
 /// A condition code, naming the `setcc`/`jcc` variant to emit. The encoding adds
 /// the [`Cc::tttn`] nibble to a base opcode: `0F 80+tttn` for a near `jcc`,
 /// `0F 90+tttn` for a `setcc`.
@@ -134,6 +158,66 @@ pub struct Fixup {
     pub kind: FixupKind,
 }
 
+/// A peephole classification tag recorded for each emitted instruction. The
+/// machine-level peephole pass ([`Asm::peephole`]) only *understands* the small
+/// recognized subset below; every other instruction is an [`ITag::Other`]
+/// **barrier** the pass never reorders across and treats as reading/writing
+/// unknown state, so an unhandled instruction can never enable a rewrite. This
+/// conservatism is what makes the pass behavior-preserving by construction.
+///
+/// A tag carries only the structured facts a rule needs (which registers a move
+/// reads/writes, the immediate of a `mov r, imm`, a branch's target label). It is
+/// never re-encoded from the tag — the already-emitted bytes are reused verbatim
+/// except for the two rewrites that emit fresh bytes (`mov r,0`→`xor r,r`), so the
+/// tag and the bytes can never drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ITag {
+    /// `mov dst, src` (64-bit reg→reg copy). A `dst==src` self-move is a no-op.
+    MovRr { dst: Gpr, src: Gpr },
+    /// `mov dst32, src32` — the deliberate 32-bit width-normalizing move. A
+    /// `dst==src` form zero-extends bits 32–63 and is **load-bearing**, so it is
+    /// tagged distinctly from [`ITag::MovRr`] and never deleted by the self-move
+    /// rule.
+    MovRr32 { dst: Gpr, src: Gpr },
+    /// `mov dst, imm` with the immediate captured (drives the `mov r,0`→`xor` and
+    /// dead-store rules; `imm` is `Some` only when it fit the recorded form).
+    MovRi { dst: Gpr, imm: i64 },
+    /// `xor dst, dst` (a register zeroing that clobbers flags). Recognized so the
+    /// `mov r,0`→`xor` rule can re-tag its rewrite.
+    XorSelf { dst: Gpr },
+    /// `jmp label` (unconditional). Drives jump-to-next / jump-to-jump.
+    Jmp { label: LabelId },
+    /// `jcc cc, label` (conditional). Drives jump-to-jump (the fall-through edge is
+    /// never the jcc itself).
+    Jcc { label: LabelId },
+    /// A bound label marker (zero bytes). Marks a basic-block boundary.
+    Label { label: LabelId },
+    /// A control / system instruction that reads **no arithmetic flags**
+    /// (`ret`/`leave`/`syscall`/`call`): like [`ITag::Other`] it is a full dataflow
+    /// barrier (its register effects are unknown, so no move is deleted across it),
+    /// but because it never observes the EFLAGS arithmetic bits — and, for a
+    /// `call`, because the callee clobbers the flags by the SysV ABI (CALL *itself*
+    /// preserves EFLAGS; the kill is the callee's) — no in-function code after it
+    /// can depend on the flags. That lets a preceding `mov r,0` become an `xor`
+    /// whose flag clobber is then unobservable.
+    CtrlNoFlags,
+    /// Any other instruction: an opaque barrier. The peephole stops dataflow
+    /// reasoning at it (assumes it reads and writes everything, *including* the
+    /// flags) and never deletes, reorders, or rewrites across it.
+    Other,
+}
+
+/// One recorded instruction boundary: the byte offset where the instruction
+/// begins and its peephole classification. The instruction's length is the
+/// distance to the next mark (or the buffer end for the last).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mark {
+    /// The byte offset of the instruction's first byte within [`Asm::buf`].
+    at: usize,
+    /// The instruction's peephole tag.
+    tag: ITag,
+}
+
 /// The instruction assembler: an append-only machine-code buffer plus the list
 /// of unresolved [`Fixup`]s and the recorded byte offset of each bound label.
 #[derive(Default)]
@@ -145,6 +229,31 @@ pub struct Asm {
     /// `label_offsets[id] = byte offset of the instruction the label marks`, or
     /// `None` until the label is bound by [`Asm::bind_label`].
     label_offsets: Vec<Option<usize>>,
+    /// One [`Mark`] per emitted instruction (and per bound label), in emission
+    /// order. The machine-level peephole pass reads this to delete/rewrite whole
+    /// instructions; `finish` then rebuilds `buf`/`fixups`/`label_offsets` from the
+    /// surviving marks. Recording is automatic (every public emit method tags
+    /// itself), so a directly-built `Asm` — a test, the runtime prelude, the
+    /// `_start` shim — is peepholed too.
+    marks: Vec<Mark>,
+    /// How many `.text` bytes the most recent [`Asm::peephole`] removed (for the
+    /// codegen size statistics).
+    peephole_saved_bytes: usize,
+}
+
+/// One whole instruction during the peephole pass: its already-emitted bytes, its
+/// [`ITag`] classification, and any fixups whose holes fall inside it (each as a
+/// `(byte offset relative to this instruction's start, kind)` pair). Editing the
+/// stream at this granularity means deletion is "drop the element" and every byte
+/// offset is re-derived on re-serialization — no `Fixup.at` is threaded by hand.
+struct Instr {
+    /// The peephole classification.
+    tag: ITag,
+    /// The exact machine-code bytes (reused verbatim, except for a rule that emits
+    /// a fresh shorter encoding).
+    bytes: Vec<u8>,
+    /// Fixup holes inside this instruction, as `(relative offset, kind)`.
+    fixups: Vec<(usize, FixupKind)>,
 }
 
 // This is a deliberately *complete* encoder for the instruction set the
@@ -173,6 +282,19 @@ impl Asm {
     /// against this).
     pub fn code(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Records the start of a new instruction with peephole tag `tag`. Called
+    /// exactly once at the head of every public emit method (before any byte is
+    /// appended), so `marks` holds one entry per instruction at its first byte. A
+    /// bound label records a distinct zero-byte marker at the same offset as the
+    /// instruction that follows it — the two coexist (a label is not folded into
+    /// the next instruction), so block boundaries survive re-serialization.
+    fn mark(&mut self, tag: ITag) {
+        self.marks.push(Mark {
+            at: self.buf.len(),
+            tag,
+        });
     }
 
     /// Appends one raw byte.
@@ -280,6 +402,7 @@ impl Asm {
     /// `mov dst, src` (register to register): `REX.W 89 /r`, with `src` in the
     /// reg field and `dst` in the rm field (the `MOV r/m64, r64` direction).
     pub fn mov_rr(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::MovRr { dst, src });
         self.rex(true, src.is_ext(), false, dst.is_ext());
         self.byte(0x89);
         self.modrm_rr(src, dst);
@@ -293,6 +416,7 @@ impl Asm {
     /// to all-ones and be a no-op; see `normalize`.) A `REX.B`/`REX.R` prefix is
     /// still emitted for `r8`–`r15`, but never `REX.W`.
     pub fn mov_rr32(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::MovRr32 { dst, src });
         if src.is_ext() || dst.is_ext() {
             self.rex(false, src.is_ext(), false, dst.is_ext());
         }
@@ -304,6 +428,7 @@ impl Asm {
     /// 32-bit range we use the compact sign-extending `REX.W C7 /0 id` form
     /// (7 bytes); otherwise the full `REX.W B8+rd io` form (10 bytes).
     pub fn mov_ri(&mut self, dst: Gpr, imm: i64) {
+        self.mark(ITag::MovRi { dst, imm });
         if let Ok(imm32) = i32::try_from(imm) {
             // REX.W C7 /0 id — MOV r/m64, imm32 (sign-extended).
             self.rex(true, false, false, dst.is_ext());
@@ -326,6 +451,7 @@ impl Asm {
 
     /// `mov dst, [rbp + disp]` (load a stack slot): `REX.W 8B /r`.
     pub fn mov_load(&mut self, dst: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, false);
         self.byte(0x8B);
         self.modrm_rbp_disp(dst.low3(), disp);
@@ -333,6 +459,7 @@ impl Asm {
 
     /// `mov [rbp + disp], src` (store a stack slot): `REX.W 89 /r`.
     pub fn mov_store(&mut self, disp: i32, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, src.is_ext(), false, false);
         self.byte(0x89);
         self.modrm_rbp_disp(src.low3(), disp);
@@ -340,6 +467,7 @@ impl Asm {
 
     /// `lea dst, [rbp + disp]` (address of a stack slot): `REX.W 8D /r`.
     pub fn lea_rbp(&mut self, dst: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, false);
         self.byte(0x8D);
         self.modrm_rbp_disp(dst.low3(), disp);
@@ -349,6 +477,7 @@ impl Asm {
     /// `REX.W 8D /r`. Used to compute the effective address of a projected place
     /// (the base register already holds an interior pointer).
     pub fn lea_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x8D);
         self.modrm_mem(dst.low3(), base, disp);
@@ -360,6 +489,7 @@ impl Asm {
 
     /// `mov dst, [base + disp]` (64-bit load): `REX.W 8B /r`.
     pub fn mov_load_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x8B);
         self.modrm_mem(dst.low3(), base, disp);
@@ -367,6 +497,7 @@ impl Asm {
 
     /// `mov [base + disp], src` (64-bit store): `REX.W 89 /r`.
     pub fn mov_store_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, src.is_ext(), false, base.is_ext());
         self.byte(0x89);
         self.modrm_mem(src.low3(), base, disp);
@@ -374,6 +505,7 @@ impl Asm {
 
     /// `movzx dst, byte [base + disp]`: `REX.W 0F B6 /r` (zero-extend a byte).
     pub fn movzx8_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x0F);
         self.byte(0xB6);
@@ -382,6 +514,7 @@ impl Asm {
 
     /// `movsx dst, byte [base + disp]`: `REX.W 0F BE /r` (sign-extend a byte).
     pub fn movsx8_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x0F);
         self.byte(0xBE);
@@ -390,6 +523,7 @@ impl Asm {
 
     /// `movzx dst, word [base + disp]`: `REX.W 0F B7 /r` (zero-extend a word).
     pub fn movzx16_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x0F);
         self.byte(0xB7);
@@ -398,6 +532,7 @@ impl Asm {
 
     /// `movsx dst, word [base + disp]`: `REX.W 0F BF /r` (sign-extend a word).
     pub fn movsx16_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x0F);
         self.byte(0xBF);
@@ -407,6 +542,7 @@ impl Asm {
     /// `mov dst32, [base + disp]` (32-bit load, **no** `REX.W`): `8B /r`. The CPU
     /// zero-extends bits 32–63, the correct way to load an unsigned 32-bit field.
     pub fn mov_load32_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         if dst.is_ext() || base.is_ext() {
             self.rex(false, dst.is_ext(), false, base.is_ext());
         }
@@ -416,6 +552,7 @@ impl Asm {
 
     /// `movsxd dst, [base + disp]` (32-bit sign-extending load): `REX.W 63 /r`.
     pub fn movsxd_mem(&mut self, dst: Gpr, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, base.is_ext());
         self.byte(0x63);
         self.modrm_mem(dst.low3(), base, disp);
@@ -426,6 +563,7 @@ impl Asm {
     /// `rsp`/`rbp`/`rsi`/`rdi`/`r8`–`r15`, because without REX the `88 /r` reg
     /// field `4..7` would name `ah/ch/dh/bh` rather than `spl/bpl/sil/dil`.
     pub fn mov_store8_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.mark(ITag::Other);
         if src.is_ext() || base.is_ext() || src.num() >= 4 {
             self.rex(false, src.is_ext(), false, base.is_ext());
         }
@@ -436,6 +574,7 @@ impl Asm {
     /// `mov word [base + disp], src16`: `66 89 /r` (the `66` operand-size prefix
     /// selects a 16-bit store of the low word of `src`).
     pub fn mov_store16_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.mark(ITag::Other);
         self.byte(0x66);
         if src.is_ext() || base.is_ext() {
             self.rex(false, src.is_ext(), false, base.is_ext());
@@ -447,6 +586,7 @@ impl Asm {
     /// `mov dword [base + disp], src32`: `89 /r` (no `REX.W`) — 32-bit store of
     /// the low dword of `src`.
     pub fn mov_store32_mem(&mut self, base: Gpr, disp: i32, src: Gpr) {
+        self.mark(ITag::Other);
         if src.is_ext() || base.is_ext() {
             self.rex(false, src.is_ext(), false, base.is_ext());
         }
@@ -457,6 +597,7 @@ impl Asm {
     /// `rep movsb`: `F3 A4` — copy RCX bytes from `[rsi]` to `[rdi]`, advancing
     /// both. Clobbers RSI/RDI/RCX. Used for the larger aggregate `memcpy`.
     pub fn rep_movsb(&mut self) {
+        self.mark(ITag::Other);
         self.byte(0xF3);
         self.byte(0xA4);
     }
@@ -476,6 +617,7 @@ impl Asm {
 
     /// `movsd dst, [base + disp]` (load an f64): `F2 0F 10 /r`.
     pub fn movsd_load(&mut self, dst: crate::reg::Xmm, base: Gpr, disp: i32) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.sse_rex(false, dst.is_ext(), base.is_ext());
         self.byte(0x0F);
@@ -485,6 +627,7 @@ impl Asm {
 
     /// `movsd [base + disp], src` (store an f64): `F2 0F 11 /r`.
     pub fn movsd_store(&mut self, base: Gpr, disp: i32, src: crate::reg::Xmm) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.sse_rex(false, src.is_ext(), base.is_ext());
         self.byte(0x0F);
@@ -495,6 +638,7 @@ impl Asm {
     /// `movsd dst, src` (xmm→xmm copy): `F2 0F 10 /r` with a register-direct
     /// ModRM (`dst` in reg, `src` in rm).
     pub fn movsd_rr(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.sse_rex(false, dst.is_ext(), src.is_ext());
         self.byte(0x0F);
@@ -505,6 +649,7 @@ impl Asm {
     /// The shared `F2 0F <op> /r` register-direct scalar-double ALU shape
     /// (`dst` in reg, `src` in rm).
     fn sse_alu_rr(&mut self, op: u8, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.sse_rex(false, dst.is_ext(), src.is_ext());
         self.byte(0x0F);
@@ -532,6 +677,7 @@ impl Asm {
     /// `ucomisd dst, src`: `66 0F 2E /r` — an ordered f64 compare that sets the
     /// ZF/PF/CF flags a `setcc`/`jcc` then reads.
     pub fn ucomisd(&mut self, dst: crate::reg::Xmm, src: crate::reg::Xmm) {
+        self.mark(ITag::Other);
         self.byte(0x66);
         self.sse_rex(false, dst.is_ext(), src.is_ext());
         self.byte(0x0F);
@@ -546,6 +692,7 @@ impl Asm {
     /// never aliasing the outgoing-args region). The mandatory `66` prefix is
     /// emitted before REX, matching the SSE encoding rule the other methods follow.
     pub fn movq_xmm_r64(&mut self, dst: crate::reg::Xmm, src: Gpr) {
+        self.mark(ITag::Other);
         self.byte(0x66);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
@@ -556,6 +703,7 @@ impl Asm {
     /// `cvtsi2sd dst, src` (int→f64): `F2 REX.W 0F 2A /r` — converts the 64-bit
     /// GPR `src` to a double in xmm `dst`.
     pub fn cvtsi2sd(&mut self, dst: crate::reg::Xmm, src: Gpr) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
@@ -566,6 +714,7 @@ impl Asm {
     /// `cvttsd2si dst, src` (f64→int, truncating): `F2 REX.W 0F 2C /r` — converts
     /// the double in xmm `src` to a 64-bit GPR `dst`, rounding toward zero.
     pub fn cvttsd2si(&mut self, dst: Gpr, src: crate::reg::Xmm) {
+        self.mark(ITag::Other);
         self.byte(0xF2);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
@@ -578,6 +727,7 @@ impl Asm {
     /// absolute virtual address. Always uses the full `B8+rd io` form so the
     /// hole is a fixed 8 bytes regardless of the (unknown) address value.
     pub fn mov_ri_data(&mut self, dst: Gpr, data_off: u32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xB8 | dst.low3());
         let at = self.pos();
@@ -593,6 +743,7 @@ impl Asm {
     /// absolute virtual address plus `state_off`. Always uses the full `B8+rd io`
     /// form so the hole is a fixed 8 bytes regardless of the (unknown) address.
     pub fn mov_ri_state(&mut self, dst: Gpr, state_off: u32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xB8 | dst.low3());
         let at = self.pos();
@@ -623,7 +774,9 @@ impl Asm {
     pub fn or_rr(&mut self, dst: Gpr, src: Gpr) {
         self.alu_rr(0x09, dst, src);
     }
-    /// `xor dst, src`: `REX.W 31 /r`.
+    /// `xor dst, src`: `REX.W 31 /r`. A self-`xor` (`xor r, r`) is the recognized
+    /// register-zeroing shape; [`Asm::alu_rr`] tags it [`ITag::XorSelf`] from the
+    /// opcode + operands so the peephole can fold a `mov r,0` into it.
     pub fn xor_rr(&mut self, dst: Gpr, src: Gpr) {
         self.alu_rr(0x31, dst, src);
     }
@@ -652,6 +805,13 @@ impl Asm {
 
     /// The shared `OP r/m64, r64` shape (`src` in the reg field, `dst` in rm).
     fn alu_rr(&mut self, opcode: u8, dst: Gpr, src: Gpr) {
+        // The one recognized ALU shape is a self-`xor` (register zeroing, opcode
+        // 0x31); every other ALU op is an opaque barrier for the peephole.
+        if opcode == 0x31 && dst == src {
+            self.mark(ITag::XorSelf { dst });
+        } else {
+            self.mark(ITag::Other);
+        }
         self.rex(true, src.is_ext(), false, dst.is_ext());
         self.byte(opcode);
         self.modrm_rr(src, dst);
@@ -659,6 +819,7 @@ impl Asm {
 
     /// `imul dst, src`: `REX.W 0F AF /r` (`dst *= src`, two-operand form).
     pub fn imul_rr(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
         self.byte(0xAF);
@@ -668,6 +829,7 @@ impl Asm {
     /// `cqo`: `REX.W 99` — sign-extend RAX into RDX:RAX (the dividend setup for
     /// a signed `idiv`).
     pub fn cqo(&mut self) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, false);
         self.byte(0x99);
     }
@@ -675,6 +837,7 @@ impl Asm {
     /// `idiv src`: `REX.W F7 /7` — signed divide RDX:RAX by `src`, quotient in
     /// RAX and remainder in RDX.
     pub fn idiv_r(&mut self, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, src.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(7, src);
@@ -687,6 +850,7 @@ impl Asm {
     /// `cqo`); a signed `idiv` would misinterpret a high-bit-set value as
     /// negative and either compute the wrong quotient or `#DE`-fault.
     pub fn div_r(&mut self, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, src.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(6, src);
@@ -697,6 +861,7 @@ impl Asm {
     /// both are set iff the high half (RDX) is nonzero, i.e. the product does not
     /// fit 64 bits.
     pub fn mul_r(&mut self, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, src.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(4, src);
@@ -709,6 +874,7 @@ impl Asm {
     /// used by the signed 64-bit overflow predicate so OF reflects the true
     /// 128-bit product.
     pub fn imul_r1(&mut self, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, src.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(5, src);
@@ -722,6 +888,7 @@ impl Asm {
 
     /// `neg dst`: `REX.W F7 /3` (two's-complement negation).
     pub fn neg_r(&mut self, dst: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(3, dst);
@@ -729,6 +896,7 @@ impl Asm {
 
     /// `not dst`: `REX.W F7 /2` (one's-complement / bitwise NOT).
     pub fn not_r(&mut self, dst: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xF7);
         self.modrm_rr_op(2, dst);
@@ -753,6 +921,7 @@ impl Asm {
 
     /// The shared `D3 /digit` shift-by-CL shape.
     fn shift_cl(&mut self, op_ext: u8, dst: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xD3);
         self.modrm_rr_op(op_ext, dst);
@@ -765,6 +934,7 @@ impl Asm {
     /// `and dst, imm32`: `REX.W 81 /4 id` (sign-extended). Used to mask an
     /// unsigned narrow-width result down to `2^w - 1`.
     pub fn and_ri(&mut self, dst: Gpr, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0x81);
         self.modrm_rr_op(4, dst);
@@ -773,6 +943,7 @@ impl Asm {
 
     /// `xor dst, imm32`: `REX.W 81 /6 id`. Used to flip a boolean (`xor rax, 1`).
     pub fn xor_ri(&mut self, dst: Gpr, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0x81);
         self.modrm_rr_op(6, dst);
@@ -781,6 +952,7 @@ impl Asm {
 
     /// `cmp dst, imm32`: `REX.W 81 /7 id`. Used by the `Switch` compare chain.
     pub fn cmp_ri(&mut self, dst: Gpr, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0x81);
         self.modrm_rr_op(7, dst);
@@ -790,6 +962,7 @@ impl Asm {
     /// `add dst, imm32`: `REX.W 81 /0 id` (sign-extended). Folds a field offset
     /// or a scaled index into an address register.
     pub fn add_ri(&mut self, dst: Gpr, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0x81);
         self.modrm_rr_op(0, dst);
@@ -799,6 +972,7 @@ impl Asm {
     /// `imul dst, src, imm32`: `REX.W 69 /r id` — `dst = src * imm32`. Computes a
     /// scaled element index (`index * elem_size`) for a non-power-of-two stride.
     pub fn imul_rri(&mut self, dst: Gpr, src: Gpr, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x69);
         self.modrm_rr(dst, src);
@@ -808,6 +982,7 @@ impl Asm {
     /// `shl dst, imm8`: `REX.W C1 /4 ib` — left-shift by a constant (a
     /// power-of-two element-size scale).
     pub fn shl_ri(&mut self, dst: Gpr, imm: u8) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xC1);
         self.modrm_rr_op(4, dst);
@@ -817,6 +992,7 @@ impl Asm {
     /// `shr dst, imm8`: `REX.W C1 /5 ib` — logical right-shift by a constant. Used
     /// by the runtime splitmix64 PRNG step (`z ^ z >> 30/27/31`).
     pub fn shr_ri(&mut self, dst: Gpr, imm: u8) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, dst.is_ext());
         self.byte(0xC1);
         self.modrm_rr_op(5, dst);
@@ -825,6 +1001,7 @@ impl Asm {
 
     /// `sub rsp, imm32`: `REX.W 81 /5 id` (allocate stack frame).
     pub fn sub_rsp_imm(&mut self, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, false);
         self.byte(0x81);
         self.modrm_rr_op(5, Gpr::Rsp);
@@ -833,6 +1010,7 @@ impl Asm {
 
     /// `add rsp, imm32`: `REX.W 81 /0 id` (deallocate stack frame).
     pub fn add_rsp_imm(&mut self, imm: i32) {
+        self.mark(ITag::Other);
         self.rex(true, false, false, false);
         self.byte(0x81);
         self.modrm_rr_op(0, Gpr::Rsp);
@@ -846,6 +1024,7 @@ impl Asm {
     /// `setcc al`: `0F 90+tttn C0` — set AL to 1 if `cc` holds, else 0. (No REX:
     /// AL is the low byte of RAX, register 0.)
     pub fn setcc_al(&mut self, cc: Cc) {
+        self.mark(ITag::Other);
         self.byte(0x0F);
         self.byte(0x90 | cc.tttn());
         self.byte(0xC0);
@@ -854,6 +1033,7 @@ impl Asm {
     /// `movzx dst, al`: `REX.W 0F B6 /r` — zero-extend AL (the `setcc` byte
     /// result) into a full 64-bit `dst`.
     pub fn movzx_al(&mut self, dst: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, false);
         self.byte(0x0F);
         self.byte(0xB6);
@@ -863,6 +1043,7 @@ impl Asm {
 
     /// `movzx dst, src8`: `REX.W 0F B6 /r` — zero-extend the low byte of `src`.
     pub fn movzx8(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
         self.byte(0xB6);
@@ -870,6 +1051,7 @@ impl Asm {
     }
     /// `movsx dst, src8`: `REX.W 0F BE /r` — sign-extend the low byte of `src`.
     pub fn movsx8(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
         self.byte(0xBE);
@@ -877,6 +1059,7 @@ impl Asm {
     }
     /// `movzx dst, src16`: `REX.W 0F B7 /r` — zero-extend the low word of `src`.
     pub fn movzx16(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
         self.byte(0xB7);
@@ -884,6 +1067,7 @@ impl Asm {
     }
     /// `movsx dst, src16`: `REX.W 0F BF /r` — sign-extend the low word of `src`.
     pub fn movsx16(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x0F);
         self.byte(0xBF);
@@ -891,6 +1075,7 @@ impl Asm {
     }
     /// `movsxd dst, src32`: `REX.W 63 /r` — sign-extend the low dword of `src`.
     pub fn movsxd(&mut self, dst: Gpr, src: Gpr) {
+        self.mark(ITag::Other);
         self.rex(true, dst.is_ext(), false, src.is_ext());
         self.byte(0x63);
         self.modrm_rr(dst, src);
@@ -902,6 +1087,7 @@ impl Asm {
 
     /// `push reg`: `50+rd` (plus a `REX.B` prefix for `r8`–`r15`).
     pub fn push(&mut self, reg: Gpr) {
+        self.mark(ITag::Other);
         if reg.is_ext() {
             self.rex(false, false, false, true);
         }
@@ -910,6 +1096,7 @@ impl Asm {
 
     /// `pop reg`: `58+rd` (plus a `REX.B` prefix for `r8`–`r15`).
     pub fn pop(&mut self, reg: Gpr) {
+        self.mark(ITag::Other);
         if reg.is_ext() {
             self.rex(false, false, false, true);
         }
@@ -918,16 +1105,19 @@ impl Asm {
 
     /// `ret`: `C3`.
     pub fn ret(&mut self) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0xC3);
     }
 
     /// `leave`: `C9` — `mov rsp, rbp; pop rbp` in one byte (the epilogue).
     pub fn leave(&mut self) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0xC9);
     }
 
     /// `syscall`: `0F 05`.
     pub fn syscall(&mut self) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0x0F);
         self.byte(0x05);
     }
@@ -935,12 +1125,14 @@ impl Asm {
     /// `jmp label` (near, rel32): `E9 cd`. Writes a 4-byte placeholder and a
     /// [`FixupKind::Local`] fixup [`Asm::finish`] resolves.
     pub fn jmp(&mut self, label: LabelId) {
+        self.mark(ITag::Jmp { label });
         self.byte(0xE9);
         self.push_rel32_fixup(FixupKind::Local(label));
     }
 
     /// `jcc label` (near, rel32): `0F 80+tttn cd`.
     pub fn jcc(&mut self, cc: Cc, label: LabelId) {
+        self.mark(ITag::Jcc { label });
         self.byte(0x0F);
         self.byte(0x80 | cc.tttn());
         self.push_rel32_fixup(FixupKind::Local(label));
@@ -949,6 +1141,7 @@ impl Asm {
     /// `call func` (near, rel32): `E8 cd`. Cross-function — records a
     /// [`FixupKind::Call`] the program layout pass patches.
     pub fn call_fn(&mut self, func: crate::mir_ids::FnId) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0xE8);
         self.push_rel32_fixup(FixupKind::Call(func));
     }
@@ -957,6 +1150,7 @@ impl Asm {
     /// [`FixupKind::Runtime`] the program layout pass patches once the routine's
     /// `.text` offset is known.
     pub fn call_runtime(&mut self, rt: RuntimeFn) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0xE8);
         self.push_rel32_fixup(FixupKind::Runtime(rt));
     }
@@ -965,6 +1159,7 @@ impl Asm {
     /// [`Asm::finish`]. The runtime trap helper uses `call after; <bytes>; after:
     /// pop` to recover the absolute address of inline data bytes.
     pub fn call_label(&mut self, label: LabelId) {
+        self.mark(ITag::CtrlNoFlags);
         self.byte(0xE8);
         self.push_rel32_fixup(FixupKind::Local(label));
     }
@@ -972,6 +1167,7 @@ impl Asm {
     /// Appends `bytes` verbatim into the code stream (raw data embedded in `.text`,
     /// e.g. a runtime trap's panic message reached via a `call`/`pop` thunk).
     pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.mark(ITag::Other);
         self.buf.extend_from_slice(bytes);
     }
 
@@ -1002,6 +1198,7 @@ impl Asm {
             "label id out of reserved range"
         );
         self.label_offsets[i] = Some(self.pos());
+        self.mark(ITag::Label { label });
     }
 
     /// Allocates a fresh, dynamically-created local label (used by the runtime
@@ -1018,6 +1215,7 @@ impl Asm {
     /// Binds a dynamically-allocated local label at the current position.
     pub fn bind_local(&mut self, label: LabelId) {
         self.label_offsets[label.0 as usize] = Some(self.pos());
+        self.mark(ITag::Label { label });
     }
 
     /// An unconditional jump to a local label (alias of [`Asm::jmp`], named for the
@@ -1031,13 +1229,123 @@ impl Asm {
         self.jcc(cc, label);
     }
 
+    /// The number of `.text` bytes the most recent [`Asm::peephole`] removed. Used
+    /// by the codegen statistics so the size reduction can be reported and tested.
+    pub fn peephole_savings(&self) -> usize {
+        self.peephole_saved_bytes
+    }
+
+    /// Runs the machine-level peephole pass over the recorded instruction stream.
+    ///
+    /// The pass is structured as a per-function list of whole instructions (the
+    /// already-emitted bytes plus the [`ITag`] classification and any embedded
+    /// fixups), rewritten to a fixpoint, then re-serialized into `buf` /
+    /// `label_offsets` / `fixups`. Because it edits at instruction granularity and
+    /// re-derives every byte offset on re-serialization, no `Fixup.at` or label
+    /// offset is ever threaded by hand — deletion just drops an instruction.
+    ///
+    /// Every rule is behavior-preserving by construction (see the per-rule notes):
+    /// each either deletes an instruction whose only effect is provably dead, emits
+    /// an instruction computing the identical value, or rewrites control flow to a
+    /// target with identical successor semantics. Unrecognized instructions are
+    /// [`ITag::Other`] barriers across which no rule reasons.
+    ///
+    /// Returns silently (a no-op) when no marks were recorded — a directly-built
+    /// `Asm` that never marked is left byte-for-byte unchanged.
+    pub fn peephole(&mut self) {
+        if self.marks.is_empty() || !peephole_enabled() {
+            return;
+        }
+        let mut instrs = self.explode_to_instrs();
+        let before: usize = instrs.iter().map(|i| i.bytes.len()).sum();
+
+        // Fixpoint: rerun until no rule fires (rules can cascade — a deleted block
+        // turns a jump-to-jump into a jump-to-next, etc.). The instruction count
+        // strictly decreases on each change, so this terminates.
+        loop {
+            let mut changed = false;
+            changed |= peep_self_moves(&mut instrs);
+            changed |= peep_mov_zero_to_xor(&mut instrs);
+            changed |= peep_dead_store(&mut instrs);
+            changed |= peep_jump_to_next(&mut instrs);
+            changed |= peep_jump_to_jump(&mut instrs);
+            if !changed {
+                break;
+            }
+        }
+
+        let after: usize = instrs.iter().map(|i| i.bytes.len()).sum();
+        self.peephole_saved_bytes = before.saturating_sub(after);
+        self.reassemble_from_instrs(instrs);
+    }
+
+    /// Splits the flat byte buffer into a per-instruction list, attaching each
+    /// instruction's tag and the fixups whose holes fall within it (recorded as a
+    /// byte offset relative to the instruction's start).
+    fn explode_to_instrs(&mut self) -> Vec<Instr> {
+        let buf = std::mem::take(&mut self.buf);
+        let fixups = std::mem::take(&mut self.fixups);
+        let marks = std::mem::take(&mut self.marks);
+
+        let mut instrs: Vec<Instr> = Vec::with_capacity(marks.len());
+        for (i, m) in marks.iter().enumerate() {
+            let end = marks.get(i + 1).map(|n| n.at).unwrap_or(buf.len());
+            instrs.push(Instr {
+                tag: m.tag,
+                bytes: buf[m.at..end].to_vec(),
+                fixups: Vec::new(),
+            });
+        }
+        // Bucket each fixup into the instruction that contains its hole.
+        for fx in fixups {
+            // Find the last mark whose `at <= fx.at` (the instruction it belongs to).
+            let idx = match marks.binary_search_by(|m| m.at.cmp(&fx.at)) {
+                Ok(i) => i,
+                Err(0) => 0,
+                Err(i) => i - 1,
+            };
+            let rel = fx.at - marks[idx].at;
+            instrs[idx].fixups.push((rel, fx.kind));
+        }
+        instrs
+    }
+
+    /// Re-serializes the (possibly shrunk) instruction list back into the flat
+    /// `buf`, recomputing every `label_offsets` entry and every `Fixup.at` from the
+    /// instructions' new positions. Label *ids* are stable (a `Label` instruction
+    /// carries its id); only their byte offsets move.
+    fn reassemble_from_instrs(&mut self, instrs: Vec<Instr>) {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut fixups: Vec<Fixup> = Vec::new();
+        for inst in &instrs {
+            let base = buf.len();
+            if let ITag::Label { label } = inst.tag {
+                // A label marks the position of the *next* emitted byte.
+                self.label_offsets[label.0 as usize] = Some(base);
+            }
+            buf.extend_from_slice(&inst.bytes);
+            for (rel, kind) in &inst.fixups {
+                fixups.push(Fixup {
+                    at: base + rel,
+                    kind: *kind,
+                });
+            }
+        }
+        self.buf = buf;
+        self.fixups = fixups;
+    }
+
     /// Finalizes this function's code: resolves every intra-function
     /// [`FixupKind::Local`] `rel32` in place and returns the code bytes together
     /// with the *surviving* cross-function fixups (`Call`/`Data`) for the program
     /// layout pass to patch. Panics only on a backend bug (an unbound label),
     /// never on subset-valid input — every label is bound when its block is
     /// emitted.
+    ///
+    /// The machine-level [`Asm::peephole`] runs first, so the returned bytes are
+    /// the minimized stream; the `rel32` resolution below sees the final offsets.
     pub fn finish(mut self) -> (Vec<u8>, Vec<Fixup>) {
+        self.peephole();
         let mut remaining = Vec::new();
         for fx in std::mem::take(&mut self.fixups) {
             match fx.kind {
@@ -1055,5 +1363,508 @@ impl Asm {
             }
         }
         (self.buf, remaining)
+    }
+}
+
+// ===========================================================================
+//  Machine-level peephole rules.
+//
+//  Each rule takes the per-function instruction list and rewrites it in place,
+//  returning whether it changed anything. Every rule is conservative by
+//  construction: it stops dataflow reasoning at an `ITag::Other` barrier (whose
+//  reads/writes are unknown) and at a basic-block boundary (a `Label`, into which
+//  another edge may jump). A rewrite is applied only when the transformed stream
+//  is provably observationally identical to the original.
+// ===========================================================================
+
+/// The condition encoding a `Jcc` instruction carries, recovered from its second
+/// opcode byte (`0F 80+tttn`). Only needed to re-emit a retargeted `jcc`.
+fn jcc_tttn(bytes: &[u8]) -> Option<u8> {
+    // `jcc` is `0F 80+tttn <rel32>`.
+    if bytes.len() == 6 && bytes[0] == 0x0F && (bytes[1] & 0xF0) == 0x80 {
+        Some(bytes[1] & 0x0F)
+    } else {
+        None
+    }
+}
+
+/// Rule 1 — **redundant self-move.** Delete every `mov r, r` (a no-op). The
+/// deliberate width-normalizing `mov r32, r32` is tagged [`ITag::MovRr32`] and is
+/// never matched here, so the load-bearing zero-extension is preserved.
+fn peep_self_moves(instrs: &mut Vec<Instr>) -> bool {
+    let before = instrs.len();
+    instrs.retain(|i| !matches!(i.tag, ITag::MovRr { dst, src } if dst == src));
+    instrs.len() != before
+}
+
+/// Rule 3 — **dead store to a register.** When a value-only write to register `r`
+/// (`mov r, imm` or `mov r, src`) is *immediately* followed by another full write
+/// to the same `r` that does not read it, the first write is dead: nothing between
+/// them can observe `r` (they are adjacent, so no `Other` barrier and no label
+/// boundary sits between), and the second overwrites `r` entirely. Delete the
+/// first. Both instructions are side-effect-free register moves, so removing the
+/// first changes nothing observable.
+fn peep_dead_store(instrs: &mut Vec<Instr>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < instrs.len() {
+        let first_dst = match instrs[i].tag {
+            ITag::MovRi { dst, .. } => Some(dst),
+            ITag::MovRr { dst, src } if dst != src => Some(dst),
+            _ => None,
+        };
+        if let Some(r) = first_dst {
+            // Does the *next* instruction fully overwrite `r` without reading it?
+            let overwrites = match instrs[i + 1].tag {
+                ITag::MovRi { dst, .. } => dst == r,
+                // `mov r, src` overwrites `r`; it reads `src`, so the source must
+                // not be `r` (else the first write feeds the second).
+                ITag::MovRr { dst, src } => dst == r && src != r,
+                ITag::XorSelf { dst } => dst == r,
+                _ => false,
+            };
+            if overwrites {
+                instrs.remove(i);
+                changed = true;
+                // Re-examine the new instruction now at `i` against its successor.
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 2 — **`mov r, 0` → `xor r, r`** (7 bytes → 3). `xor` clobbers the flags
+/// while `mov` does not, so the rewrite is only behavior-preserving when the flags
+/// `xor` would destroy are provably **dead** at the site — i.e. no execution that
+/// could observe the live flags reaches a flag reader before something redefines
+/// the flags.
+///
+/// ## Why a same-block forward scan is not enough (the soundness landmine)
+///
+/// An earlier version treated a `Jmp`, a `Label`, and the end of the function as
+/// proof the flags were dead, because no instruction *within the current block*
+/// read them. That ignores cross-block flag liveness: a `cmp` can set flags, a
+/// `mov r,0` follow, then a `jmp L`, and block `L` open with a `jcc`/`setcc`/`adc`
+/// that reads those flags — they are *live-out* across the jump edge. Rewriting
+/// the `mov` to `xor` there clobbers the still-live flags and the successor
+/// branches on garbage. Today's front-end lowering happens to emit every
+/// `cmp/test; jcc` adjacently (no block is *entered* with flags live), but nothing
+/// enforces that invariant, and any directly-built `Asm` (or a future lowering
+/// that hoists a shared condition across an edge) reintroduces the live-across-edge
+/// shape — a latent miscompile.
+///
+/// ## The sound rule (conservative same-block clobber proof)
+///
+/// Fire only when, scanning forward **within the same basic block**, a
+/// flag-CLOBBERING instruction provably executes before any flag READER and before
+/// any block-exit edge. Then whatever the `xor` does to the flags is overwritten
+/// before anyone could observe it, regardless of cross-block liveness. A plain
+/// `Jmp`/`Label`/end-of-function is *not* such a proof (the flags may be live-out),
+/// so the window ends UNSAFE at a block boundary. This makes the rule fire rarely —
+/// only the `mov r,0; <flag-neutral moves>; call|ret|syscall|leave|xor` shapes —
+/// which is acceptable: correctness outweighs the tiny size win.
+fn peep_mov_zero_to_xor(instrs: &mut [Instr]) -> bool {
+    let mut changed = false;
+    for i in 0..instrs.len() {
+        let dst = match instrs[i].tag {
+            ITag::MovRi { dst, imm: 0 } => dst,
+            _ => continue,
+        };
+        if flags_clobbered_before_use_in_block(instrs, i + 1) {
+            // Re-emit as `xor dst, dst` (`REX.W 31 /r`, register-direct).
+            let mut a = Asm::new();
+            a.xor_rr(dst, dst);
+            instrs[i] = Instr {
+                tag: ITag::XorSelf { dst },
+                bytes: a.buf,
+                fixups: Vec::new(),
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// True iff, scanning forward from `start`, a flag-CLOBBERING instruction provably
+/// executes **before any flag reader and before any block-exit edge** — the only
+/// condition under which clobbering the flags with `xor` is unobservable.
+///
+/// Sound by construction: it never reasons about flag liveness across a block
+/// boundary. A `Jmp`/`Label`/end-of-function ends the window UNSAFE (the flags may
+/// be live-out to a successor that reads them). Recognized clobbers are `XorSelf`
+/// (zeroes flags, reads none) and `CtrlNoFlags` (`call` makes the flags ABI-dead —
+/// the callee clobbers them by the SysV contract; `ret`/`syscall`/`leave` leave the
+/// function so no in-function reader follows). A `Jcc` or an opaque `Other`
+/// (possibly `setcc`/`adc`/`cmovcc`) is a potential flag READER and ends the
+/// window UNSAFE *before* any later clobber, so a clobber after them does not
+/// count. Only flag-neutral moves may precede the clobber.
+fn flags_clobbered_before_use_in_block(instrs: &[Instr], start: usize) -> bool {
+    for inst in &instrs[start..] {
+        match inst.tag {
+            // Flag-neutral moves: keep scanning for a clobber.
+            ITag::MovRr { .. } | ITag::MovRr32 { .. } | ITag::MovRi { .. } => {}
+            // A clobber with no prior flag read: the `xor`'s effect is overwritten
+            // here before anything observes it. SAFE to rewrite.
+            ITag::XorSelf { .. } => return true,
+            // `call`/`ret`/`syscall`/`leave`. A `call`'s callee clobbers the flags
+            // by ABI (CALL itself preserves EFLAGS — the kill is the callee's, not
+            // the instruction's); `ret`/`syscall`/`leave` exit the function. Either
+            // way no in-function code observes the pre-`xor` flags. SAFE.
+            ITag::CtrlNoFlags => return true,
+            // Block boundary: control leaves this block with the flags possibly
+            // LIVE-OUT to a successor (reached via this jmp, or the fall-through at
+            // a label) that may read them. We do not do cross-block liveness, so
+            // this is UNSAFE — do not rewrite.
+            ITag::Jmp { .. } | ITag::Label { .. } => return false,
+            // A conditional jump READS the flags before any clobber — UNSAFE.
+            ITag::Jcc { .. } => return false,
+            // An opaque instruction may read the flags (`setcc`/`adc`/`cmovcc`/…)
+            // before any clobber — conservatively UNSAFE.
+            ITag::Other => return false,
+        }
+    }
+    // Reached the function end with no proven clobber: the flags may be live-out
+    // (a tail block whose flags feed a caller is not a thing here, but the absence
+    // of a clobber means we cannot prove the `xor` is invisible). UNSAFE.
+    false
+}
+
+/// Rule 6 — **jump-to-next (fall-through).** Delete a `jmp L` immediately followed
+/// by the `Label L` it targets: the unconditional branch lands on the very next
+/// instruction, so removing it changes nothing. This is the common shape for a
+/// `Goto(next_block)` terminator and the dead `jmp else` after a `Branch` whose
+/// else-block falls through.
+fn peep_jump_to_next(instrs: &mut Vec<Instr>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < instrs.len() {
+        if let (ITag::Jmp { label: tgt }, ITag::Label { label: here }) =
+            (instrs[i].tag, instrs[i + 1].tag)
+        {
+            if tgt == here {
+                instrs.remove(i);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 7 — **jump-to-jump (thread).** Retarget a `jmp`/`jcc` whose target label
+/// is bound on an instruction that is *itself* an unconditional `jmp L2` (an empty
+/// forwarding block) so it jumps straight to `L2`. Bounded by a visited set to
+/// avoid cycling on a self-loop. Control-flow semantics are unchanged: both paths
+/// end at `L2` with no instruction executed in between.
+fn peep_jump_to_jump(instrs: &mut [Instr]) -> bool {
+    // Map every label id to the index of its `Label` instruction.
+    let label_at: std::collections::HashMap<u32, usize> = instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, inst)| match inst.tag {
+            ITag::Label { label } => Some((label.0, idx)),
+            _ => None,
+        })
+        .collect();
+
+    // The *effective* final target of a label: follow a chain of empty
+    // `Label*; jmp L2` forwarding blocks. `None` means "no improvement" (the label
+    // is not a pure forwarder, or the chain cycles). Computed up-front against an
+    // immutable borrow so the rewrite loop can mutate freely.
+    let resolve = |start: LabelId| -> Option<LabelId> {
+        let mut cur = start;
+        let mut hops = 0;
+        loop {
+            hops += 1;
+            if hops > 16 {
+                return None; // cycle / too long: leave as-is.
+            }
+            let &idx = label_at.get(&cur.0)?;
+            // Skip consecutive labels bound at the same spot to find the first real
+            // instruction of the block.
+            let mut j = idx;
+            while j < instrs.len() && matches!(instrs[j].tag, ITag::Label { .. }) {
+                j += 1;
+            }
+            match instrs.get(j).map(|i| i.tag) {
+                Some(ITag::Jmp { label: next }) if next != cur => cur = next,
+                _ => return if cur == start { None } else { Some(cur) },
+            }
+        }
+    };
+
+    // Phase 1: compute the retarget for each jump under the immutable borrow.
+    let retargets: Vec<Option<LabelId>> = instrs
+        .iter()
+        .map(|inst| match inst.tag {
+            ITag::Jmp { label } | ITag::Jcc { label } => resolve(label),
+            _ => None,
+        })
+        .collect();
+
+    // Phase 2: apply the retargets.
+    let mut changed = false;
+    for (inst, retarget) in instrs.iter_mut().zip(retargets) {
+        let Some(t) = retarget else { continue };
+        match inst.tag {
+            ITag::Jmp { .. } => {
+                rewrite_jmp_target(inst, t);
+                changed = true;
+            }
+            ITag::Jcc { .. } => {
+                rewrite_jcc_target(inst, t);
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+/// Rewrites an unconditional-jump instruction to a new target label, preserving
+/// its single `Local` fixup (the `rel32` hole at byte offset 1).
+fn rewrite_jmp_target(inst: &mut Instr, target: LabelId) {
+    // `jmp rel32` is `E9 <rel32>`; the fixup hole is the 4 bytes after the opcode.
+    *inst = Instr {
+        tag: ITag::Jmp { label: target },
+        bytes: vec![0xE9, 0, 0, 0, 0],
+        fixups: vec![(1, FixupKind::Local(target))],
+    };
+}
+
+/// Rewrites a conditional-jump instruction to a new target label, preserving its
+/// condition code (recovered from the opcode) and its `Local` fixup (offset 2).
+fn rewrite_jcc_target(inst: &mut Instr, target: LabelId) {
+    let tttn = jcc_tttn(&inst.bytes).expect("a Jcc instruction must be a 6-byte 0F 8x rel32");
+    *inst = Instr {
+        tag: ITag::Jcc { label: target },
+        bytes: vec![0x0F, 0x80 | tttn, 0, 0, 0, 0],
+        fixups: vec![(2, FixupKind::Local(target))],
+    };
+}
+
+#[cfg(test)]
+mod peephole_tests {
+    //! Byte-level unit tests for each machine-level peephole rule. Each builds a
+    //! small `Asm`, runs the pass via `finish()`, and asserts the resulting bytes
+    //! are the expected minimized form — and that an `Other` barrier blocks an
+    //! unsafe rewrite. These are host-independent (no execution).
+
+    use super::*;
+    use crate::reg::Gpr;
+
+    /// `mov rbx, rbx` (a self-move) is deleted; a real `mov rbx, rcx` survives.
+    #[test]
+    fn rule_self_move_deleted() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_rr(Gpr::Rbx, Gpr::Rbx); // no-op -> deleted
+        a.mov_rr(Gpr::Rbx, Gpr::Rcx); // 48 89 cb -> kept
+        a.ret();
+        let (code, _) = a.finish();
+        // Only the real move + ret remain.
+        assert_eq!(code, vec![0x48, 0x89, 0xcb, 0xc3]);
+    }
+
+    /// `mov r32, r32` (the width-normalizing move) is NOT deleted even when
+    /// dst==src: it zero-extends the upper 32 bits and is load-bearing.
+    #[test]
+    fn rule_self_move_keeps_norm32() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_rr32(Gpr::Rbx, Gpr::Rbx); // 89 db (no REX.W) -> kept
+        a.ret();
+        let (code, _) = a.finish();
+        assert_eq!(code, vec![0x89, 0xdb, 0xc3]);
+    }
+
+    /// A `mov r, 0` whose flags are dead until the block end becomes `xor r, r`
+    /// (7 bytes -> 3). Here the zero is followed only by another flag-neutral move
+    /// and a `ret`, so flags are dead.
+    #[test]
+    fn rule_mov_zero_to_xor() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_ri(Gpr::Rax, 0); // -> xor rax, rax (48 31 c0)
+        a.ret();
+        let (code, _) = a.finish();
+        assert_eq!(code, vec![0x48, 0x31, 0xc0, 0xc3]);
+    }
+
+    /// A `mov r, 0` is NOT rewritten when a flag consumer (`jcc`) could observe the
+    /// flags the `xor` would clobber: a conditional jump before the block ends
+    /// blocks the rewrite, so the `mov` (which leaves flags untouched) is kept.
+    #[test]
+    fn rule_mov_zero_to_xor_blocked_by_flag_use() {
+        let mut a = Asm::new();
+        a.reserve_labels(1);
+        a.mov_ri(Gpr::Rax, 0); // flags must survive for the jcc below
+        a.jcc(Cc::E, LabelId(0)); // a flag consumer
+        a.bind_label(LabelId(0));
+        a.ret();
+        let (code, _) = a.finish();
+        // The mov stays as `48 C7 C0 00 00 00 00` (7 bytes), not an xor.
+        assert_eq!(&code[0..3], &[0x48, 0xc7, 0xc0]);
+        assert_eq!(&code[3..7], &[0, 0, 0, 0]);
+    }
+
+    /// A dead store: `mov rbx, 1` immediately overwritten by `mov rbx, 2` — the
+    /// first is deleted.
+    #[test]
+    fn rule_dead_store() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_ri(Gpr::Rbx, 1); // dead: overwritten before any read
+        a.mov_ri(Gpr::Rbx, 2); // -> 48 c7 c3 02 00 00 00
+        a.ret();
+        let (code, _) = a.finish();
+        assert_eq!(code, vec![0x48, 0xc7, 0xc3, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+    }
+
+    /// A dead store is NOT removed across an `Other` barrier (which might read the
+    /// register). `mov rbx,1; add rbx,rax; mov rbx,2` keeps the first move.
+    #[test]
+    fn rule_dead_store_blocked_by_barrier() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_ri(Gpr::Rbx, 1);
+        a.add_rr(Gpr::Rbx, Gpr::Rax); // Other barrier reads rbx
+        a.mov_ri(Gpr::Rbx, 2);
+        a.ret();
+        let (code, _) = a.finish();
+        // The first mov (7 bytes) survives because the barrier may read rbx.
+        assert_eq!(&code[0..3], &[0x48, 0xc7, 0xc3]);
+        assert!(
+            code.len() > 8,
+            "first mov must be kept (len {})",
+            code.len()
+        );
+    }
+
+    /// Jump-to-next: a `jmp L` immediately followed by `L:` is deleted (fall-through).
+    #[test]
+    fn rule_jump_to_next_deleted() {
+        let mut a = Asm::new();
+        a.reserve_labels(1);
+        a.jmp(LabelId(0)); // targets the very next instruction
+        a.bind_label(LabelId(0));
+        a.ret();
+        let (code, _) = a.finish();
+        // Only the ret remains.
+        assert_eq!(code, vec![0xc3]);
+    }
+
+    /// Jump-to-jump: `jmp L1` where `L1:` is itself `jmp L2` threads to `L2`.
+    #[test]
+    fn rule_jump_to_jump_threaded() {
+        let mut a = Asm::new();
+        a.reserve_labels(3);
+        // jmp L0 ; ret(filler) ; L0: jmp L1 ; ret(filler) ; L1: ret
+        a.jmp(LabelId(0));
+        a.bind_label(LabelId(2)); // a placeholder so blocks are not adjacent
+        a.mov_rr(Gpr::Rax, Gpr::Rcx); // filler so L0 is not the next instr
+        a.bind_label(LabelId(0));
+        a.jmp(LabelId(1)); // empty forwarding block
+        a.mov_rr(Gpr::Rdx, Gpr::Rcx); // filler
+        a.bind_label(LabelId(1));
+        a.ret();
+        let (code, _) = a.finish();
+        // The leading `jmp` must now skip straight to L1 (the ret). It is still a
+        // 5-byte `E9 rel32`; its rel32 should point at the final ret.
+        assert_eq!(code[0], 0xe9);
+        let rel = i32::from_le_bytes([code[1], code[2], code[3], code[4]]);
+        let target = (5i64 + rel as i64) as usize;
+        assert_eq!(
+            code[target], 0xc3,
+            "threaded jmp must land on the final ret"
+        );
+    }
+
+    /// `peephole_savings` reports the bytes the pass removed (here: one deleted
+    /// self-move = 3 bytes), so the size statistic is exercised by a unit test.
+    #[test]
+    fn savings_counts_removed_bytes() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_rr(Gpr::Rbx, Gpr::Rbx); // 3-byte no-op -> deleted
+        a.ret();
+        a.peephole();
+        assert_eq!(a.peephole_savings(), 3, "one deleted self-move is 3 bytes");
+    }
+
+    /// An `Other` barrier between a self-move pattern does not enable an unsafe
+    /// rewrite: a `mov r,0` whose flags are consumed by an opaque `Other` (which
+    /// might be `adc`/`setcc`) is conservatively left as a `mov`.
+    #[test]
+    fn rule_other_is_a_barrier() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_ri(Gpr::Rax, 0);
+        a.adc_rr(Gpr::Rax, Gpr::Rcx); // Other: reads CF (a flag) — blocks the xor rewrite
+        a.ret();
+        let (code, _) = a.finish();
+        assert_eq!(
+            &code[0..3],
+            &[0x48, 0xc7, 0xc0],
+            "mov r,0 must survive before adc"
+        );
+    }
+
+    /// Soundness counterexample (finding v0.17-#3): a `mov r,0` whose flags are
+    /// LIVE-OUT across an unconditional `jmp` to a block that opens with a `jcc`
+    /// must NOT become `xor r,r`. The producing `cmp` sets the flags, the `mov`
+    /// follows, then `jmp L` leaves the block; block `L` reads the flags with a
+    /// `jcc`. An `xor` here would clobber the still-live flags and the `jcc` would
+    /// branch on garbage. The old same-block scan treated the `jmp` as "flags
+    /// dead" and miscompiled this shape; the fixed rule ends the window UNSAFE at
+    /// the block boundary, so the 7-byte `mov` is preserved.
+    #[test]
+    fn rule_mov_zero_to_xor_unsound_across_jmp_is_blocked() {
+        let mut a = Asm::new();
+        a.reserve_labels(2);
+        a.cmp_rr(Gpr::Rax, Gpr::Rcx); // sets flags that are LIVE across the jmp
+        a.mov_ri(Gpr::Rbx, 0); // candidate: must stay a `mov`, not become `xor`
+        a.jmp(LabelId(0)); // leaves the block with flags live-out
+        a.mov_rr(Gpr::Rdx, Gpr::Rcx); // filler block (not reached with flags live)
+        a.bind_label(LabelId(0));
+        a.jcc(Cc::E, LabelId(1)); // reads the flags set by the cmp above
+        a.bind_label(LabelId(1));
+        a.ret();
+        let (code, _) = a.finish();
+        // The `mov rbx,0` (7 bytes: 48 C7 C3 00 00 00 00) must survive verbatim —
+        // an `xor rbx,rbx` (48 31 DB) would have clobbered the flags the jcc reads.
+        let mov = [0x48u8, 0xc7, 0xc3, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            code.windows(mov.len()).any(|w| w == mov),
+            "mov rbx,0 must survive (flags live-out across the jmp); got {code:02x?}"
+        );
+        let xor = [0x48u8, 0x31, 0xdb];
+        assert!(
+            !code.windows(xor.len()).any(|w| w == xor),
+            "must NOT emit `xor rbx,rbx` across a flag-live block edge; got {code:02x?}"
+        );
+    }
+
+    /// The companion SAFE shape: a `mov r,0` whose flags are clobbered within the
+    /// same block (here by a `syscall`, after which the kernel/ABI leaves the flags
+    /// unobservable — the same rationale that makes `call` safe) before any reader
+    /// or block exit IS still rewritten to the 3-byte `xor`. This pins that the
+    /// soundness fix did not over-tighten the common rewritable shape away.
+    #[test]
+    fn rule_mov_zero_to_xor_fires_when_clobbered_in_block() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.mov_ri(Gpr::Rbx, 0); // -> xor rbx,rbx (CtrlNoFlags follows in-block)
+        a.syscall(); // CtrlNoFlags: ends the flag-liveness window
+        a.ret();
+        let (code, _) = a.finish();
+        let xor = [0x48u8, 0x31, 0xdb];
+        assert!(
+            code.windows(xor.len()).any(|w| w == xor),
+            "mov rbx,0 should become `xor rbx,rbx` before a syscall; got {code:02x?}"
+        );
     }
 }

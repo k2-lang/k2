@@ -135,6 +135,29 @@ pub fn result_repr(arena: &TypeArena, ty: TypeId, dst_ty: Option<TypeId>) -> Int
     r
 }
 
+/// The TYPE a folded integer constant should carry. The folder masks the *value*
+/// to [`result_repr`] (the sized destination repr when the rvalue's own result
+/// type is an unsized `comptime_int`), but the propagated `Const::Int` must carry
+/// a *type* that is consistent with that masked value — otherwise a negative or
+/// otherwise comptime-typed fold flows downstream as `Type::ComptimeInt`, which
+/// the native print formatter (and any backend deriving a field type from the
+/// const) treats as a non-integer field and rejects in release builds (an
+/// opt-vs-unopt native divergence). So when the rvalue result type is `comptime_int`
+/// (width 0) and a sized integer destination is available, stamp the constant with
+/// the SIZED destination type. The value is already masked to that repr, so type
+/// and value stay consistent and the constant is a genuine sized integer
+/// everywhere downstream.
+fn stamp_ty(arena: &TypeArena, ty: TypeId, dst_ty: Option<TypeId>) -> TypeId {
+    if int_repr_of(arena, ty).width == 0 {
+        if let Some(dty) = dst_ty {
+            if int_repr_of(arena, dty).width != 0 {
+                return dty;
+            }
+        }
+    }
+    ty
+}
+
 /// `true` if `ty` is a float type (so the folder skips it).
 pub fn is_float_ty(arena: &TypeArena, ty: TypeId) -> bool {
     matches!(arena.get(ty), Type::Float { .. } | Type::ComptimeFloat)
@@ -210,6 +233,10 @@ pub fn fold_binary(
     // back to the destination's sized repr for a comptime-typed (width-0) result —
     // exactly the VM's `result_repr`. Comparisons (below) use the OPERANDS' repr.
     let res_repr = result_repr(arena, ty, dst_ty);
+    // The type the folded integer constant carries: the sized destination when the
+    // rvalue's own result type is `comptime_int` (see `stamp_ty`), so a folded
+    // value never propagates as a bare `comptime_int` the backend cannot format.
+    let res_ty = stamp_ty(arena, ty, dst_ty);
 
     // Comparisons use the OPERANDS' repr (the result repr is `bool`, width 0),
     // exactly like the VM. Prefer whichever operand is a sized integer.
@@ -221,15 +248,15 @@ pub fn fold_binary(
     let v = match op {
         BinOp::Add => Const::Int {
             value: res_repr.normalize(x.wrapping_add(y)),
-            ty,
+            ty: res_ty,
         },
         BinOp::Sub => Const::Int {
             value: res_repr.normalize(x.wrapping_sub(y)),
-            ty,
+            ty: res_ty,
         },
         BinOp::Mul => Const::Int {
             value: res_repr.normalize(x.wrapping_mul(y)),
-            ty,
+            ty: res_ty,
         },
         BinOp::Div => {
             let v = if y == 0 {
@@ -241,33 +268,33 @@ pub fn fold_binary(
             };
             Const::Int {
                 value: res_repr.normalize(v),
-                ty,
+                ty: res_ty,
             }
         }
         BinOp::Rem => {
             let v = if y == 0 { 0 } else { x.wrapping_rem(y) };
             Const::Int {
                 value: res_repr.normalize(v),
-                ty,
+                ty: res_ty,
             }
         }
         BinOp::BitAnd => Const::Int {
             value: res_repr.normalize(x & y),
-            ty,
+            ty: res_ty,
         },
         BinOp::BitOr => Const::Int {
             value: res_repr.normalize(x | y),
-            ty,
+            ty: res_ty,
         },
         BinOp::BitXor => Const::Int {
             value: res_repr.normalize(x ^ y),
-            ty,
+            ty: res_ty,
         },
         BinOp::Shl => {
             let sh = shift_amount(y, res_repr);
             Const::Int {
                 value: res_repr.normalize(x.wrapping_shl(sh)),
-                ty,
+                ty: res_ty,
             }
         }
         BinOp::Shr => {
@@ -279,7 +306,7 @@ pub fn fold_binary(
             };
             Const::Int {
                 value: res_repr.normalize(v),
-                ty,
+                ty: res_ty,
             }
         }
         BinOp::Eq => Const::Bool(x == y),
@@ -320,7 +347,7 @@ pub fn fold_unary(
             let repr = result_repr(arena, ty, dst_ty);
             Some(Const::Int {
                 value: repr.normalize(x.wrapping_neg()),
-                ty,
+                ty: stamp_ty(arena, ty, dst_ty),
             })
         }
         UnOp::BitNot => {
@@ -328,7 +355,7 @@ pub fn fold_unary(
             let repr = result_repr(arena, ty, dst_ty);
             Some(Const::Int {
                 value: repr.normalize(!x),
-                ty,
+                ty: stamp_ty(arena, ty, dst_ty),
             })
         }
     }

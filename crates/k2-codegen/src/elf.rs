@@ -49,6 +49,10 @@ pub const TEXT_VADDR: u64 = LOAD_BASE + PAGE;
 pub struct ElfImage {
     /// The complete file bytes (write to disk, `chmod +x`, execute).
     pub bytes: Vec<u8>,
+    /// The number of `.text` (machine-code) bytes in the image, before page
+    /// padding. The peephole size-reduction statistics compare this across a
+    /// peephole-on vs peephole-off build of the same program.
+    pub text_len: usize,
     /// The virtual address of `.text` / the entry point (`_start`).
     pub text_vaddr: u64,
     /// The virtual address of the `.rodata` blob (meaningful only when the
@@ -199,6 +203,7 @@ pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
 
     ElfImage {
         bytes,
+        text_len: text.len(),
         text_vaddr,
         rodata_vaddr,
         state_vaddr,

@@ -631,6 +631,13 @@ mod exec {
 
     /// Like [`lower`], but with an explicit [`BuildMode`] — `ReleaseFast` elides
     /// the safety checks, exercising the wrapping (no-trap) arithmetic paths.
+    ///
+    /// The MIR optimizer is run at the level the mode selects (Debug -> identity,
+    /// ReleaseSafe -> Safe, ReleaseFast -> Fast), exactly like the driver's
+    /// native/VM paths. This is the milestone's key change: native lowering now
+    /// sees the *optimized* MIR (folded constants, propagated copies, simplified
+    /// CFG), so the differential tests exercise the optimizer-on-native path that
+    /// the old `OptLevel::None`-only helper could not.
     fn lower_mode(source: &str, mode: BuildMode) -> MirProgram {
         // Inject the bundled std prelude exactly like the driver, so
         // `@import("std")` and the `*System` capability methods resolve.
@@ -651,7 +658,12 @@ mod exec {
 
         let mut prog = lower_program(&pres.file, &resolved, typed, mode).expect("lowering failed");
         assert!(prog.is_ok(), "lowering diagnostics in test program");
-        k2_opt::optimize(&mut prog, k2_opt::OptLevel::None);
+        let level = match mode {
+            BuildMode::Debug => k2_opt::OptLevel::None,
+            BuildMode::ReleaseSafe => k2_opt::OptLevel::Safe,
+            BuildMode::ReleaseFast => k2_opt::OptLevel::Fast,
+        };
+        k2_opt::optimize(&mut prog, level);
         let problems = prog.verify();
         assert!(problems.is_empty(), "malformed MIR: {problems:?}");
         prog
@@ -2192,5 +2204,427 @@ mod exec {
         let (v_big, _vo, _ve) = run_vm(&big);
         assert_eq!(n_big, 139, "native UAF on a multi-page block faults (139)");
         assert_eq!(v_big, 134, "VM UAF panics (134)");
+    }
+
+    // =====================================================================
+    //  v0.17 — the optimizer-on-native differential, peephole, and speedup
+    // =====================================================================
+
+    /// The committed example + bench sources, compiled through the same
+    /// std-injecting front end as every other exec test. These are full programs
+    /// (`@import("std")`), so `lower_mode` rewrites the std import and injects the
+    /// prelude. Each is in the native subset.
+    fn v017_corpus() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("hello", include_str!("../../../examples/hello.k2")),
+            ("errors", include_str!("../../../examples/errors.k2")),
+            (
+                "allocators",
+                include_str!("../../../examples/allocators.k2"),
+            ),
+            (
+                "fib_rec",
+                include_str!("../../k2c/bench/bench_fib_rec_native.k2"),
+            ),
+            (
+                "loop_sum",
+                include_str!("../../k2c/bench/bench_loop_sum.k2"),
+            ),
+            (
+                "struct_kernel",
+                include_str!("../../k2c/bench/bench_struct_kernel.k2"),
+            ),
+        ]
+    }
+
+    /// **The headline differential: native-opt == native-unopt == VM.**
+    ///
+    /// For every corpus program and every mode, the native backend and the VM must
+    /// agree on stdout + exit (`assert_native_eq_vm`), AND the optimized
+    /// ReleaseFast native run must match the unoptimized Debug native run (the
+    /// optimizer is behavior-preserving). This is the regression that proves Fix A:
+    /// before it, `hello` in release modes errored ("non-scalar constant Str"); the
+    /// old `OptLevel::None`-only helper could not see it.
+    #[test]
+    fn diff_native_opt_eq_unopt_eq_vm() {
+        for (name, src) in v017_corpus() {
+            // native == VM in each mode.
+            let dbg = lower_mode(src, BuildMode::Debug);
+            let safe = lower_mode(src, BuildMode::ReleaseSafe);
+            let fast = lower_mode(src, BuildMode::ReleaseFast);
+            assert_native_eq_vm(&dbg);
+            assert_native_eq_vm(&safe);
+            assert_native_eq_vm(&fast);
+
+            // native-opt (ReleaseFast) == native-unopt (Debug): the optimizer + the
+            // peephole are behavior-preserving. (These compute kernels do not trap,
+            // so Debug and ReleaseFast produce identical observable output.)
+            let (d_code, d_out, _) = run_native(&dbg);
+            let (f_code, f_out, _) = run_native(&fast);
+            assert_eq!(
+                String::from_utf8_lossy(&d_out),
+                String::from_utf8_lossy(&f_out),
+                "[{name}] native ReleaseFast stdout must equal native Debug"
+            );
+            assert_eq!(
+                d_code, f_code,
+                "[{name}] native ReleaseFast exit must equal native Debug"
+            );
+        }
+    }
+
+    /// The peephole pass must measurably shrink `.text` without changing behavior.
+    /// We assert a strict reduction on a kernel known to contain the targeted
+    /// patterns (the loop kernel: regalloc copies + a fall-through back-edge), a
+    /// non-increase everywhere, and — the correctness half — that the peepholed
+    /// binary behaves identically to the un-peepholed one for every corpus program.
+    #[test]
+    fn peephole_shrinks_code_and_preserves_behavior() {
+        let mut any_strict = false;
+        for (name, src) in v017_corpus() {
+            // Compile in both Debug and ReleaseFast; the peephole runs on both.
+            for mode in [BuildMode::Debug, BuildMode::ReleaseFast] {
+                let prog = lower_mode(src, mode);
+                let (img_on, stats) = crate::compile_program_to_elf_stats(&prog).expect("codegen");
+                assert!(
+                    stats.text_bytes_after <= stats.text_bytes_before,
+                    "[{name}/{mode:?}] peephole must never grow .text \
+                     ({} -> {})",
+                    stats.text_bytes_before,
+                    stats.text_bytes_after
+                );
+                if stats.text_bytes_after < stats.text_bytes_before {
+                    any_strict = true;
+                }
+
+                // Correctness: the peephole-on image (the shipped one) must behave
+                // exactly like the peephole-off image. Run both and compare.
+                let img_off = crate::encode::with_peephole(false, || {
+                    crate::compile_program_to_elf(&prog).expect("codegen-off")
+                });
+                let (c_on, o_on, _) = run_image(&img_on);
+                let (c_off, o_off, _) = run_image(&img_off);
+                assert_eq!(o_on, o_off, "[{name}/{mode:?}] peephole changed stdout");
+                assert_eq!(c_on, c_off, "[{name}/{mode:?}] peephole changed exit code");
+            }
+        }
+        assert!(
+            any_strict,
+            "the peephole must strictly shrink .text on at least one corpus program"
+        );
+    }
+
+    /// Writes an ELF image to a temp file, executes it, and returns
+    /// `(exit, stdout, stderr)`. Shares the ETXTBSY retry with [`run_native`].
+    fn run_image(img: &crate::ElfImage) -> (i32, Vec<u8>, Vec<u8>) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1_000_000);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("k2_peep_{}_{}", std::process::id(), n));
+        std::fs::write(&path, &img.bytes).expect("write elf");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let mut attempt = 0;
+        let out = loop {
+            match Command::new(&path).output() {
+                Ok(o) => break o,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("exec image: {e:?}"),
+            }
+        };
+        let _ = std::fs::remove_file(&path);
+        (native_exit_code(&out.status), out.stdout, out.stderr)
+    }
+
+    /// **Native is much faster than the VM** — a non-flaky, conservative
+    /// lower-bound assertion. fib(26) is timed native (min-of-N process exec) vs
+    /// the VM (min-of-N in-process), and native must be at least 5x faster. The
+    /// measured margin is enormous (the VM is a bytecode interpreter), so a 5x
+    /// floor cannot flake even on a slow/loaded CI box; a debug-profile test build
+    /// makes the VM *slower*, enlarging the ratio further. Output is asserted
+    /// identical native vs VM as an independent correctness gate.
+    #[test]
+    fn native_is_much_faster_than_vm() {
+        let src = include_str!("../../k2c/bench/bench_fib_rec_native.k2");
+        let prog = lower_mode(src, BuildMode::ReleaseFast);
+
+        // Build the ELF once; write + exec it best-of-N.
+        let img = crate::compile_program_to_elf(&prog).expect("codegen");
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("k2_speedup_{}", std::process::id()));
+        std::fs::write(&path, &img.bytes).expect("write");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        const REPS: u32 = 5;
+        let mut native_min = u128::MAX;
+        let mut native_out = Vec::new();
+        let mut native_code = 0;
+        for _ in 0..REPS {
+            let mut attempt = 0;
+            let (us, out) = loop {
+                let t0 = std::time::Instant::now();
+                match std::process::Command::new(&path).output() {
+                    Ok(o) => {
+                        native_code = native_exit_code(&o.status);
+                        break (t0.elapsed().as_micros(), o.stdout);
+                    }
+                    Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("exec: {e:?}"),
+                }
+            };
+            native_min = native_min.min(us);
+            native_out = out;
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // The VM, best-of-N in-process on the same optimized MIR.
+        let (vm_code, vm_out, _e) = run_vm(&prog);
+        let mut vm_min = u128::MAX;
+        for _ in 0..REPS {
+            let t0 = std::time::Instant::now();
+            let _ = k2_vm::run_captured(&prog, k2_vm::RunArgs::new(prog.mode));
+            vm_min = vm_min.min(t0.elapsed().as_micros());
+        }
+
+        // Correctness gate (independent of timing).
+        assert_eq!(
+            String::from_utf8_lossy(&native_out),
+            String::from_utf8_lossy(&vm_out),
+            "native and VM must produce identical output"
+        );
+        assert_eq!(native_code, vm_code, "native and VM exit must agree");
+
+        // Informational: print the real measured ratio (never a pass/fail input).
+        let ratio = vm_min as f64 / native_min.max(1) as f64;
+        eprintln!(
+            "[native_is_much_faster_than_vm] native={}us vm={}us ratio={:.1}x",
+            native_min, vm_min, ratio
+        );
+
+        // The non-flaky floor: VM must be at least 5x slower than native.
+        assert!(
+            vm_min >= 5 * native_min.max(1),
+            "expected native >= 5x faster; got native={native_min}us vm={vm_min}us \
+             ({ratio:.1}x)"
+        );
+    }
+
+    /// ReleaseFast strips a safety check that traps in Debug, and native matches the
+    /// VM in each mode. A `u8` overflow traps (exit 134) in Debug on both backends;
+    /// in ReleaseFast it wraps (no trap, exit 0) on both. This proves the native
+    /// check-stripping is correct and mode-for-mode identical to the VM.
+    #[test]
+    fn releasefast_strips_native_traps() {
+        let src = "pub fn main() u8 { var x: u8 = 255; x = x + 1; return x; }";
+
+        // Debug: the overflow check traps on both backends (panic-trap exit 134).
+        let dbg = lower_mode(src, BuildMode::Debug);
+        let (n_dbg, _o, _e) = run_native(&dbg);
+        let (v_dbg, _vo, _ve) = run_vm(&dbg);
+        assert_eq!(n_dbg, v_dbg, "Debug: native trap must match the VM");
+        assert_eq!(n_dbg, 134, "Debug: u8 overflow traps (134)");
+
+        // ReleaseFast: the check is stripped at lowering; the add wraps to 0, no
+        // trap, exit 0 — identical on both backends.
+        let fast = lower_mode(src, BuildMode::ReleaseFast);
+        let (n_fast, _o, _e) = run_native(&fast);
+        let (v_fast, _vo, _ve) = run_vm(&fast);
+        assert_eq!(
+            n_fast, v_fast,
+            "ReleaseFast: native no-trap must match the VM"
+        );
+        assert_eq!(n_fast, 0, "ReleaseFast: 255+1 wraps to 0, exit 0");
+
+        // The modes differ (the whole point of the strip): Debug traps, Fast does
+        // not — identically on both backends.
+        assert_ne!(n_dbg, n_fast, "Debug must trap where ReleaseFast does not");
+    }
+
+    // =====================================================================
+    //  v0.17 review fixes — differential regressions (native == VM, gated
+    //  x86_64-linux exec). Each pins one finding.
+    // =====================================================================
+
+    /// **Finding #1 — `for (slice) |x|` value capture.** A `for` loop over a slice
+    /// PARAMETER (a `&array` coerced to `[]const u32` at the call site) must compute
+    /// the real sum on native, matching the VM, in every mode. The bug: `&array`
+    /// was marshalled as a single pointer into a `[]T` parameter, so the callee read
+    /// a garbage `.len` and the loop summed to 0. The MIR now emits a `MakeSlice`
+    /// coercion, so both backends see a fat `{ptr, len}` slice.
+    #[test]
+    fn diff_for_over_slice_value_capture() {
+        let src = "fn sumArr(xs: []const u32) u32 { var t: u32 = 0; \
+                   for (xs) |x| { t = t + x; } return t; } \
+                   pub fn main(sys: *System) !void { const o = sys.io.stdout(); \
+                   const a = [_]u32{ 10, 20, 30, 40 }; \
+                   try o.print(\"sum={d}\\n\", .{sumArr(&a)}); }";
+        for mode in [
+            BuildMode::Debug,
+            BuildMode::ReleaseSafe,
+            BuildMode::ReleaseFast,
+        ] {
+            let prog = lower_mode(src, mode);
+            let (n_code, n_out, _) = run_native(&prog);
+            let (v_code, v_out, _) = run_vm(&prog);
+            assert_eq!(
+                String::from_utf8_lossy(&n_out),
+                "sum=100\n",
+                "[{mode:?}] for-over-slice value capture must sum to 100 on native"
+            );
+            assert_eq!(n_out, v_out, "[{mode:?}] for-over-slice native==VM stdout");
+            assert_eq!(n_code, v_code, "[{mode:?}] for-over-slice native==VM exit");
+        }
+    }
+
+    /// **Finding #1 (companion) — `for (array) |x|` and `for (xs, 0..) |x, i|`.** The
+    /// by-value capture over a local array, and the 2-operand value+index form,
+    /// must also match the VM in every mode.
+    #[test]
+    fn diff_for_over_array_and_index_forms() {
+        // for over a local array, by value.
+        let arr = "pub fn main(sys: *System) !void { const o = sys.io.stdout(); \
+                   const a = [_]u32{ 10, 20, 30, 40 }; var t: u32 = 0; \
+                   for (a) |x| { t = t + x; } try o.print(\"a={d}\\n\", .{t}); }";
+        // for over a slice with an index capture: sum x*i.
+        let idx = "fn weighted(xs: []const u32) u32 { var t: u32 = 0; \
+                   for (xs, 0..) |x, i| { t = t + x * @as(u32, @intCast(i)); } return t; } \
+                   pub fn main(sys: *System) !void { const o = sys.io.stdout(); \
+                   const a = [_]u32{ 10, 20, 30, 40 }; \
+                   try o.print(\"w={d}\\n\", .{weighted(&a)}); }";
+        for src in [arr, idx] {
+            for mode in [
+                BuildMode::Debug,
+                BuildMode::ReleaseSafe,
+                BuildMode::ReleaseFast,
+            ] {
+                let prog = lower_mode(src, mode);
+                let (n_code, n_out, _) = run_native(&prog);
+                let (v_code, v_out, _) = run_vm(&prog);
+                assert_eq!(n_out, v_out, "[{mode:?}] for-loop native==VM stdout");
+                assert_eq!(n_code, v_code, "[{mode:?}] for-loop native==VM exit");
+            }
+        }
+    }
+
+    /// **Finding #2 — const-folded integer print across modes + verbs.** A negative
+    /// (comptime-typed) integer constant, and a const-foldable integer expression,
+    /// printed with every integer verb, must produce byte-identical native output in
+    /// Debug, ReleaseSafe, and ReleaseFast — and match the VM. Before the fix the
+    /// optimizer folded the value to a `comptime_int` Const the native print
+    /// formatter rejected in release modes (exit 1 "non-integer field"), an
+    /// opt-vs-unopt native divergence.
+    #[test]
+    fn diff_const_folded_int_print_all_verbs() {
+        // The negative-constant headline repro, plus one const-foldable expression
+        // per verb (the fold collapses the arithmetic to an inline Const).
+        let progs = [
+            "const c: i64 = -7; try o.print(\"{d}\\n\", .{c});",
+            "const c: i64 = -7; try o.print(\"{}\\n\", .{c});",
+            "const c: u32 = (32 - 15); try o.print(\"{x}\\n\", .{c});",
+            "const c: u32 = (1 << 6) | 1; try o.print(\"{b}\\n\", .{c});",
+            "const c: u32 = 8 * 8 + 1; try o.print(\"{o}\\n\", .{c});",
+            "const c: u8 = 64 + 1; try o.print(\"{c}\\n\", .{c});",
+        ];
+        for body in progs {
+            let src = main_io(body);
+            // The Debug (unopt) native output is the reference; every release mode
+            // and the VM must equal it.
+            let dbg = lower_mode(&src, BuildMode::Debug);
+            let (ref_code, ref_out, _) = run_native(&dbg);
+            for mode in [BuildMode::ReleaseSafe, BuildMode::ReleaseFast] {
+                let prog = lower_mode(&src, mode);
+                let (n_code, n_out, _) = run_native(&prog);
+                assert_eq!(
+                    n_out, ref_out,
+                    "[{mode:?}] `{body}` native release output must equal Debug native"
+                );
+                assert_eq!(n_code, 0, "[{mode:?}] `{body}` must succeed (exit 0)");
+            }
+            let (v_code, v_out, _) = run_vm(&dbg);
+            assert_eq!(v_out, ref_out, "`{body}` VM output must equal native Debug");
+            assert_eq!(v_code, ref_code, "`{body}` VM exit must equal native Debug");
+        }
+    }
+
+    /// **Finding #4 — ReleaseFast bounds-strip parity.** An out-of-bounds index in
+    /// ReleaseFast must not trap on EITHER backend (the bounds check is stripped on
+    /// both): exit 0, no panic. (The exact OOB value is UB and need not match; the
+    /// observable trap/exit behavior must.) In Debug both still trap (134).
+    #[test]
+    fn diff_releasefast_strips_bounds_native_eq_vm() {
+        let src = main_io(
+            "const a = [_]u32{ 10, 20, 30, 40 }; var i: usize = 9; \
+             const x = a[i]; try o.print(\"x={d}\\n\", .{x});",
+        );
+        // Debug: both trap.
+        let dbg = lower_mode(&src, BuildMode::Debug);
+        let (n_dbg, _, _) = run_native(&dbg);
+        let (v_dbg, _, _) = run_vm(&dbg);
+        assert_eq!(n_dbg, 134, "Debug OOB traps on native (134)");
+        assert_eq!(v_dbg, 134, "Debug OOB traps on the VM (134)");
+        // ReleaseFast: neither traps — both exit 0, no panic.
+        let fast = lower_mode(&src, BuildMode::ReleaseFast);
+        let (n_fast, _, _) = run_native(&fast);
+        let (v_fast, _, _) = run_vm(&fast);
+        assert_eq!(n_fast, 0, "ReleaseFast native OOB does not trap (exit 0)");
+        assert_eq!(v_fast, 0, "ReleaseFast VM OOB does not trap (exit 0)");
+    }
+
+    /// **Finding #5 — trap message text native == VM.** The two trap-message tables
+    /// (native `trap_message`, VM `PanicInfo::message`) are aligned, so a trap
+    /// prints identical text on both backends. Verified for negation overflow and a
+    /// narrowing-cast trap (the two the finding called out).
+    ///
+    /// The native backend writes `panic: <message>\n` to fd 2 (its `trap_message`
+    /// table); the VM's captured-run reports the same message via the
+    /// `RunOutcome::Panicked(msg)` outcome (its `PanicInfo::message`, which the
+    /// streaming `run_program` path renders identically as `panic: <msg>`). We
+    /// compare the native stderr line against the VM's rendered panic line.
+    #[test]
+    fn diff_trap_message_text_native_eq_vm() {
+        use k2_vm::RunOutcome;
+        // i32::MIN negation overflows in Debug -> "negation of minimum integer".
+        let neg = "pub fn main(sys: *System) !void { _ = sys; \
+                   var x: i32 = -2147483648; x = -x; _ = x; }";
+        // u64 300 -> u8 narrowing truncates -> "cast truncated value".
+        let cast = "pub fn main(sys: *System) !void { _ = sys; \
+                    var n: u64 = 300; const t: u8 = @intCast(n); _ = t; }";
+        for (src, needle) in [
+            (neg, "negation of minimum integer"),
+            (cast, "cast truncated value"),
+        ] {
+            let prog = lower_mode(src, BuildMode::Debug);
+            let (n_code, _n_out, n_err) = run_native(&prog);
+            let n_err = String::from_utf8_lossy(&n_err).to_string();
+            // The VM's panic message, rendered the way `run_program` prints it.
+            let (v_outcome, v_code, _v_out, _v_err) =
+                k2_vm::run_captured(&prog, k2_vm::RunArgs::new(prog.mode));
+            let v_line = match v_outcome {
+                RunOutcome::Panicked(msg) => format!("panic: {msg}"),
+                other => panic!("`{needle}` expected a VM panic, got {other:?}"),
+            };
+            assert_eq!(n_code, 134, "`{needle}` traps on native (134)");
+            assert_eq!(v_code, 134, "`{needle}` traps on the VM (134)");
+            assert!(
+                n_err.contains(needle),
+                "native stderr must contain `{needle}`, got: {n_err:?}"
+            );
+            assert_eq!(
+                n_err.trim(),
+                v_line.trim(),
+                "trap text must be byte-identical native==VM for `{needle}`"
+            );
+        }
     }
 }

@@ -418,8 +418,20 @@ fn elem_of(arena: &TypeArena, ty: TypeId) -> TypeId {
 /// type, the result type of a projected place (walking field/index/slice-meta/
 /// payload/deref projections), or `None` for a constant.
 fn operand_decl_type(func: &MirFunction, arena: &TypeArena, op: &Operand) -> Option<TypeId> {
+    // This MUST stay aligned with `lower::operand_type`: the synthetic packed layout
+    // computed here (field strides + the home size) and the per-field stores emitted
+    // by `lower::build_aggregate` are two views of the *same* aggregate, so a
+    // disagreement on any field type corrupts the layout. Copy/const propagation
+    // (the optimizer) newly folds typed locals into inline constant fields of a
+    // print tuple, so a constant field must report the same type the value carries —
+    // a string is `[]const u8` (16 bytes), a typed int/float/enum its own type —
+    // rather than falling back to the surrounding (deferred) tuple type.
     match op {
         Operand::Copy(p) => Some(place_result_type(func, arena, p)),
+        Operand::Const(k2_mir::Const::Str(_)) => Some(arena.t_str()),
+        Operand::Const(k2_mir::Const::Int { ty, .. })
+        | Operand::Const(k2_mir::Const::Float { ty, .. })
+        | Operand::Const(k2_mir::Const::EnumVal { ty, .. }) => Some(*ty),
         _ => None,
     }
 }

@@ -1,0 +1,20 @@
+// bench_fib_rec_native.k2 — the heavy recursive-Fibonacci kernel for the
+// native-vs-VM wall-clock benchmark (`k2c bench --native`).
+//
+// fib(26) is the headline workload: it is a call-heavy kernel that completes
+// comfortably on the VM (~2.9M executed instructions in ReleaseFast — far under
+// the deterministic 200M-step budget and the 5-second wall guard) while the
+// native binary runs the *same* optimized MIR many times faster, so the committed
+// >=5x speedup floor holds with a large safety margin even on a slow/loaded CI
+// box. The body is pure integer recursion — squarely in the native subset — so
+// the differential harness can assert native stdout/exit == VM byte-for-byte.
+
+fn fib(n: u32) u32 {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try out.print("fib(26) = {d}\n", .{fib(26)});
+}
