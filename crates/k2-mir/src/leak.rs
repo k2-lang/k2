@@ -349,7 +349,19 @@ fn owning_locals(func: &MirFunction, alloc_temp: LocalId) -> HashSet<LocalId> {
 
 /// `true` if an intrinsic path is an *allocating* operation whose result is an
 /// owned resource (final member ∈ the small allocator set).
+///
+/// The v0.23 fs/net door shares two of these spellings — `sys.fs.create(path)`
+/// opens a FILE (not a heap cell) and `listener.accept()`/`stream` handles are not
+/// heap-owned — so a path rooted in an OS-effect namespace is explicitly NOT an
+/// allocation. The OS handle owns an fd/socket released by `close()`, which the
+/// leak pass does not (and should not) track as a heap allocation.
 fn is_allocating(path: &IntrinsicPath) -> bool {
+    if matches!(
+        path.members.first().map(String::as_str),
+        Some("fs" | "os" | "net" | "time")
+    ) {
+        return false;
+    }
     matches!(path.last(), Some("alloc" | "create" | "dupe"))
 }
 

@@ -62,7 +62,7 @@ use k2_resolve::{
 };
 use k2_syntax::{Expr, Item, SourceFile, Span};
 use k2_types::{check_file, dump_signatures, dump_types};
-use k2_vm::{run_metered, run_program, RunArgs, RunOutcome};
+use k2_vm::{run_metered, run_program, OsInputs, RunArgs, RunOutcome};
 
 /// Program name used in diagnostics and the usage text.
 const PROG: &str = "k2c";
@@ -882,20 +882,38 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut mode = BuildMode::Debug;
     let mut opt_flag = false;
     let mut opt_report = false;
-    // Arguments after the path are reserved for the program's own argv.
+    // Arguments after the path are the program's own argv (read by `sys.os.args`).
     let mut forwarded: Vec<String> = Vec::new();
+    // The v0.23 OS inputs: the real-env / real-pid opt-ins and a scripted env map.
+    // Defaults keep the run offline-absent and deterministic.
+    let mut os = OsInputs::default();
     let mut seen_path = false;
     for arg in args {
         if seen_path {
             forwarded.push(arg.clone());
             continue;
         }
-        match arg.as_str() {
+        let a = arg.as_str();
+        if let Some(kv) = a.strip_prefix("--env=") {
+            // `--env=KEY=VALUE`: inject a single scripted env var (deterministic).
+            if let Some((k, v)) = kv.split_once('=') {
+                os.env.push((k.to_string(), v.to_string()));
+            } else {
+                return Err("`--env` expects `KEY=VALUE`".to_string());
+            }
+            continue;
+        }
+        match a {
             "--release-fast" => mode = BuildMode::ReleaseFast,
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
             "--opt" => opt_flag = true,
             "--opt-report" => opt_report = true,
+            // Real OS opt-ins. Without these, `sys.env.get` is offline-absent (or
+            // reads only the scripted `--env` map) and `sys.os.getpid()` is a
+            // deterministic `1`, so reproducibility is the default.
+            "--real-env" => os.env_host = true,
+            "--real-pid" => os.real_pid = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown `run` flag `{other}`"));
             }
@@ -904,6 +922,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
                 seen_path = true;
             }
         }
+    }
+    // A leading `--` separates k2c flags from the program's argv; drop it so the
+    // program sees only its own args (`k2c run prog.k2 -- a b` -> argv `[a, b]`).
+    if forwarded.first().map(String::as_str) == Some("--") {
+        forwarded.remove(0);
     }
     let path =
         path.ok_or_else(|| "`run` needs a <file.k2> argument (or `-` for stdin)".to_string())?;
@@ -929,7 +952,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             );
             return Ok(ExitCode::FAILURE);
         }
-        return run_multi_file(path, &label, mode, opt_flag, opt_report, forwarded);
+        return run_multi_file(path, &label, mode, opt_flag, opt_report, forwarded, os);
     }
 
     let pres = parse_program(&source);
@@ -1016,6 +1039,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         RunArgs {
             mode,
             argv: forwarded,
+            os,
             trace_label: Some(label.clone()),
         },
     ))
@@ -1033,6 +1057,7 @@ fn run_multi_file(
     opt_flag: bool,
     opt_report: bool,
     forwarded: Vec<String>,
+    os: OsInputs,
 ) -> Result<ExitCode, String> {
     let root = Path::new(path);
     let build_root = root
@@ -1080,6 +1105,7 @@ fn run_multi_file(
         RunArgs {
             mode,
             argv: forwarded,
+            os,
             trace_label: Some(label.to_string()),
         },
     ))
@@ -1566,7 +1592,12 @@ fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
     }
     set_executable(&tmp);
 
-    let forwarded_args: Vec<&String> = forwarded;
+    // A leading `--` separates k2c flags from the program's argv; drop it so the
+    // child process sees only its own args on the stack (`_start` reads argv there).
+    let forwarded_args: Vec<&String> = match forwarded.split_first() {
+        Some((first, rest)) if first.as_str() == "--" => rest.to_vec(),
+        _ => forwarded,
+    };
     let status = std::process::Command::new(&tmp)
         .args(forwarded_args.iter().map(|s| s.as_str()))
         .status();

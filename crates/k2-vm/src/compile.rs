@@ -727,6 +727,39 @@ impl<'p> FnCompiler<'p> {
                 "buildInstall" => IntrinsicId::BuildInstall,
                 "buildStep" => IntrinsicId::BuildStep,
                 "buildStepDependOn" => IntrinsicId::BuildStepDependOn,
+                // The v0.23 fs/os/time/net floor: thin `@builtin` leaf intrinsics
+                // the std `fs`/`os`/`time`/`net` wrapper methods call (passing a
+                // `u32` handle id / a path / a byte buffer), backed by Rust `std` on
+                // the VM and raw syscalls (where feasible) natively. See `IntrinsicId`
+                // and the VM dispatcher.
+                "fsOpenRead" => IntrinsicId::FsOpenRead,
+                "fsCreate" => IntrinsicId::FsCreate,
+                "fsOpenReadWrite" => IntrinsicId::FsOpenReadWrite,
+                "fsRead" => IntrinsicId::FsRead,
+                "fsWrite" => IntrinsicId::FsWrite,
+                "fsClose" => IntrinsicId::FsClose,
+                "fsStat" => IntrinsicId::FsStat,
+                "fsFstat" => IntrinsicId::FsFstat,
+                "fsExists" => IntrinsicId::FsExists,
+                "fsDelete" => IntrinsicId::FsDelete,
+                "fsMkdir" => IntrinsicId::FsMkdir,
+                "fsRmdir" => IntrinsicId::FsRmdir,
+                "fsListDir" => IntrinsicId::FsListDir,
+                "osArgCount" => IntrinsicId::OsArgCount,
+                "osArg" => IntrinsicId::OsArg,
+                "osArgs" => IntrinsicId::OsArgs,
+                "osGetpid" => IntrinsicId::OsGetpid,
+                "osExit" => IntrinsicId::OsExit,
+                "timeWallReal" => IntrinsicId::TimeWallReal,
+                "timeMonoReal" => IntrinsicId::TimeMonoReal,
+                "timeSleepReal" => IntrinsicId::TimeSleepReal,
+                "netListen" => IntrinsicId::NetListen,
+                "netAccept" => IntrinsicId::NetAccept,
+                "netConnect" => IntrinsicId::NetConnect,
+                "netSend" => IntrinsicId::NetSend,
+                "netRecv" => IntrinsicId::NetRecv,
+                "netLocalPort" => IntrinsicId::NetLocalPort,
+                "netClose" => IntrinsicId::NetClose,
                 other => IntrinsicId::Unsupported(format!("@{other}")),
             },
             IntrinsicRoot::Value(_) => {
@@ -748,6 +781,76 @@ impl<'p> FnCompiler<'p> {
                     ["random", "int" | "intRangeLessThan"] => IntrinsicId::RandomInt,
                     ["random", "bytes"] => IntrinsicId::RandomBytes,
                     ["env", "get"] => IntrinsicId::EnvGet,
+                    // ---- The v0.23 fs/os/time/net capability door (spec §7.4) ----
+                    // The bare `sys.fs`/`sys.os`/`sys.time`/`sys.net` namespace
+                    // member yields the capability value; the door methods on it
+                    // (`openRead`/`stat`/`args`/`nowReal`/`listen`/…) are the real
+                    // OS effects. Handle methods reached on the File/Listener/Stream
+                    // values these mint (`read`/`write`/`accept`/`close`/…) are
+                    // demuxed by receiver kind in the VM dispatcher, since several
+                    // method spellings (`close`/`send`/`recv`) collide with the
+                    // concurrency channel floor.
+                    // Note: the bare `["os"]` member is NOT mapped to a capability:
+                    // it collides with `target.os` (a `Target` field read in a build
+                    // script). `sys.os` is always used as `sys.os.<method>()`, whose
+                    // member path is `["os", "<method>"]`, so the door methods below
+                    // are unaffected; only a bare `const o = sys.os` rebind is
+                    // unsupported (use `sys.os.<method>()` directly).
+                    ["fs"] => IntrinsicId::FsCap,
+                    ["time"] => IntrinsicId::TimeCap,
+                    ["net"] => IntrinsicId::NetCap,
+                    ["fs", "openRead"] => IntrinsicId::FsOpenRead,
+                    ["fs", "create"] => IntrinsicId::FsCreate,
+                    ["fs", "openReadWrite"] => IntrinsicId::FsOpenReadWrite,
+                    ["fs", "stat"] => IntrinsicId::FsStat,
+                    ["fs", "exists"] => IntrinsicId::FsExists,
+                    ["fs", "delete"] => IntrinsicId::FsDelete,
+                    ["fs", "makeDir"] => IntrinsicId::FsMkdir,
+                    ["fs", "removeDir"] => IntrinsicId::FsRmdir,
+                    ["fs", "listDir"] => IntrinsicId::FsListDir,
+                    ["os", "argCount"] => IntrinsicId::OsArgCount,
+                    ["os", "arg"] => IntrinsicId::OsArg,
+                    ["os", "args"] => IntrinsicId::OsArgs,
+                    ["os", "getpid"] => IntrinsicId::OsGetpid,
+                    ["os", "exit"] => IntrinsicId::OsExit,
+                    ["time", "nowReal" | "wallReal"] => IntrinsicId::TimeWallReal,
+                    ["time", "monotonicReal"] => IntrinsicId::TimeMonoReal,
+                    ["time", "sleepReal"] => IntrinsicId::TimeSleepReal,
+                    // The bare spellings, reached when the `sys.time` capability is
+                    // threaded through an `anytype` parameter (`Instant.now(t)` /
+                    // `elapsedSince(t)` call `t.monotonicReal()` inside their body).
+                    ["nowReal" | "wallReal"] => IntrinsicId::TimeWallReal,
+                    ["monotonicReal"] => IntrinsicId::TimeMonoReal,
+                    ["sleepReal"] => IntrinsicId::TimeSleepReal,
+                    ["net", "listen"] => IntrinsicId::NetListen,
+                    ["net", "connect"] => IntrinsicId::NetConnect,
+                    // The bare door spellings, reached when an `Fs`/`Net` capability
+                    // is threaded through an `anytype` parameter (`fn w(fsc: anytype)`
+                    // then `fsc.openRead(path)` — the `fs` member is already consumed).
+                    // These names are unambiguous (used nowhere else); the two that DO
+                    // collide — `create` (heap allocator) and `stat` (open-file fstat)
+                    // — are demuxed by receiver kind in the VM dispatcher instead.
+                    ["openRead"] => IntrinsicId::FsOpenRead,
+                    ["openReadWrite"] => IntrinsicId::FsOpenReadWrite,
+                    ["exists"] => IntrinsicId::FsExists,
+                    ["delete"] => IntrinsicId::FsDelete,
+                    ["makeDir"] => IntrinsicId::FsMkdir,
+                    ["removeDir"] => IntrinsicId::FsRmdir,
+                    ["listDir"] => IntrinsicId::FsListDir,
+                    ["listen"] => IntrinsicId::NetListen,
+                    ["connect"] => IntrinsicId::NetConnect,
+                    ["argCount"] => IntrinsicId::OsArgCount,
+                    ["arg"] => IntrinsicId::OsArg,
+                    ["getpid"] => IntrinsicId::OsGetpid,
+                    // File/Stream handle methods with non-colliding spellings.
+                    ["read"] => IntrinsicId::FsRead,
+                    ["write"] => IntrinsicId::FsWrite,
+                    ["stat"] => IntrinsicId::FsFstat,
+                    ["accept"] => IntrinsicId::NetAccept,
+                    ["localPort"] => IntrinsicId::NetLocalPort,
+                    // `Stat` field reads on the deferred door result (field by name).
+                    ["size"] => IntrinsicId::StatSize,
+                    ["is_dir"] => IntrinsicId::StatIsDir,
                     ["print"] => IntrinsicId::Print,
                     // Slice metadata reached on a still-`deferred` value (an
                     // unannotated `const g = alloc.realloc(...)` whose element

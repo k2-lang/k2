@@ -27,7 +27,7 @@ use k2_mir::BuildMode;
 use k2_opt::{optimize, OptLevel};
 use k2_vm::{
     run_build_graph, run_program_code, run_tests, Artifact, ArtifactKind, BuildGraph, BuildInputs,
-    OptMode, RunArgs, TargetTriple,
+    OptMode, OsInputs, RunArgs, TargetTriple,
 };
 
 use crate::lock;
@@ -358,6 +358,7 @@ fn step_run(
             RunArgs {
                 mode,
                 argv,
+                os: OsInputs::default(),
                 trace_label: None,
             },
         );
@@ -486,6 +487,7 @@ fn run_user_step(
             RunArgs {
                 mode,
                 argv,
+                os: OsInputs::default(),
                 trace_label: None,
             },
         );

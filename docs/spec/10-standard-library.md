@@ -925,6 +925,19 @@ measuring durations), `wallNanos()` (calendar time), and `sleep(ns)`. A
 function that takes a `Clock` and nothing else is, by signature, a function
 whose only effect is observing or waiting on time.
 
+**Deterministic vs. real time (v0.23).** `sys.clock` is the *deterministic*
+clock: it starts at zero and only advances on `sleep`, so it is fully
+reproducible — the default for tests. Alongside it, `sys.time` reads the
+**real host clock**: `sys.time.monotonicReal()` (a non-decreasing real
+monotonic counter, nanoseconds), `sys.time.nowReal()` (the real wall-clock
+Unix time, nanoseconds), and `sys.time.sleepReal(ns)` (a real delay). The
+`std.time.Duration`/`std.time.Instant` value types work over either clock —
+`Instant.fromNanos(reading)` captures a point and `elapsedSince(later_reading)`
+measures a `Duration`. Real time is opt-in *per call*, so adding `sys.time`
+never perturbs a deterministic run. Tests of real time assert only
+inequalities (monotonic increased, a sleep delayed by at least a loose lower
+bound), never exact nanoseconds, so they stay robust and offline.
+
 ### 7.3 `Random` — randomness
 
 ```k2
@@ -950,49 +963,83 @@ just as the heap flows from `sys.heap`. This is what makes random-using code
 testable: hand it a *seeded* or *scripted* `Random` (§08) and its behavior is
 deterministic.
 
-### 7.4 `Fs`, `Net`, and `Env`
+### 7.4 `Fs`, `Net`, `Os`, and `Env` (v0.23)
 
 The remaining capabilities follow the identical pattern: authority is a
 value, obtained from `sys`, and a function that uses it carries it in its
-signature.
+signature. As of v0.23 these are **real OS effects** (backed by the host's
+filesystem and TCP stack); tests use temp files and loopback only, are
+self-cleaning, and never touch an external network.
+
+**`Fs` — the filesystem.** `sys.fs` opens, reads, writes, stats, and removes
+files, and makes/removes directories:
 
 ```k2
 const std = @import("std");
 
 pub fn main(sys: *System) !void {
     const out = sys.io.stdout();
+    const path = "/tmp/k2_demo.bin";
 
-    // Env: command-line arguments come through the env capability, allocated
-    // with an explicit allocator — never an ambient global.
-    const args = try sys.env.args(sys.heap);
-    defer sys.heap.free(args);
-    try out.print("argc = {d}\n", .{args.len});
+    // Create + write through the fs capability (no ambient `open`).
+    var wf = try sys.fs.create(path);          // O_CREAT|O_TRUNC|O_RDWR
+    const nw = try wf.write("hello, fs");       // -> bytes written
+    wf.close();
 
-    // Fs: opening a file is authority granted by `sys.fs`. The returned File
-    // exposes Reader/Writer (§04) — composing the I/O interfaces with the
-    // filesystem capability.
-    var file = try sys.fs.openRead("config.txt");
-    defer file.close();
+    // Stat: size and is_dir.
+    const st = try sys.fs.stat(path);
+    try out.print("wrote {d}, size {d}\n", .{ nw, st.size });
 
-    var buf: [256]u8 = undefined;
-    const n = try file.reader().read(&buf);
-    try out.print("read {d} bytes of config\n", .{n});
+    // Read it back, byte-for-byte.
+    var rf = try sys.fs.openRead(path);         // read-only
+    var buf: [64]u8 = undefined;
+    const nr = try rf.read(&buf);
+    rf.close();
+    try out.print("read {d}: {s}\n", .{ nr, buf[0..nr] });
 
-    // Net: connecting is authority granted by `sys.net`; a connection again
-    // exposes Reader/Writer once established.
-    // var conn = try sys.net.connect("example.com", 80);
-    // defer conn.close();
+    try sys.fs.delete(path);                     // self-clean
 }
 ```
 
-Notice how the capabilities **compose**: `Fs.openRead` returns a `File` whose
-`reader()`/`writer()` are the `std.io` interfaces of §04, and `Net.connect`
-returns a connection with the same. The interfaces are the shared
-vocabulary; the capabilities are the authority to obtain a real one. `Env`'s
-`args(alloc)` even *takes an allocator*, because materializing the argument
-list is a heap operation — so it honestly declares both the env authority
-(it is a method on `Env`) and the allocation (an explicit `Allocator`
-parameter).
+`Fs` exposes `openRead(path)`, `create(path)`, `openReadWrite(path)` (each →
+`FsError!File`), `stat(path)`, `exists(path)`, `delete(path)`,
+`makeDir(path)`/`removeDir(path)`, and `listDir(alloc, path)`. A `File`
+exposes `read(buf)`/`write(bytes)`/`stat()`/`close()`. Errors are an honest
+`FsError` set (`FileNotFound`, `AccessDenied`, `AlreadyExists`, …) mapped from
+the host.
+
+**`Net` — TCP sockets.** `sys.net.listen(port)` binds a loopback listener
+(port 0 = an ephemeral port, read back with `localPort()`); `sys.net.connect(
+host, port)` connects. A `TcpListener.accept()` yields a `TcpStream`, which
+exposes `send(bytes)`/`recv(buf)`/`close()`:
+
+```k2
+var listener = try sys.net.listen(0);          // ephemeral loopback port
+var client   = try sys.net.connect("127.0.0.1", listener.localPort());
+var server   = try listener.accept();
+_ = try client.send("ping");
+var buf: [16]u8 = undefined;
+const n = try server.recv(&buf);               // server reads "ping"
+_ = try server.send(buf[0..n]);                // echo it back
+```
+
+**`Os` and `Env` — process.** `sys.os.argCount()`/`sys.os.arg(i)` read the
+forwarded command-line arguments (everything after `--`); `sys.os.args(alloc)`
+materializes them as `[][]const u8` through an explicit allocator (so the
+allocation is visible). `sys.os.getpid()` and `sys.os.exit(code)` round out the
+process surface. `sys.env.get(name)` looks up an environment variable, returning
+`?[]const u8`. **Reproducibility default:** env lookups are *offline-absent* by
+default — `sys.env.get` consults the host environment only when the run opts in
+(`k2c run --real-env`), or a scripted value supplied with `--env=KEY=VALUE`;
+otherwise every lookup is `null`. Likewise `getpid()` is a deterministic `1`
+unless `--real-pid` is passed. This keeps every run reproducible by default;
+the idiomatic form is `sys.env.get("VAR") orelse "default"`.
+
+**Native backend (v0.23).** The VM backs every effect with Rust `std`. The
+native backend implements the feasible subset with raw Linux syscalls
+(`sys.os.getpid`/`exit`) and **cleanly refuses** the rest at compile time
+(`sys.fs`/`sys.net`/`sys.time`, `os.args`/`env.get`), so such a program runs on
+the VM (`k2c run`) — a refusal is always reported, never a miscompile.
 
 ### 7.5 The rule, stated precisely
 

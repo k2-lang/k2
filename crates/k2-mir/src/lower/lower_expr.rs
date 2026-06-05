@@ -1762,7 +1762,18 @@ impl FnBuilder<'_, '_> {
             | "@mutexMake" | "@mutexLock" | "@mutexUnlock"
             | "@atomicMake" | "@atomicLoad" | "@atomicStore" | "@atomicFetchAdd"
             | "@atomicSwap" | "@atomicCas"
-            | "@wgMake" | "@wgAdd" | "@wgDone" | "@wgWait" => {
+            | "@wgMake" | "@wgAdd" | "@wgDone" | "@wgWait"
+            // The v0.23 fs/os/time/net floor: thin `@builtin` leaf intrinsics the
+            // std `fs`/`os`/`time`/`net` wrapper methods call (passing a `u32`
+            // handle id, a path, or a byte buffer). Backed by Rust `std` on the VM
+            // and raw syscalls (where feasible) natively; the rest cleanly refused.
+            | "@fsOpenRead" | "@fsCreate" | "@fsOpenReadWrite"
+            | "@fsRead" | "@fsWrite" | "@fsClose" | "@fsStat" | "@fsFstat"
+            | "@fsExists" | "@fsDelete" | "@fsMkdir" | "@fsRmdir" | "@fsListDir"
+            | "@osArgCount" | "@osArg" | "@osArgs" | "@osGetpid" | "@osExit"
+            | "@timeWallReal" | "@timeMonoReal" | "@timeSleepReal"
+            | "@netListen" | "@netAccept" | "@netConnect" | "@netSend" | "@netRecv"
+            | "@netLocalPort" | "@netClose" => {
                 // Runtime ops on opaque data -> intrinsic. `@schedSpawn`'s first
                 // argument is the work *function*: lower it to an `FnRef` const
                 // tag (the MIR has no indirect calls), so the VM can build the new

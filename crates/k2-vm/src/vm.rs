@@ -23,7 +23,7 @@ use crate::fmt::format_into;
 use crate::heap::{Heap, HeapFault, Ptr};
 use crate::isa::{AggregateKind, CompiledFn, Instr, IntrinsicId, Reg, StoreStep};
 use crate::sched::{BlockReason, FiberId, FiberState, Frame, Scheduler};
-use crate::value::{Capability, IntRepr, SchedKind, Value};
+use crate::value::{Capability, IntRepr, OsKind, SchedKind, Value};
 
 /// The build-time inputs the driver seeds into the VM before running `build(b)`:
 /// the resolved target/optimize choices and the `-D` option map. The `*Build`
@@ -39,6 +39,28 @@ pub struct BuildInputs {
     /// The `-Dkey=value` option map (deterministic order via the driver's
     /// `BTreeMap`).
     pub dopts: Vec<(String, String)>,
+}
+
+/// The driver-seeded OS-effect inputs for a v0.23 run: the forwarded program argv,
+/// a scripted environment map, and the real-env / real-pid opt-ins. The driver
+/// builds this from `k2c run`'s `--`-forwarded args and `--env`/`--real-env`/
+/// `--real-pid` flags; a test constructs it directly for a deterministic run.
+///
+/// All fields default to the offline, deterministic baseline (empty argv, no
+/// scripted vars, host env and real pid both off), so an empty `OsInputs` is
+/// indistinguishable from never seeding one.
+#[derive(Clone, Debug, Default)]
+pub struct OsInputs {
+    /// The forwarded program argv (`sys.os.args`/`arg`/`argCount`).
+    pub argv: Vec<String>,
+    /// The scripted environment map (`sys.env.get`/`sys.os.getenv`), consulted when
+    /// `env_host` is false. Deterministic: tests inject specific vars here.
+    pub env: Vec<(String, String)>,
+    /// Whether `sys.env.get` consults the *host* environment (default false).
+    pub env_host: bool,
+    /// Whether `sys.os.getpid` returns the *real* process id (default false: a
+    /// deterministic `1`).
+    pub real_pid: bool,
 }
 
 /// The mutable build-recording state the `*Build` floor writes into. Present only
@@ -243,6 +265,43 @@ pub struct Vm<'p> {
     /// `main` (newest-first). Empty in ReleaseFast and for non-error exits. Read
     /// via [`Vm::escaped_trace`] after `run_main`.
     escaped_trace: Vec<crate::trace::TraceFrame>,
+    /// The v0.23 OS-effect state, backed by Rust `std`. All effects flow through
+    /// the `sys.fs`/`sys.os`/`sys.time`/`sys.net` capabilities (no ambient global).
+    os: OsState,
+}
+
+/// The per-run OS-effect state the v0.23 `sys.fs`/`sys.os`/`sys.time`/`sys.net`
+/// capabilities operate over, all backed by Rust `std`. Open files, TCP listeners,
+/// and TCP streams are kept in handle tables (indexed by a [`Value::Os`] id), so a
+/// copied handle aliases the same OS object — exactly the file/socket semantics.
+///
+/// The defaults keep every existing run deterministic and offline: `argv` is empty,
+/// env lookups are absent (offline mode), `getpid` is a constant `1`, and the real
+/// clocks are never read unless the program calls `sys.time.*`. A driver opts into
+/// real effects per-field ([`Vm::with_os_inputs`]).
+#[derive(Default)]
+struct OsState {
+    /// Open files, indexed by [`Value::Os`] id. `None` is a closed slot.
+    files: Vec<Option<std::fs::File>>,
+    /// Bound TCP listeners, indexed by [`Value::Os`] id.
+    listeners: Vec<Option<std::net::TcpListener>>,
+    /// Connected TCP streams, indexed by [`Value::Os`] id.
+    streams: Vec<Option<std::net::TcpStream>>,
+    /// The forwarded program argv (`sys.os.args`/`arg`/`argCount`). Empty by default.
+    argv: Vec<Vec<u8>>,
+    /// The scripted environment map consulted by `sys.env.get`/`sys.os.getenv` when
+    /// not reading the host env. Deterministic: tests inject specific vars here.
+    env_map: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether `sys.env.get` consults the *host* environment (`std::env::var_os`).
+    /// Default `false` (offline-absent / scripted) so every existing test stays
+    /// reproducible; a driver sets it for a real-env run.
+    env_host: bool,
+    /// Whether `sys.os.getpid` returns the *real* process id. Default `false`
+    /// (a deterministic `1`); a driver sets it for a real-pid run.
+    real_pid: bool,
+    /// The monotonic real-time epoch: `epoch.elapsed()` backs `sys.time.monotonicReal`,
+    /// guaranteeing a non-decreasing reading within a run. Set in [`Vm::new`].
+    real_epoch: Option<std::time::Instant>,
 }
 
 impl<'p> Vm<'p> {
@@ -269,7 +328,30 @@ impl<'p> Vm<'p> {
             started: std::time::Instant::now(),
             build: None,
             escaped_trace: Vec::new(),
+            os: OsState {
+                real_epoch: Some(std::time::Instant::now()),
+                ..OsState::default()
+            },
         }
+    }
+
+    /// Seeds this VM's OS-effect inputs (v0.23) before `run_main`: the forwarded
+    /// program `argv`, the scripted environment map, and the real-env / real-pid
+    /// opt-ins. Returns `self` for builder-style threading from the driver.
+    ///
+    /// The defaults (empty argv, offline-absent env, constant pid) are unchanged
+    /// from a bare [`Vm::new`], so a caller that never calls this gets byte-identical
+    /// behaviour — which is why the whole pre-v0.23 corpus stays green.
+    pub fn with_os_inputs(&mut self, inputs: OsInputs) -> &mut Self {
+        self.os.argv = inputs.argv.into_iter().map(String::into_bytes).collect();
+        self.os.env_map = inputs
+            .env
+            .into_iter()
+            .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
+            .collect();
+        self.os.env_host = inputs.env_host;
+        self.os.real_pid = inputs.real_pid;
+        self
     }
 
     /// The error-return trace captured when an error escaped `main` (newest
@@ -283,6 +365,27 @@ impl<'p> Vm<'p> {
     /// benchmark harness reports (Debug vs ReleaseFast).
     pub fn instr_count(&self) -> u64 {
         self.instr_count
+    }
+
+    /// The `(files, listeners, streams)` OS handle-table lengths — the backing
+    /// `Vec` capacities, not the live-handle count. Exposed so a regression test
+    /// can prove that a long `open`/`close` loop REUSES vacated slots (the tables
+    /// stay bounded by the high-water mark of concurrently-open handles) rather
+    /// than growing one entry per open. Not used on the normal run path.
+    pub fn os_handle_table_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.os.files.len(),
+            self.os.listeners.len(),
+            self.os.streams.len(),
+        )
+    }
+
+    /// The captured stdout bytes accumulated so far. Exposed for tests that drive
+    /// a `Vm` directly (rather than `run_captured`) so they can both inspect
+    /// VM-internal state and assert on the program's output. Not used on the
+    /// normal run path, which reads `vm.stdout` in-crate.
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
     }
 
     /// Runs `main(sys)` to completion. On success returns `Ok(())`; otherwise a
@@ -803,12 +906,27 @@ impl<'p> Vm<'p> {
             Instr::LoadSliceMeta { dst, base, which } => {
                 let bv = self.get(base);
                 let v = self.slice_meta(&bv, which)?;
-                // A `.ptr` taken from a by-value array boxes the array into a heap
-                // cell; reflect that back into the base register so repeated meta
-                // reads (e.g. a sub-slice's `.ptr` and `.len`) share one backing
-                // allocation and the local aliases the slice's data.
+                // A `.ptr` taken from a by-value array (an `arr[lo..hi]` sub-slice)
+                // boxes the array into a heap cell; reflect that pointer back into
+                // the base register so repeated meta reads (e.g. a sub-slice's
+                // `.ptr` and `.len`) share one backing allocation and — crucially —
+                // so the LOCAL itself becomes that `Value::Ptr`. Subsequent
+                // `arr[i]` loads/stores then route through the SAME heap cell the
+                // slice's `ptr` addresses, so writes through the slice are visible
+                // via the array and vice-versa.
+                //
+                // This must also fire for an `= undefined` array (`Value::Undef`):
+                // `slice_meta` materializes it into a fresh default-initialized
+                // heap cell, and without this write-back the local would stay
+                // `Undef` and a later `arr[i]` store would materialize a SECOND,
+                // register-resident array that the slice's `ptr` does not alias —
+                // exactly the lost-write defect that made `fill(buf[0..N])` and
+                // `fs.read(buf[0..N])` silently drop every byte.
                 if let (SliceMeta::Ptr, Value::Ptr(p)) = (which, &v) {
-                    if matches!(bv, Value::Array(_)) {
+                    if matches!(bv, Value::Array(_))
+                        || matches!(&bv, Value::Undef(ty)
+                            if matches!(self.prog.arena.get(*ty), k2_types::Type::Array { .. }))
+                    {
                         self.set_cur(base, Value::Ptr(*p));
                     }
                 }
@@ -1595,6 +1713,20 @@ impl<'p> Vm<'p> {
         recv: Option<Value>,
         args: &[Value],
     ) -> Result<IntrinsicOutcome, Halt> {
+        // v0.23 OS-handle method demux. Several handle-method spellings collide
+        // between the fs/net floor and the concurrency channel floor: `close` is
+        // both `File`/`TcpStream`/`TcpListener` close and `Channel.close`; `send`/
+        // `recv` are both `TcpStream` ops and `Channel` ops. The compiler emits the
+        // channel id for the bare spelling; here, if the RECEIVER is actually an
+        // OS handle (an encoded handle, or a `{ handle: u32 }` struct), we reroute
+        // to the fs/net handler so `x.close()`/`stream.send(...)` work naturally
+        // without a type-system change. A genuine channel receiver (a `Value::Sched`)
+        // falls through to the concurrency floor unchanged.
+        if let Some(rerouted) = self.os_handle_reroute(id, &recv) {
+            return self
+                .dispatch_os_handle(&rerouted, recv, args)
+                .map(IntrinsicOutcome::Value);
+        }
         // A concurrency method reached as `value.<method>` (a deferred receiver —
         // e.g. `c.mu.lock()` where the field access lost the concrete `Mutex` type)
         // carries the handle in the RECEIVER, not the operands. Unify by prepending
@@ -2218,6 +2350,13 @@ impl<'p> Vm<'p> {
             // reached as member calls on an `Allocator` value. The handle id is on
             // the receiver (`Capability::Allocator(id)`, or the bare `sys.heap`).
             IntrinsicId::Create => {
+                // `create` collides between the heap allocator (`alloc.create(T)`)
+                // and the fs door (`sys.fs.create(path)`). When the receiver is the
+                // `Fs` capability — reached when `sys.fs` is threaded by value and
+                // `fsc.create(path)` is called — route to the file open instead.
+                if matches!(recv, Some(Value::Cap(Capability::Fs))) {
+                    return self.fs_open(args, 1);
+                }
                 let id = alloc_id_of(&recv);
                 let ty = type_carrier(args).unwrap_or_else(|| self.prog.arena.t_void());
                 self.alloc_create(id, ty)
@@ -2305,10 +2444,7 @@ impl<'p> Vm<'p> {
                 Ok(Value::Unit)
             }
             IntrinsicId::RandomInt => Ok(Value::int(self.next_random() as i128, IntRepr::USIZE)),
-            IntrinsicId::EnvGet => {
-                // Offline-safe: no host env is consulted; every lookup is absent.
-                Ok(Value::Optional(None))
-            }
+            IntrinsicId::EnvGet => Ok(self.env_get(args)),
             IntrinsicId::BufPrint => self.intrinsic_buf_print(args),
             IntrinsicId::SliceLen => match recv {
                 Some(Value::Slice { len, .. }) => Ok(Value::int(len as i128, IntRepr::USIZE)),
@@ -2338,6 +2474,69 @@ impl<'p> Vm<'p> {
             IntrinsicId::NoDivOverflow => Ok(self.no_div_overflow(args)),
             IntrinsicId::NoNegOverflow => Ok(self.no_neg_overflow(args)),
             IntrinsicId::NarrowFits => Ok(self.narrow_fits(args)),
+
+            // ---- The v0.23 fs/os/time/net capability floor ---------------
+            // The bare capability namespaces yield a capability value (the door
+            // through which the real OS effects are reached). Each effect below is
+            // backed by Rust `std`; errors map to name-keyed k2 error tags so the
+            // std `FsError`/`NetError` sets construct the right arm with no enum.
+            IntrinsicId::FsCap => Ok(Value::Cap(Capability::Fs)),
+            IntrinsicId::TimeCap => Ok(Value::Cap(Capability::Time)),
+            IntrinsicId::NetCap => Ok(Value::Cap(Capability::Net)),
+            IntrinsicId::FsOpenRead => self.fs_open(args, 0),
+            IntrinsicId::FsCreate => self.fs_open(args, 1),
+            IntrinsicId::FsOpenReadWrite => self.fs_open(args, 2),
+            IntrinsicId::FsStat => self.fs_stat_path(args),
+            // `Stat` field reads on the deferred door result: field 0 is the `u64`
+            // size, field 1 the `bool` is_dir. A non-`Stat` receiver yields the
+            // type's zero, never a panic.
+            IntrinsicId::StatSize => Ok(match recv {
+                Some(Value::Struct(fields)) => fields
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::int(0, IntRepr::USIZE)),
+                _ => Value::int(0, IntRepr::USIZE),
+            }),
+            IntrinsicId::StatIsDir => Ok(match recv {
+                Some(Value::Struct(fields)) => fields.get(1).cloned().unwrap_or(Value::Bool(false)),
+                _ => Value::Bool(false),
+            }),
+            IntrinsicId::FsExists => Ok(self.fs_exists(args)),
+            IntrinsicId::FsDelete => self.fs_delete(args),
+            IntrinsicId::FsMkdir => self.fs_mkdir(args),
+            IntrinsicId::FsRmdir => self.fs_rmdir(args),
+            IntrinsicId::FsListDir => self.fs_list_dir(args),
+            IntrinsicId::OsArgCount => Ok(Value::int(self.os.argv.len() as i128, IntRepr::USIZE)),
+            IntrinsicId::OsArg => Ok(self.os_arg(args)),
+            IntrinsicId::OsArgs => self.os_args(args),
+            IntrinsicId::OsGetpid => Ok(self.os_getpid()),
+            IntrinsicId::OsExit => {
+                let code = args.first().and_then(|v| v.as_i128()).unwrap_or(0);
+                Err(Halt::Exit((code & 0xff) as i32))
+            }
+            IntrinsicId::TimeWallReal => Ok(self.time_wall_real()),
+            IntrinsicId::TimeMonoReal => Ok(self.time_mono_real()),
+            IntrinsicId::TimeSleepReal => {
+                let ns = args.first().and_then(|v| v.as_i128()).unwrap_or(0).max(0) as u64;
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+                Ok(Value::Unit)
+            }
+            IntrinsicId::NetListen => self.net_listen(args),
+            IntrinsicId::NetConnect => self.net_connect(args),
+            // The File/Stream handle methods reach this dispatcher via the
+            // receiver-kind demux (`dispatch_os_handle`); their `recv` carries the
+            // OS handle. They are also reachable as bare leaf builtins (`@fsRead`
+            // etc.) from the std wrappers, where the handle is the first arg.
+            IntrinsicId::FsRead
+            | IntrinsicId::FsWrite
+            | IntrinsicId::FsFstat
+            | IntrinsicId::FsClose
+            | IntrinsicId::NetAccept
+            | IntrinsicId::NetSend
+            | IntrinsicId::NetRecv
+            | IntrinsicId::NetLocalPort
+            | IntrinsicId::NetClose => self.dispatch_os_handle(id, recv, args),
+
             IntrinsicId::Unsupported(name) => Err(Halt::Panic(PanicInfo {
                 reason: TrapReason::Panic,
                 detail: Some(format!("unsupported intrinsic `{name}`")),
@@ -2345,6 +2544,714 @@ impl<'p> Vm<'p> {
             // The concurrency floor is routed by `dispatch_intrinsic` (some of it
             // blocking) and never reaches this value-only dispatcher.
             _ => Err(self.internal("concurrency intrinsic reached value dispatcher")),
+        }
+    }
+
+    // ====================================================================
+    //  The v0.23 fs/os/time/net capability floor (Rust std backing)
+    // ====================================================================
+
+    /// Routes a File/Listener/Stream handle method to its effect. Reached both from
+    /// the receiver-kind demux (the `x.close()`/`stream.send(...)` natural spelling,
+    /// where the handle is the `recv`) and from the bare `@fs*`/`@net*` leaf builtins
+    /// the std wrappers call (where the handle is the first arg). The handle is
+    /// extracted uniformly via [`Vm::os_handle_of`].
+    fn dispatch_os_handle(
+        &mut self,
+        id: &IntrinsicId,
+        recv: Option<Value>,
+        args: &[Value],
+    ) -> Result<Value, Halt> {
+        // The handle is on the receiver (natural method spelling) or the first arg
+        // (the `@fsRead(handle, ...)` builtin spelling). Prefer the receiver.
+        let handle = recv
+            .as_ref()
+            .and_then(|r| self.os_handle_of(r))
+            .or_else(|| args.first().and_then(|a| self.os_handle_of(a)));
+        // The byte buffer / payload operand is the first non-handle slice/ptr arg.
+        match id {
+            IntrinsicId::FsRead => self.fs_read(handle, args),
+            IntrinsicId::FsWrite => self.fs_write(handle, args),
+            IntrinsicId::FsFstat => self.fs_fstat(handle),
+            IntrinsicId::FsClose => {
+                self.fs_close(handle);
+                Ok(Value::Unit)
+            }
+            IntrinsicId::NetAccept => self.net_accept(handle),
+            IntrinsicId::NetSend => self.net_send(handle, args),
+            IntrinsicId::NetRecv => self.net_recv(handle, args),
+            IntrinsicId::NetLocalPort => Ok(self.net_local_port(handle)),
+            IntrinsicId::NetClose => {
+                self.net_close(handle);
+                Ok(Value::Unit)
+            }
+            _ => Err(self.internal("non-OS-handle intrinsic reached OS-handle dispatcher")),
+        }
+    }
+
+    /// If `id` is a collidable handle-method spelling (`close`/`send`/`recv` — also
+    /// concurrency channel ops) AND the receiver is actually an OS handle, returns
+    /// the concrete OS intrinsic to run instead. Otherwise `None` (the call falls
+    /// through to the concurrency floor / its own value handler).
+    fn os_handle_reroute(&self, id: &IntrinsicId, recv: &Option<Value>) -> Option<IntrinsicId> {
+        let kind = recv.as_ref().and_then(|r| self.os_kind_of(r))?;
+        match (id, kind) {
+            // `close` on any OS handle -> the right close.
+            (IntrinsicId::ChanClose, OsKind::File) => Some(IntrinsicId::FsClose),
+            (IntrinsicId::ChanClose, OsKind::Listener | OsKind::Stream) => {
+                Some(IntrinsicId::NetClose)
+            }
+            // `send`/`recv` on a TCP stream -> the socket op (a channel handle keeps
+            // the channel op by returning `None`).
+            (IntrinsicId::ChanSend, OsKind::Stream) => Some(IntrinsicId::NetSend),
+            (IntrinsicId::ChanRecv, OsKind::Stream) => Some(IntrinsicId::NetRecv),
+            _ => None,
+        }
+    }
+
+    /// The [`OsKind`] of a receiver value, if it is (or wraps) an OS handle.
+    fn os_kind_of(&self, recv: &Value) -> Option<OsKind> {
+        self.os_handle_of(recv).map(|(kind, _)| kind)
+    }
+
+    /// Decodes the `(kind, table index)` of an OS handle from a value: an opaque
+    /// `u32` handle ([`OsKind::encode`]), a `{ handle: u32 }` struct (the std
+    /// `File`/`TcpListener`/`TcpStream` shape — its id is in field 0), or a pointer
+    /// to such a struct (a `*File`/`*TcpStream` receiver). A non-handle value (a
+    /// channel `Value::Sched`, a plain int that is not an encoded handle) yields
+    /// `None`, so the demux leaves genuine channel ops untouched.
+    fn os_handle_of(&self, v: &Value) -> Option<(OsKind, u32)> {
+        match v {
+            Value::Int { v, .. } if *v >= 0 => OsKind::decode(*v as u32),
+            Value::Struct(fields) => fields.first().and_then(|f| self.os_handle_of(f)),
+            Value::Ptr(p) => self
+                .heap
+                .load(*p)
+                .ok()
+                .and_then(|inner| self.os_handle_of(&inner)),
+            _ => None,
+        }
+    }
+
+    /// Builds the k2 `{ handle: u32 }` value the door methods return, packing the
+    /// `(kind, table index)` into the opaque handle id (so it round-trips through
+    /// `self.handle` in real k2 and back to the VM).
+    fn os_handle_value(kind: OsKind, index: u32) -> Value {
+        Value::Struct(Rc::new(vec![Value::int(
+            kind.encode(index) as i128,
+            IntRepr {
+                width: 32,
+                signed: false,
+            },
+        )]))
+    }
+
+    /// Looks up a name-keyed global error tag, constructing the `Err` arm by NAME
+    /// (the std `FsError`/`NetError` sets auto-register these tags, so no enum is
+    /// needed). Falls back to `OutOfMemory`'s slot, then `0`, if the name is absent.
+    fn error_named(&self, name: &str) -> Value {
+        let tag = self
+            .prog
+            .err_names
+            .iter()
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(t, _)| t.0)
+            .unwrap_or_else(|| match self.out_of_memory_value() {
+                Value::ErrVal(t) => t,
+                _ => 0,
+            });
+        Value::ErrVal(tag)
+    }
+
+    /// Maps a Rust `io::Error` to the matching k2 `FsError`/`NetError` tag, by name.
+    fn io_error_value(&self, e: &std::io::Error) -> Value {
+        use std::io::ErrorKind::*;
+        let name = match e.kind() {
+            NotFound => "FileNotFound",
+            PermissionDenied => "AccessDenied",
+            AlreadyExists => "AlreadyExists",
+            ConnectionRefused => "ConnectionRefused",
+            ConnectionReset => "ConnectionReset",
+            AddrInUse => "AddressInUse",
+            WouldBlock => "WouldBlock",
+            _ => "IoError",
+        };
+        self.error_named(name)
+    }
+
+    /// Reads a `[]const u8`/`[]u8` path or byte argument into an owned `Vec<u8>`,
+    /// from a `Str` literal or a heap-backed `Slice`/`Ptr` (the same byte sources
+    /// `read_bytes`/`random_bytes` handle). A non-byte value yields an empty `Vec`.
+    fn bytes_of(&self, v: Option<&Value>) -> Vec<u8> {
+        match v {
+            Some(Value::Str(b)) => b.as_ref().clone(),
+            Some(Value::Slice { ptr, len }) => {
+                let mut out = Vec::with_capacity(*len);
+                for i in 0..*len {
+                    match self.heap.load_index(*ptr, i) {
+                        Ok(Value::Int { v, .. }) => out.push(v as u8),
+                        _ => break,
+                    }
+                }
+                out
+            }
+            Some(Value::Ptr(p)) => {
+                let len = self.heap.len_of(*p).unwrap_or(0);
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    match self.heap.load_index(*p, i) {
+                        Ok(Value::Int { v, .. }) => out.push(v as u8),
+                        _ => break,
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The first byte-source operand in `args` — a `Str` literal, a byte `Slice`,
+    /// or a `*[N]u8` pointer-to-array (`Value::Ptr`) — skipping any leading
+    /// allocator/handle operand. Returns the owned bytes.
+    ///
+    /// `Value::Ptr` MUST be accepted here: passing the canonical whole-array
+    /// pointer `&payload` (a `*[N]u8` coerced to `[]const u8`) arrives in the VM
+    /// as a `Value::Ptr`, exactly as the read/recv *destination* extractor
+    /// (`buffer_arg`) already handles. Omitting it made `fs.write(&payload)` /
+    /// `net.send(&payload)` source ZERO bytes — and, because `create()` opens
+    /// `O_TRUNC`, destructively truncate the target to length 0 while reporting a
+    /// (false) success. `bytes_of` already knows how to read a `Value::Ptr`.
+    fn path_arg(&self, args: &[Value]) -> Vec<u8> {
+        let v = args
+            .iter()
+            .find(|a| matches!(a, Value::Str(_) | Value::Slice { .. } | Value::Ptr(_)));
+        self.bytes_of(v)
+    }
+
+    /// The destination `(ptr, len)` byte buffer operand (`[]u8`) in `args` — the
+    /// first slice/ptr, used by `read`/`recv` to fill the caller's buffer.
+    fn buffer_arg(&self, args: &[Value]) -> (Ptr, usize) {
+        for a in args {
+            match a {
+                Value::Slice { ptr, len } => return (*ptr, *len),
+                Value::Ptr(p) => return (*p, self.heap.len_of(*p).unwrap_or(0)),
+                _ => {}
+            }
+        }
+        (Ptr::NULL, 0)
+    }
+
+    /// Writes `n` bytes from `src` into the heap cell at `ptr` (the inverse of
+    /// `bytes_of` for a destination buffer), as `u8` values. Used by `read`/`recv`.
+    ///
+    /// Returns `Ok(())` only if EVERY byte landed in the destination cell. If any
+    /// `store_index` faults (a NULL / out-of-range / non-aliasing destination),
+    /// the fault is reported as `Err(())` so the caller NEVER returns a byte count
+    /// for bytes that were not actually delivered. (Previously the `store_index`
+    /// error was discarded by `let _ =` and `read`/`recv` returned `Ok(n)` even
+    /// when zero bytes reached the buffer — a count that lied. With the
+    /// slice-of-undefined-array aliasing fix the common case now stores
+    /// successfully; this makes a genuinely unwritable destination an honest
+    /// `IoError` instead of a false success.)
+    fn fill_buffer(&mut self, ptr: Ptr, src: &[u8]) -> Result<(), ()> {
+        for (i, &b) in src.iter().enumerate() {
+            self.heap
+                .store_index(
+                    ptr,
+                    i,
+                    Value::int(
+                        b as i128,
+                        IntRepr {
+                            width: 8,
+                            signed: false,
+                        },
+                    ),
+                )
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// Builds an `Ok(usize)` result value (the byte count `read`/`write`/`send`/
+    /// `recv` return).
+    fn ok_usize(n: usize) -> Value {
+        Value::ErrOk(Box::new(Value::int(n as i128, IntRepr::USIZE)))
+    }
+
+    /// Inserts `handle` into a handle table, REUSING the first vacated (`None`)
+    /// slot if one exists, and only growing the `Vec` when the table is full.
+    /// Returns the slot index (the value's stable id).
+    ///
+    /// `close()` vacates a slot by setting it to `None` (the underlying
+    /// `std::fs::File` / `TcpStream` is dropped, releasing the OS fd); without
+    /// reuse a long `open`/`close` loop would grow these tables unbounded. Scanning
+    /// for a free slot bounds growth at the high-water mark of *concurrently* open
+    /// handles, which is the natural bound for these resources.
+    fn insert_handle<T>(table: &mut Vec<Option<T>>, handle: T) -> u32 {
+        match table.iter().position(|slot| slot.is_none()) {
+            Some(i) => {
+                table[i] = Some(handle);
+                i as u32
+            }
+            None => {
+                table.push(Some(handle));
+                (table.len() - 1) as u32
+            }
+        }
+    }
+
+    // ---- sys.fs (over std::fs) ----------------------------------------
+
+    /// Open/create a file, returning `Ok(File{handle})`. `mode`: 0=read-only,
+    /// 1=create (O_CREAT|O_TRUNC|O_RDWR), 2=read+write.
+    fn fs_open(&mut self, args: &[Value], mode: i128) -> Result<Value, Halt> {
+        let path = self.path_arg(args);
+        let os_path = std::path::PathBuf::from(String::from_utf8_lossy(&path).into_owned());
+        let mut opts = std::fs::OpenOptions::new();
+        match mode {
+            1 => {
+                opts.create(true).truncate(true).write(true).read(true);
+            }
+            2 => {
+                opts.read(true).write(true);
+            }
+            _ => {
+                opts.read(true);
+            }
+        }
+        match opts.open(&os_path) {
+            Ok(file) => {
+                let index = Self::insert_handle(&mut self.os.files, file);
+                Ok(Value::ErrOk(Box::new(Self::os_handle_value(
+                    OsKind::File,
+                    index,
+                ))))
+            }
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsRead(handle, buf)`: read up to `buf.len` bytes into the caller's buffer,
+    /// returning `Ok(n)`.
+    fn fs_read(&mut self, handle: Option<(OsKind, u32)>, args: &[Value]) -> Result<Value, Halt> {
+        use std::io::Read;
+        let (ptr, len) = self.buffer_arg(args);
+        let Some((OsKind::File, fid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let mut tmp = vec![0u8; len];
+        let res = match self.os.files.get_mut(fid as usize).and_then(|f| f.as_mut()) {
+            Some(f) => f.read(&mut tmp),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match res {
+            // Only report the byte count once every byte is in the caller's
+            // buffer. A `fill_buffer` fault means the destination did not receive
+            // the bytes — surface an honest `IoError` rather than a false `Ok(n)`.
+            Ok(n) => match self.fill_buffer(ptr, &tmp[..n]) {
+                Ok(()) => Ok(Self::ok_usize(n)),
+                Err(()) => Ok(self.error_named("IoError")),
+            },
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsWrite(handle, bytes)`: write all of `bytes`, returning `Ok(n)`.
+    fn fs_write(&mut self, handle: Option<(OsKind, u32)>, args: &[Value]) -> Result<Value, Halt> {
+        use std::io::Write;
+        let bytes = self.path_arg(args);
+        let Some((OsKind::File, fid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let res = match self.os.files.get_mut(fid as usize).and_then(|f| f.as_mut()) {
+            Some(f) => f.write_all(&bytes).map(|()| bytes.len()),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match res {
+            Ok(n) => Ok(Self::ok_usize(n)),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsFstat(handle)`: stat an open file -> `Ok(Stat{ size, is_dir })`.
+    fn fs_fstat(&mut self, handle: Option<(OsKind, u32)>) -> Result<Value, Halt> {
+        let Some((OsKind::File, fid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let md = match self.os.files.get(fid as usize).and_then(|f| f.as_ref()) {
+            Some(f) => f.metadata(),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match md {
+            Ok(m) => Ok(Value::ErrOk(Box::new(Self::stat_value(&m)))),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsClose(handle)`: drop the open file (it closes on drop).
+    fn fs_close(&mut self, handle: Option<(OsKind, u32)>) {
+        if let Some((OsKind::File, fid)) = handle {
+            if let Some(slot) = self.os.files.get_mut(fid as usize) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// `@fsStat(path)`: stat a path -> `Ok(Stat{ size, is_dir })`.
+    fn fs_stat_path(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        match std::fs::metadata(&os_path) {
+            Ok(m) => Ok(Value::ErrOk(Box::new(Self::stat_value(&m)))),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// Builds the std `Stat` struct value `{ size: u64, is_dir: bool }` from a
+    /// `std::fs::Metadata` (the field order the std wrapper declares).
+    fn stat_value(m: &std::fs::Metadata) -> Value {
+        Value::Struct(Rc::new(vec![
+            Value::int(m.len() as i128, IntRepr::USIZE),
+            Value::Bool(m.is_dir()),
+        ]))
+    }
+
+    /// `@fsExists(path)`: `true` if the path exists.
+    fn fs_exists(&self, args: &[Value]) -> Value {
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        Value::Bool(std::path::Path::new(&os_path).exists())
+    }
+
+    /// `@fsDelete(path)`: remove a file -> `Ok(void)`.
+    fn fs_delete(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        match std::fs::remove_file(&os_path) {
+            Ok(()) => Ok(Value::ErrOk(Box::new(Value::Unit))),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsMkdir(path)`: create a directory -> `Ok(void)`.
+    fn fs_mkdir(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        match std::fs::create_dir(&os_path) {
+            Ok(()) => Ok(Value::ErrOk(Box::new(Value::Unit))),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsRmdir(path)`: remove a directory -> `Ok(void)`.
+    fn fs_rmdir(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        match std::fs::remove_dir(&os_path) {
+            Ok(()) => Ok(Value::ErrOk(Box::new(Value::Unit))),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `@fsListDir(alloc, path)`: list a directory's entry names -> `Ok([][]const u8)`,
+    /// each name a heap `[]const u8` allocated through the passed allocator. The
+    /// entries are sorted so the listing is deterministic across runs/hosts.
+    fn fs_list_dir(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let alloc_id = args.first().map(alloc_id_of_val).unwrap_or(0);
+        let path = self.path_arg(args);
+        let os_path = String::from_utf8_lossy(&path).into_owned();
+        let mut names: Vec<Vec<u8>> = match std::fs::read_dir(&os_path) {
+            Ok(rd) => {
+                let mut v = Vec::new();
+                for entry in rd.flatten() {
+                    v.push(
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                            .into_bytes(),
+                    );
+                }
+                v
+            }
+            Err(e) => return Ok(self.io_error_value(&e)),
+        };
+        names.sort();
+        // Materialize each name as a heap `[]const u8`, then a slice-of-slices.
+        let mut elems: Vec<Value> = Vec::with_capacity(names.len());
+        for name in &names {
+            elems.push(self.alloc_bytes_through(alloc_id, name)?);
+        }
+        let outer = self.alloc_values_through(alloc_id, elems)?;
+        Ok(Value::ErrOk(Box::new(outer)))
+    }
+
+    /// Allocates `n` cells through allocator `id` and stores `values` into them,
+    /// returning the resulting slice. The shared honest-allocation path behind
+    /// `fsListDir`/`osArgs` (both materialize a slice through a passed allocator,
+    /// exactly as the spec's `args(alloc)` requires). The cells are default-init'd
+    /// to void and immediately overwritten — the managed heap is value-typed, so the
+    /// element type is carried by the stored `Value`s, not the allocation.
+    fn alloc_values_through(&mut self, id: u32, values: Vec<Value>) -> Result<Value, Halt> {
+        let n = values.len();
+        let void_ty = self.prog.arena.t_void();
+        let slice = match self.alloc_many(id, void_ty, n)? {
+            Value::ErrOk(inner) => *inner,
+            other => return Ok(other),
+        };
+        if let Value::Slice { ptr, .. } = &slice {
+            for (i, v) in values.into_iter().enumerate() {
+                let _ = self.heap.store_index(*ptr, i, v);
+            }
+        }
+        Ok(slice)
+    }
+
+    /// Allocates a `[]u8` through allocator `id` holding `bytes`, returning the
+    /// slice value (a `[]const u8`).
+    fn alloc_bytes_through(&mut self, id: u32, bytes: &[u8]) -> Result<Value, Halt> {
+        let u8_ty = self.prog.arena.t_u8();
+        let slice = match self.alloc_many(id, u8_ty, bytes.len())? {
+            Value::ErrOk(inner) => *inner,
+            other => return Ok(other),
+        };
+        if let Value::Slice { ptr, .. } = &slice {
+            // The destination is the slice we just allocated, so every index is in
+            // range and `fill_buffer` cannot fault — the result is intentionally
+            // ignored (unlike read/recv, where a fault must surface as an error).
+            let _ = self.fill_buffer(*ptr, bytes);
+        }
+        Ok(slice)
+    }
+
+    // ---- sys.os (over std::env / std::process) ------------------------
+
+    /// `sys.env.get(name)` / scripted-or-host env lookup -> `?[]const u8`.
+    fn env_get(&self, args: &[Value]) -> Value {
+        let name = self.path_arg(args);
+        // Host env (opt-in) first, then the scripted map; default absent.
+        if self.os.env_host {
+            if let Some(val) = std::env::var_os(String::from_utf8_lossy(&name).as_ref()) {
+                let bytes = val.to_string_lossy().into_owned().into_bytes();
+                return Value::Optional(Some(Box::new(Value::Str(Rc::new(bytes)))));
+            }
+        }
+        for (k, v) in &self.os.env_map {
+            if k == &name {
+                return Value::Optional(Some(Box::new(Value::Str(Rc::new(v.clone())))));
+            }
+        }
+        Value::Optional(None)
+    }
+
+    /// `sys.os.arg(i)`: argv element `i` as a `[]const u8` (empty out of range).
+    fn os_arg(&self, args: &[Value]) -> Value {
+        let i = args.first().and_then(|v| v.as_usize()).unwrap_or(0);
+        let bytes = self.os.argv.get(i).cloned().unwrap_or_default();
+        Value::Str(Rc::new(bytes))
+    }
+
+    /// `sys.os.args(alloc)`: materialize the argv as a `[][]const u8` through the
+    /// passed allocator (honest allocation, matching spec §7.4).
+    fn os_args(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let alloc_id = args.first().map(alloc_id_of_val).unwrap_or(0);
+        let argv = self.os.argv.clone();
+        let mut elems: Vec<Value> = Vec::with_capacity(argv.len());
+        for a in &argv {
+            elems.push(self.alloc_bytes_through(alloc_id, a)?);
+        }
+        let outer = self.alloc_values_through(alloc_id, elems)?;
+        Ok(Value::ErrOk(Box::new(outer)))
+    }
+
+    /// `sys.os.getpid()`: a deterministic `1` by default; the real pid if opted in.
+    fn os_getpid(&self) -> Value {
+        let pid = if self.os.real_pid {
+            std::process::id() as i128
+        } else {
+            1
+        };
+        Value::int(pid, IntRepr::USIZE)
+    }
+
+    // ---- sys.time (real host clocks over std::time) -------------------
+
+    /// `sys.time.nowReal()`: real wall-clock Unix nanoseconds (host).
+    fn time_wall_real(&self) -> Value {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Value::int(nanos as i128, IntRepr::USIZE)
+    }
+
+    /// `sys.time.monotonicReal()`: real monotonic nanoseconds since the run's epoch
+    /// (non-decreasing within a run).
+    fn time_mono_real(&self) -> Value {
+        let nanos = self
+            .os
+            .real_epoch
+            .map(|e| e.elapsed().as_nanos())
+            .unwrap_or(0);
+        Value::int(nanos as i128, IntRepr::USIZE)
+    }
+
+    // ---- sys.net (loopback TCP over std::net) -------------------------
+
+    /// `sys.net.listen(port)`: bind a loopback TCP listener (port 0 = ephemeral)
+    /// -> `Ok(TcpListener{handle})`.
+    fn net_listen(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let port = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u16;
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => {
+                let index = Self::insert_handle(&mut self.os.listeners, l);
+                Ok(Value::ErrOk(Box::new(Self::os_handle_value(
+                    OsKind::Listener,
+                    index,
+                ))))
+            }
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `listener.accept()`: accept the next connection -> `Ok(TcpStream{handle})`.
+    fn net_accept(&mut self, handle: Option<(OsKind, u32)>) -> Result<Value, Halt> {
+        let Some((OsKind::Listener, lid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let res = match self.os.listeners.get(lid as usize).and_then(|l| l.as_ref()) {
+            Some(l) => l.accept(),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match res {
+            Ok((stream, _addr)) => {
+                let index = Self::insert_handle(&mut self.os.streams, stream);
+                Ok(Value::ErrOk(Box::new(Self::os_handle_value(
+                    OsKind::Stream,
+                    index,
+                ))))
+            }
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `sys.net.connect(host, port)`: connect a loopback TCP stream ->
+    /// `Ok(TcpStream{handle})`.
+    fn net_connect(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let host = self.path_arg(args);
+        let host = String::from_utf8_lossy(&host).into_owned();
+        let port = args
+            .iter()
+            .filter(|a| !matches!(a, Value::Str(_) | Value::Slice { .. }))
+            .find_map(|a| a.as_usize())
+            .unwrap_or(0) as u16;
+        match std::net::TcpStream::connect((host.as_str(), port)) {
+            Ok(s) => {
+                let index = Self::insert_handle(&mut self.os.streams, s);
+                Ok(Value::ErrOk(Box::new(Self::os_handle_value(
+                    OsKind::Stream,
+                    index,
+                ))))
+            }
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `stream.send(bytes)`: write all of `bytes` -> `Ok(n)`.
+    fn net_send(&mut self, handle: Option<(OsKind, u32)>, args: &[Value]) -> Result<Value, Halt> {
+        use std::io::Write;
+        let bytes = self.path_arg(args);
+        let Some((OsKind::Stream, sid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let res = match self
+            .os
+            .streams
+            .get_mut(sid as usize)
+            .and_then(|s| s.as_mut())
+        {
+            Some(s) => s.write_all(&bytes).map(|()| bytes.len()),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match res {
+            Ok(n) => Ok(Self::ok_usize(n)),
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `stream.recv(buf)`: read up to `buf.len` bytes -> `Ok(n)`.
+    fn net_recv(&mut self, handle: Option<(OsKind, u32)>, args: &[Value]) -> Result<Value, Halt> {
+        use std::io::Read;
+        let (ptr, len) = self.buffer_arg(args);
+        let Some((OsKind::Stream, sid)) = handle else {
+            return Ok(self.error_named("IoError"));
+        };
+        let mut tmp = vec![0u8; len];
+        let res = match self
+            .os
+            .streams
+            .get_mut(sid as usize)
+            .and_then(|s| s.as_mut())
+        {
+            Some(s) => s.read(&mut tmp),
+            None => return Ok(self.error_named("IoError")),
+        };
+        match res {
+            // As in `fs_read`: never claim to have received bytes that did not
+            // reach the caller's buffer — a `fill_buffer` fault is an `IoError`.
+            Ok(n) => match self.fill_buffer(ptr, &tmp[..n]) {
+                Ok(()) => Ok(Self::ok_usize(n)),
+                Err(()) => Ok(self.error_named("IoError")),
+            },
+            Err(e) => Ok(self.io_error_value(&e)),
+        }
+    }
+
+    /// `listener.localPort()`: the bound `u16` port (so an ephemeral listener's port
+    /// can be read back and connected to).
+    fn net_local_port(&self, handle: Option<(OsKind, u32)>) -> Value {
+        let port = match handle {
+            Some((OsKind::Listener, lid)) => self
+                .os
+                .listeners
+                .get(lid as usize)
+                .and_then(|l| l.as_ref())
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0),
+            Some((OsKind::Stream, sid)) => self
+                .os
+                .streams
+                .get(sid as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        Value::int(
+            port as i128,
+            IntRepr {
+                width: 16,
+                signed: false,
+            },
+        )
+    }
+
+    /// `@netClose(handle)`: drop the listener/stream (it closes on drop).
+    fn net_close(&mut self, handle: Option<(OsKind, u32)>) {
+        match handle {
+            Some((OsKind::Listener, lid)) => {
+                if let Some(slot) = self.os.listeners.get_mut(lid as usize) {
+                    *slot = None;
+                }
+            }
+            Some((OsKind::Stream, sid)) => {
+                if let Some(slot) = self.os.streams.get_mut(sid as usize) {
+                    *slot = None;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3455,6 +4362,16 @@ fn unwrap_task_result(v: Value) -> Value {
 fn alloc_id_of(recv: &Option<Value>) -> u32 {
     match recv {
         Some(Value::Cap(Capability::Allocator(id))) => *id,
+        _ => 0,
+    }
+}
+
+/// The handle id carried by an `Allocator` value (not wrapped in an `Option`): the
+/// allocator operand `fsListDir`/`osArgs` take explicitly, per spec §7.4. A
+/// non-allocator value falls back to the default allocator id `0`.
+fn alloc_id_of_val(v: &Value) -> u32 {
+    match v {
+        Value::Cap(Capability::Allocator(id)) => *id,
         _ => 0,
     }
 }

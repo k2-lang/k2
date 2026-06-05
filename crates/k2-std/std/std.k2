@@ -1544,3 +1544,202 @@ pub const event = struct {
         }
     };
 };
+
+// =========================================================================
+//  fs / os / time / net — the v0.23 OS-effect capabilities (spec §7.4)
+// =========================================================================
+//
+// These are the real-effect surfaces reached through `*System`: `sys.fs`,
+// `sys.os`, `sys.time`, `sys.net`. Every door method is a member call on the
+// capability value (no ambient global), backed by Rust `std` on the VM and raw
+// syscalls (where feasible) natively. The handle TYPES below (`File`/`Stat`/
+// `TcpListener`/`TcpStream`/`Duration`/`Instant`) and ERROR SETS are the spec
+// vocabulary; the door itself (`sys.fs.openRead(...)`, `sys.net.listen(...)`, …)
+// is realized by the VM intrinsic floor. Tests use TEMP files + LOOPBACK only,
+// are self-cleaning, and assert only inequalities for real time, so they stay
+// deterministic and offline.
+
+/// The error set a filesystem operation can fail with. Mapped from the host's
+/// `io::ErrorKind` (NotFound → `FileNotFound`, PermissionDenied → `AccessDenied`,
+/// …) by the VM, and constructed BY NAME so no enum wiring is needed.
+pub const FsError = error{
+    FileNotFound,
+    AccessDenied,
+    AlreadyExists,
+    NotADirectory,
+    IsADirectory,
+    IoError,
+    NoSpaceLeft,
+};
+
+/// The error set a network operation can fail with.
+pub const NetError = error{
+    ConnectionRefused,
+    ConnectionReset,
+    AddressInUse,
+    WouldBlock,
+    IoError,
+};
+
+/// The filesystem namespace: the `File`/`Dir` handle types and the `Stat` record.
+/// The capability door is `sys.fs` (its methods `openRead`/`create`/`stat`/… are
+/// the real effects); these types describe what the door hands back.
+pub const fs = struct {
+    /// What `stat`/`File.stat` report about a path: its byte size and whether it
+    /// is a directory. (A small, honest record — not the full `struct stat`.)
+    pub const Stat = struct {
+        /// The file size in bytes.
+        size: u64,
+        /// `true` for a directory.
+        is_dir: bool,
+    };
+
+    /// An open file handle, minted by `sys.fs.openRead`/`create`/`openReadWrite`.
+    /// `handle` is the VM/native fd id; the methods are the real read/write/stat/
+    /// close effects (each demuxed to the file by receiver kind in the VM).
+    pub const File = struct {
+        const Self = @This();
+        /// The VM/native open-file handle id.
+        handle: u32,
+
+        /// Read up to `buf.len` bytes into `buf`, returning the count read (0 at EOF).
+        pub fn read(self: *Self, buf: []u8) FsError!usize {
+            return @fsRead(self.handle, buf);
+        }
+
+        /// Write all of `bytes`, returning the count written.
+        pub fn write(self: *Self, bytes: []const u8) FsError!usize {
+            return @fsWrite(self.handle, bytes);
+        }
+
+        /// Stat this open file (its current size / kind).
+        pub fn stat(self: *Self) FsError!Stat {
+            return @fsFstat(self.handle);
+        }
+
+        /// Close the file (also closed automatically when its slot is reused).
+        pub fn close(self: *Self) void {
+            @fsClose(self.handle);
+        }
+    };
+};
+
+/// The process namespace: command-line arguments, environment lookup, the process
+/// id, and exit. The capability door is `sys.os` (and the env reader `sys.env`).
+pub const os = struct {
+    /// The number of forwarded program arguments (`k2c run prog -- a b` → 2).
+    pub fn argCount(sys: *System) usize {
+        _ = sys;
+        return @osArgCount();
+    }
+};
+
+/// The time namespace: the real wall/monotonic clocks (reached through `sys.time`),
+/// plus the pure-k2 `Duration`/`Instant` value types built over them. The
+/// DETERMINISTIC clock (`sys.clock`) stays the default for reproducible tests; the
+/// real clock is opt-in per call here, and `Instant`/`Duration` work over either.
+pub const time = struct {
+    /// Nanoseconds in a millisecond / second (the conversion constants).
+    pub const ns_per_ms: u64 = 1_000_000;
+    pub const ns_per_s: u64 = 1_000_000_000;
+
+    /// A span of time, in nanoseconds. A plain value — no capability needed to do
+    /// arithmetic on a measured duration.
+    pub const Duration = struct {
+        const Self = @This();
+        /// The span length in nanoseconds.
+        ns: u64,
+
+        /// Build a `Duration` of `ms` milliseconds.
+        pub fn fromMillis(ms: u64) Self {
+            return Self{ .ns = ms * ns_per_ms };
+        }
+
+        /// This span in whole milliseconds (truncating).
+        pub fn asMillis(self: Self) u64 {
+            return self.ns / ns_per_ms;
+        }
+
+        /// This span in nanoseconds.
+        pub fn asNanos(self: Self) u64 {
+            return self.ns;
+        }
+    };
+
+    /// A captured point on the monotonic clock, in nanoseconds. Build one from a
+    /// monotonic reading — `Instant.fromNanos(sys.time.monotonicReal())` for the
+    /// REAL clock, or `Instant.fromNanos(sys.clock.monotonicNanos())` for the
+    /// DETERMINISTIC test clock — and measure a `Duration` with `elapsedSince`,
+    /// passing a later reading from the same clock. Because the monotonic clock is
+    /// non-decreasing, the elapsed span is always well-defined.
+    ///
+    /// `Instant` deliberately takes the nanosecond READING (a `u64`), not the
+    /// capability: that keeps it a plain, non-generic value type usable with EITHER
+    /// clock, and keeps the authority to read the clock at the call site where
+    /// `sys.time`/`sys.clock` is visible — exactly the capability discipline.
+    pub const Instant = struct {
+        const Self = @This();
+        /// The captured monotonic reading, in nanoseconds.
+        ns: u64,
+
+        /// Capture an instant from a monotonic nanosecond reading.
+        pub fn fromNanos(ns: u64) Self {
+            return Self{ .ns = ns };
+        }
+
+        /// The `Duration` elapsed from `self` to `now_ns` (a later reading of the
+        /// same monotonic clock).
+        pub fn elapsedSince(self: Self, now_ns: u64) Duration {
+            return Duration{ .ns = now_ns - self.ns };
+        }
+    };
+};
+
+/// The network namespace: the `TcpListener`/`TcpStream` handle types. The
+/// capability door is `sys.net` (`listen`/`connect`); these types describe what it
+/// hands back. Loopback only in tests (`127.0.0.1`, ephemeral port), self-cleaning.
+pub const net = struct {
+    /// A bound TCP listener (minted by `sys.net.listen(port)`; port 0 = ephemeral).
+    pub const TcpListener = struct {
+        const Self = @This();
+        /// The VM/native listener handle id.
+        handle: u32,
+
+        /// Accept the next incoming connection, yielding a connected stream.
+        pub fn accept(self: *Self) NetError!TcpStream {
+            return @netAccept(self.handle);
+        }
+
+        /// The bound local port (so an ephemeral listener's port is readable).
+        pub fn localPort(self: *Self) u16 {
+            return @netLocalPort(self.handle);
+        }
+
+        /// Close the listener.
+        pub fn close(self: *Self) void {
+            @netClose(self.handle);
+        }
+    };
+
+    /// A connected TCP stream (minted by `listener.accept()` / `sys.net.connect`).
+    pub const TcpStream = struct {
+        const Self = @This();
+        /// The VM/native stream handle id.
+        handle: u32,
+
+        /// Send all of `bytes`, returning the count sent.
+        pub fn send(self: *Self, bytes: []const u8) NetError!usize {
+            return @netSend(self.handle, bytes);
+        }
+
+        /// Receive up to `buf.len` bytes into `buf`, returning the count read.
+        pub fn recv(self: *Self, buf: []u8) NetError!usize {
+            return @netRecv(self.handle, buf);
+        }
+
+        /// Close the stream.
+        pub fn close(self: *Self) void {
+            @netClose(self.handle);
+        }
+    };
+};

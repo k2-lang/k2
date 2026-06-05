@@ -1,0 +1,433 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn writeFile
+    (params
+      (param fsc
+        (anytype)
+      )
+      (param path
+        (slice :const
+          (ident u8)
+        )
+      )
+      (param bytes
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident usize)
+        )
+      )
+    )
+    (block
+      (var f
+        (unary try
+          (call
+            (field create
+              (ident fsc)
+            )
+            (ident path)
+          )
+        )
+      )
+      (const n
+        (unary try
+          (call
+            (field write
+              (ident f)
+            )
+            (ident bytes)
+          )
+        )
+      )
+      (expr
+        (call
+          (field close
+            (ident f)
+          )
+        )
+      )
+      (return
+        (ident n)
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var path_buf
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const path
+        (unary try
+          (call
+            (field bufPrint
+              (field fmt
+                (ident std)
+              )
+            )
+            (slice-expr
+              (ident path_buf)
+              (lo
+                (int 0)
+              )
+              (hi
+                (int 64)
+              )
+            )
+            (str "\"/tmp/k2_os_capabilities_demo_{d}.bin\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field getpid
+                    (field os
+                      (ident sys)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const payload
+        (str "\"k2 directs every byte: written, then read back identically.\"")
+      )
+      (const nw
+        (unary try
+          (call
+            (ident writeFile)
+            (field fs
+              (ident sys)
+            )
+            (ident path)
+            (ident payload)
+          )
+        )
+      )
+      (const st
+        (unary try
+          (call
+            (field stat
+              (field fs
+                (ident sys)
+              )
+            )
+            (ident path)
+          )
+        )
+      )
+      (var rf
+        (unary try
+          (call
+            (field openRead
+              (field fs
+                (ident sys)
+              )
+            )
+            (ident path)
+          )
+        )
+      )
+      (var buf
+        (ty
+          (array-type
+            (len
+              (int 128)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const nr
+        (unary try
+          (call
+            (field read
+              (ident rf)
+            )
+            (unary addrof
+              (ident buf)
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field close
+            (ident rf)
+          )
+        )
+      )
+      (const identical
+        (call
+          (field eql
+            (field mem
+              (ident std)
+            )
+          )
+          (ident u8)
+          (ident payload)
+          (slice-expr
+            (ident buf)
+            (lo
+              (int 0)
+            )
+            (hi
+              (ident nr)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"fs: wrote {d}, size {d}, read {d}, identical={}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident nw)
+                (field size
+                  (ident st)
+                )
+                (ident nr)
+                (ident identical)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"fs: contents = {s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (slice-expr
+                  (ident buf)
+                  (lo
+                    (int 0)
+                  )
+                  (hi
+                    (ident nr)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field delete
+              (field fs
+                (ident sys)
+              )
+            )
+            (ident path)
+          )
+        )
+      )
+      (const start
+        (call
+          (field fromNanos
+            (field Instant
+              (field time
+                (ident std)
+              )
+            )
+          )
+          (call
+            (field monotonicReal
+              (field time
+                (ident sys)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field sleepReal
+            (field time
+              (ident sys)
+            )
+          )
+          (int 2_000_000)
+        )
+      )
+      (const elapsed
+        (call
+          (field elapsedSince
+            (ident start)
+          )
+          (call
+            (field monotonicReal
+              (field time
+                (ident sys)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"time: slept; elapsed >= 1 ms = {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary ge
+                  (call
+                    (field asMillis
+                      (ident elapsed)
+                    )
+                  )
+                  (int 1)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"os: pid > 0 = {}, argc = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary gt
+                  (call
+                    (field getpid
+                      (field os
+                        (ident sys)
+                      )
+                    )
+                  )
+                  (int 0)
+                )
+                (call
+                  (field argCount
+                    (field os
+                      (ident sys)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (call
+              (field argCount
+                (field os
+                  (ident sys)
+                )
+              )
+            )
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"os: arg[{d}] = {s}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident i)
+                      (call
+                        (field arg
+                          (field os
+                            (ident sys)
+                          )
+                        )
+                        (ident i)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

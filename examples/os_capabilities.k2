@@ -1,0 +1,68 @@
+// os_capabilities.k2 — Real OS effects, all through `*System` (v0.23).
+//
+// k2 has NO ambient authority: the filesystem, the clock, the process
+// environment, and the network are capability VALUES reached only through the
+// root `*System` handle `main` receives. This program exercises the v0.23
+// capabilities end to end — and every one is visible in a signature, never a
+// hidden global.
+//
+//   * `sys.fs`   — write a temp file, stat it, read it back byte-for-byte, delete it
+//   * `sys.time` — the real monotonic clock + a measured `Duration`
+//   * `sys.os`   — the process id and the forwarded command-line arguments
+//
+// It is self-cleaning (the temp file is deleted) and offline (no network).
+//
+// Run it:
+//   k2 run examples/os_capabilities.k2 -- first second
+
+const std = @import("std");
+
+/// Write `bytes` to `path` through the `Fs` capability and return the count.
+/// The capability is in the signature: this function's only authority over the
+/// world is the filesystem handle it was given.
+fn writeFile(fsc: anytype, path: []const u8, bytes: []const u8) !usize {
+    var f = try fsc.create(path);
+    const n = try f.write(bytes);
+    f.close();
+    return n;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // --- Filesystem: write -> stat -> read-back -> delete ---------------------
+    // Derive the temp path from the process id so concurrent runs of this example
+    // cannot collide on a fixed name (the os_effects test suite does the same).
+    // It is still self-cleaning: the file is deleted before `main` returns.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(path_buf[0..64], "/tmp/k2_os_capabilities_demo_{d}.bin", .{sys.os.getpid()});
+    const payload = "k2 directs every byte: written, then read back identically.";
+
+    const nw = try writeFile(sys.fs, path, payload);
+    const st = try sys.fs.stat(path);
+
+    var rf = try sys.fs.openRead(path);
+    var buf: [128]u8 = undefined;
+    const nr = try rf.read(&buf);
+    rf.close();
+
+    const identical = std.mem.eql(u8, payload, buf[0..nr]);
+    try out.print("fs: wrote {d}, size {d}, read {d}, identical={}\n", .{ nw, st.size, nr, identical });
+    try out.print("fs: contents = {s}\n", .{buf[0..nr]});
+
+    try sys.fs.delete(path);
+
+    // --- Time: the real monotonic clock + a measured Duration ----------------
+    // Real time is opt-in per call; the deterministic `sys.clock` is unaffected.
+    const start = std.time.Instant.fromNanos(sys.time.monotonicReal());
+    sys.time.sleepReal(2_000_000); // 2 ms
+    const elapsed = start.elapsedSince(sys.time.monotonicReal());
+    try out.print("time: slept; elapsed >= 1 ms = {}\n", .{elapsed.asMillis() >= 1});
+
+    // --- Os: the process id and the forwarded argv ---------------------------
+    try out.print("os: pid > 0 = {}, argc = {d}\n", .{ sys.os.getpid() > 0, sys.os.argCount() });
+    var i: usize = 0;
+    while (i < sys.os.argCount()) : (i += 1) {
+        try out.print("os: arg[{d}] = {s}\n", .{ i, sys.os.arg(i) });
+    }
+}

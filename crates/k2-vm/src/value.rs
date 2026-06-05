@@ -179,6 +179,56 @@ pub enum SchedKind {
     WaitGroup,
 }
 
+/// The kind of OS object a v0.23 handle indexes. Each kind selects a different
+/// per-run VM table backed by Rust `std` (`std::fs::File`, `std::net::TcpListener`,
+/// `std::net::TcpStream`).
+///
+/// A handle is a plain `u32` carried in a k2 `{ handle: u32 }` struct (so it
+/// round-trips through real k2 code as `self.handle`), with the KIND encoded in the
+/// handle's high nibble ([`OsKind::encode`]/[`OsKind::decode`]). This keeps the
+/// `File`/`TcpListener`/`TcpStream` std types concrete `{ handle: u32 }` structs —
+/// their methods are ordinary k2 calling `@fs*`/`@net*` builtins — while still
+/// letting the VM recover which OS table an opaque handle indexes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OsKind {
+    /// An open file: indexes the VM's `files` table (`std::fs::File`).
+    File,
+    /// A bound TCP listener: indexes the VM's `listeners` table.
+    Listener,
+    /// A connected TCP stream: indexes the VM's `streams` table.
+    Stream,
+}
+
+impl OsKind {
+    /// The high-nibble tag for this kind (1/2/3; 0 is reserved so a zero handle is
+    /// never a valid OS handle).
+    fn tag(self) -> u32 {
+        match self {
+            OsKind::File => 1,
+            OsKind::Listener => 2,
+            OsKind::Stream => 3,
+        }
+    }
+
+    /// Packs a `(kind, table index)` pair into the opaque `u32` handle a k2
+    /// `{ handle: u32 }` carries: the kind tag in bits 28..32, the index in 0..28.
+    pub fn encode(self, index: u32) -> u32 {
+        (self.tag() << 28) | (index & 0x0FFF_FFFF)
+    }
+
+    /// Decodes an opaque handle back to `(kind, table index)`, or `None` if the
+    /// high nibble is not a known kind tag (so a stray integer is rejected cleanly).
+    pub fn decode(handle: u32) -> Option<(OsKind, u32)> {
+        let index = handle & 0x0FFF_FFFF;
+        match handle >> 28 {
+            1 => Some((OsKind::File, index)),
+            2 => Some((OsKind::Listener, index)),
+            3 => Some((OsKind::Stream, index)),
+            _ => None,
+        }
+    }
+}
+
 /// A runtime capability handle. The shim hands `main` the [`Capability::System`]
 /// root; the io/heap intrinsics derive the rest from it. None of these carry
 /// real OS state — stdout/stderr are buffers owned by the VM, and the heap is the
@@ -205,6 +255,17 @@ pub enum Capability {
     Random,
     /// The `sys.env` environment-lookup capability.
     Env,
+    /// The `sys.fs` filesystem capability (v0.23): open/read/write/stat/delete a
+    /// file, list/make/remove a directory. The door methods (`openRead`/`create`/
+    /// `stat`/…) are deferred-member intrinsics on this value.
+    Fs,
+    /// The `sys.net` TCP networking capability (v0.23): `listen`/`connect`. The
+    /// listener/stream handles it mints are [`Value::Os`] values.
+    Net,
+    /// The `sys.time` real-clock capability (v0.23): real wall + monotonic time and
+    /// a real `sleep`. Distinct from [`Capability::Clock`], whose readings are the
+    /// deterministic VM counter; `sys.time` reads the *host* clock.
+    Time,
     /// The root `*Build` authority handed to `build(b)` — the build-time analogue
     /// of [`Capability::System`]. Its methods bottom out in the recording
     /// `@build*` intrinsics (no I/O, no allocation); the VM exposes the recorded

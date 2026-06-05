@@ -3247,6 +3247,14 @@ impl<'p> FnLower<'p> {
             ["random", "int" | "intRangeLessThan"] => self.lower_random_int(),
             ["random", "bytes"] => self.lower_random_bytes(args),
             ["env", "get"] => self.lower_env_get(),
+            // The v0.23 `sys.os` floor that needs NO marshaling: `getpid` and `exit`
+            // are single raw syscalls, so they are fully native here. (`sys.fs`/
+            // `sys.net`/`sys.time` and `os.args(alloc)`/`env.get` natively need a
+            // path/buffer/timespec scratch the native subset does not carry yet, so
+            // they fall through to the clean `Unsupported` refusal below and the
+            // program runs on the VM — never a miscompile.)
+            ["os", "getpid"] => self.lower_os_getpid(),
+            ["os", "exit"] => self.lower_os_exit(args),
             other => Err(CodegenError::Unsupported(format!(
                 "intrinsic value.{} in `{}`",
                 other.join("."),
@@ -3832,6 +3840,34 @@ impl<'p> FnLower<'p> {
     /// flagged optional — both read absence as zero), matching the VM's
     /// `Optional(None)`.
     fn lower_env_get(&mut self) -> Result<(), CodegenError> {
+        self.asm.mov_ri(Gpr::Rax, 0);
+        Ok(())
+    }
+
+    /// `sys.os.getpid()`: the real process id via `getpid` (syscall 39), result in
+    /// RAX. Unlike the VM's deterministic default `1`, the native binary returns the
+    /// real pid — but tests assert only `getpid() > 0`, so both backends agree.
+    fn lower_os_getpid(&mut self) -> Result<(), CodegenError> {
+        /// `getpid` — Linux x86-64 syscall number.
+        const SYS_GETPID: i64 = 39;
+        self.asm.mov_ri(Gpr::Rax, SYS_GETPID);
+        self.asm.syscall();
+        Ok(())
+    }
+
+    /// `sys.os.exit(code)`: terminate the process with `code` via `exit` (syscall
+    /// 60). Does not return; an Ok sentinel is still left in RAX for any fall-through
+    /// the verifier expects (the syscall never reaches it).
+    fn lower_os_exit(&mut self, args: &[Operand]) -> Result<(), CodegenError> {
+        /// `exit` — Linux x86-64 syscall number.
+        const SYS_EXIT: i64 = 60;
+        let code = args
+            .first()
+            .ok_or_else(|| self.unsup("sys.os.exit without a code operand"))?;
+        self.operand_to(code, Gpr::Rdi)?;
+        self.asm.mov_ri(Gpr::Rax, SYS_EXIT);
+        self.asm.syscall();
+        // Unreachable, but keep a defined RAX for the in-subset result shape.
         self.asm.mov_ri(Gpr::Rax, 0);
         Ok(())
     }

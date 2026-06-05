@@ -59,7 +59,7 @@ pub use build_graph::{
     TargetTriple,
 };
 pub use value::{Capability, IntRepr, SchedKind, Value};
-pub use vm::{BuildInputs, Halt, PanicInfo, Vm};
+pub use vm::{BuildInputs, Halt, OsInputs, PanicInfo, Vm};
 
 /// Runs `build(b)` over a compiled `build.k2` program and returns the recorded
 /// [`BuildGraph`]. The program is the merged `build.k2` (with the bundled `build`
@@ -127,8 +127,13 @@ pub fn run_tests(prog: &MirProgram) -> TestReport {
 pub struct RunArgs {
     /// The build mode the program was lowered under.
     pub mode: BuildMode,
-    /// The program arguments (forwarded; unused by the current `main` shape).
+    /// The program arguments (forwarded after `--`), read by `sys.os.args`/`arg`/
+    /// `argCount`. Empty by default.
     pub argv: Vec<String>,
+    /// The scripted environment map and real-env/real-pid opt-ins read by
+    /// `sys.env.get` / `sys.os.getpid` (v0.23). All-default by default, so a run
+    /// that never seeds it is offline-absent and deterministic.
+    pub os: OsInputs,
     /// The file label used in an error-return trace (`<file>:line:col`). `None`
     /// falls back to a generic `<source>` label. Set by the driver from the
     /// source path so the trace points at real locations.
@@ -141,6 +146,7 @@ impl RunArgs {
         RunArgs {
             mode,
             argv: Vec::new(),
+            os: OsInputs::default(),
             trace_label: None,
         }
     }
@@ -216,8 +222,11 @@ pub fn run_program_code(prog: &MirProgram, args: RunArgs) -> i32 {
 /// returning `(outcome, exit_code, stdout, stderr)`. Used by the test suite to
 /// assert exact output and exit codes without spawning a process.
 pub fn run_captured(prog: &MirProgram, args: RunArgs) -> (RunOutcome, i32, Vec<u8>, Vec<u8>) {
-    let _ = args;
-    let (outcome, code, out, err, _trace) = run_inner_traced(prog, RunArgs::new(prog.mode));
+    // The forwarded argv and the scripted OS inputs (env / pid opt-ins) are threaded
+    // into the VM. For the whole pre-v0.23 corpus these are all-default (empty argv,
+    // offline-absent env, constant pid), so this is byte-identical to the previous
+    // "ignore the args" behaviour; the v0.23 os/env/fs tests rely on the threading.
+    let (outcome, code, out, err, _trace) = run_inner_traced(prog, args);
     (outcome, code, out, err)
 }
 
@@ -245,7 +254,7 @@ pub fn run_captured_traced(
 /// The existing `run_captured`/`run_program` signatures are intentionally left
 /// unchanged so no caller breaks; this is an additive entry point.
 pub fn run_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64) {
-    let (outcome, code, out, err, count, _trace) = run_inner_metered(prog);
+    let (outcome, code, out, err, count, _trace) = run_inner_metered(prog, OsInputs::default());
     (outcome, code, out, err, count)
 }
 
@@ -254,7 +263,7 @@ pub fn run_metered(prog: &MirProgram) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, u64
 /// (possibly empty) propagation trace.
 fn run_inner_traced(
     prog: &MirProgram,
-    _args: RunArgs,
+    args: RunArgs,
 ) -> (
     RunOutcome,
     i32,
@@ -262,7 +271,15 @@ fn run_inner_traced(
     Vec<u8>,
     Vec<crate::trace::TraceFrame>,
 ) {
-    let (outcome, code, out, err, _count, trace) = run_inner_metered(prog);
+    // Fold the forwarded argv into the OS inputs so `sys.os.args`/`arg`/`argCount`
+    // (and the scripted env / pid opt-ins) reach the VM. Defaults are unchanged
+    // (empty argv, offline-absent env), so a run with no `--`-args is byte-identical
+    // to before.
+    let mut os = args.os;
+    if os.argv.is_empty() {
+        os.argv = args.argv;
+    }
+    let (outcome, code, out, err, _count, trace) = run_inner_metered(prog, os);
     (outcome, code, out, err, trace)
 }
 
@@ -270,6 +287,7 @@ fn run_inner_traced(
 /// captured streams, executed-instruction count, and the error-return trace.
 fn run_inner_metered(
     prog: &MirProgram,
+    os: OsInputs,
 ) -> (
     RunOutcome,
     i32,
@@ -279,6 +297,7 @@ fn run_inner_metered(
     Vec<crate::trace::TraceFrame>,
 ) {
     let mut vm = Vm::new(prog);
+    vm.with_os_inputs(os);
     let halt = vm.run_main();
     let (outcome, code) = match halt {
         Ok(()) => (RunOutcome::Ok, 0),

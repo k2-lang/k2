@@ -2255,6 +2255,44 @@ fn run_native_matches_vm_in_every_mode() {
     }
 }
 
+/// **REGRESSION (v0.23 ROOT)**: a write THROUGH a slice of an `= undefined`
+/// stack array must be visible via the array, identically on the native backend
+/// and the VM. Before the fix, slicing `buf[0..N]` of a `var buf:[N]u8=undefined`
+/// yielded a slice whose `ptr` did NOT alias the array's backing cell, so the VM
+/// silently DROPPED every store through the slice (`fill` left `buf` all-zero)
+/// while native wrote `1 2 3 4` — a native≠VM divergence that also underlay the
+/// `fs.read(buf[0..n])` / `net.recv(buf[0..n])` silent-data-loss findings. This
+/// is the literal repro from the milestone; it must print `1 2 3 4` on BOTH.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn slice_of_undefined_array_write_through_native_matches_vm() {
+    let src = br#"
+fn fill(dst: []u8) void {
+    var i: usize = 0;
+    while (i < dst.len) : (i += 1) { dst[i] = @intCast(i + 1); }
+}
+pub fn main(sys: *System) !void {
+    const o = sys.io.stdout();
+    var buf: [4]u8 = undefined;
+    fill(buf[0..4]);
+    try o.print("{d} {d} {d} {d}\n", .{ buf[0], buf[1], buf[2], buf[3] });
+}
+"#;
+    let (vm_code, vm_out, vm_err) = run_with_code(&["run", "-"], src);
+    let (na_code, na_out, na_err) = run_with_code(&["run-native", "-"], src);
+    assert_eq!(
+        vm_out, "1 2 3 4\n",
+        "VM lost the write-through; stderr: {vm_err}"
+    );
+    assert_eq!(
+        na_out, "1 2 3 4\n",
+        "native lost the write-through; stderr: {na_err}"
+    );
+    assert_eq!(vm_out, na_out, "native and VM must agree byte-for-byte");
+    assert_eq!(vm_code, 0);
+    assert_eq!(na_code, 0);
+}
+
 /// The `bench` subcommand prints the native-vs-VM speedup line. A light smoke test
 /// that the harness runs end-to-end and reports a speedup (the non-flaky numeric
 /// floor lives in the codegen test `native_is_much_faster_than_vm`).

@@ -12,6 +12,45 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **OS / IO / net / time capabilities through `*System` (v0.23).** Real OS
+  effects, every one a capability *value* reached only through the root
+  `*System` (no ambient global). The VM backs them with Rust `std` (`std::fs`,
+  `std::net`, `std::time`, `std::env`, `std::process`); the native backend
+  implements the feasible subset with raw Linux syscalls and **cleanly refuses**
+  the rest (`CodegenError::Unsupported` → "run it on the VM"), never a
+  miscompile. All tests use TEMP files + LOOPBACK only, are self-cleaning, and
+  assert only inequalities for real time — deterministic and offline.
+  - **`sys.fs` / `std.fs`.** `openRead`/`create`/`openReadWrite` (→ `File`),
+    `stat`/`exists`/`delete`, `makeDir`/`removeDir`, `listDir(alloc, path)`; a
+    `File` does `read`/`write`/`stat`/`close`. Errors are an honest `FsError`
+    set mapped from the host's `io::ErrorKind`. A program writes a temp file and
+    reads back the IDENTICAL contents with the correct stat size, then deletes
+    it. (VM via `std::fs`; native cleanly refuses fs.)
+  - **`sys.os` / `std.os` + `sys.env`.** `argCount()`/`arg(i)`/`args(alloc)`
+    read the forwarded argv (everything after `--`, threaded by `k2c run`/
+    `run-native`); `getpid()` and `exit(code)`; `sys.env.get(name)` returns
+    `?[]const u8`. Reproducible by default: env is offline-absent (host env only
+    with `--real-env`; a scripted var with `--env=KEY=VALUE`) and `getpid()` is a
+    deterministic `1` (real with `--real-pid`). Native implements `getpid`/`exit`
+    as raw syscalls; `args(alloc)`/`env.get` are VM-only (cleanly refused).
+  - **`sys.time` / `std.time`.** Real `monotonicReal()` (non-decreasing),
+    `nowReal()` (wall Unix nanos), and `sleepReal(ns)` (a real delay), ALONGSIDE
+    the unchanged deterministic `sys.clock`. The pure-k2 `Duration`/`Instant`
+    value types (`fromMillis`/`asMillis`, `fromNanos`/`elapsedSince`) work over
+    either clock. Real time is opt-in per call, so it never perturbs a
+    deterministic run.
+  - **`sys.net` / `std.net`.** TCP over loopback: `listen(port)` (port 0 =
+    ephemeral, read back with `localPort()`), `connect(host, port)`, a
+    `TcpListener.accept()` → `TcpStream` with `send`/`recv`/`close`. A
+    single-fiber loopback echo round-trips bytes correctly. (VM via `std::net`;
+    native cleanly refuses net.)
+  - Plumbing: `RunArgs` now threads the forwarded argv and an `OsInputs` (scripted
+    env + real-env/real-pid opt-ins) into the VM; `k2c run` gains `--env=K=V`,
+    `--real-env`, `--real-pid` and forwards `-- argv...` to the program (the VM
+    and the native child both). The v0.23 fs/net error names are pre-seeded with
+    stable tags (like `OutOfMemory`/`NoSpaceLeft`) so `@errorName`/`catch` name
+    them even though the door synthesizes them in the VM.
+
 - **Stdlib data structures (v0.22).** The bundled `std` (written in k2, in
   `crates/k2-std/std/std.k2`) gains a family of containers, algorithms, and
   allocators, each exercised by a running program (VM is the semantic reference;

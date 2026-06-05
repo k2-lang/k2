@@ -222,6 +222,94 @@ pub enum IntrinsicId {
     /// a user step can `dependOn`.
     BuildArtifactStep,
 
+    // ---- The v0.23 fs/os/time/net capability floor ----------------------
+    //
+    // These back the real OS effects routed through `sys.fs`/`sys.os`/`sys.time`/
+    // `sys.net` (and the std `fs`/`os`/`time`/`net` wrapper types). The VM backs
+    // them with Rust `std` (`std::fs`, `std::net`, `std::time`, `std::env`,
+    // `std::process`); the native backend backs the feasible subset with raw Linux
+    // syscalls and cleanly REFUSES the rest (`CodegenError::Unsupported`). Tests use
+    // TEMP files + LOOPBACK only, are self-cleaning, and never read the host env or
+    // assert exact wall-clock values (only inequalities), so they stay deterministic.
+    /// `@fsCap()` -> the `sys.fs` filesystem capability value.
+    FsCap,
+    /// `sys.fs.openRead(path)` -> `FsError!File`, opened read-only.
+    FsOpenRead,
+    /// `sys.fs.create(path)` -> `FsError!File` (O_CREAT|O_TRUNC|O_RDWR).
+    FsCreate,
+    /// `sys.fs.openReadWrite(path)` -> `FsError!File`, opened read+write.
+    FsOpenReadWrite,
+    /// `file.read(buf)` / `@fsRead(handle, buf)` -> `FsError!usize`, bytes read.
+    FsRead,
+    /// `file.write(bytes)` / `@fsWrite(handle, bytes)` -> `FsError!usize`, written.
+    FsWrite,
+    /// `file.close()` / `@fsClose(handle)` -> void (the OS file closes on drop).
+    FsClose,
+    /// `sys.fs.stat(path)` / `@fsStat(path)` -> `FsError!Stat { size, is_dir }`.
+    FsStat,
+    /// `stat.size` on a still-`deferred` `Stat` value -> field 0 (the `u64` size).
+    /// (A `Stat` reached through the deferred capability door has no concrete type,
+    /// so its two field reads are deferred members, like `slice.len`/`slice.ptr`.)
+    StatSize,
+    /// `stat.is_dir` on a still-`deferred` `Stat` value -> field 1 (the `bool`).
+    StatIsDir,
+    /// `file.stat()` / `@fsFstat(handle)` -> `FsError!Stat` of an open file.
+    FsFstat,
+    /// `sys.fs.exists(path)` / `@fsExists(path)` -> `bool`.
+    FsExists,
+    /// `sys.fs.delete(path)` / `@fsDelete(path)` -> `FsError!void`.
+    FsDelete,
+    /// `sys.fs.makeDir(path)` / `@fsMkdir(path)` -> `FsError!void`.
+    FsMkdir,
+    /// `sys.fs.removeDir(path)` / `@fsRmdir(path)` -> `FsError!void`.
+    FsRmdir,
+    /// `sys.fs.listDir(alloc, path)` / `@fsListDir(alloc, path)` ->
+    /// `FsError![][]const u8`. VM-only (native cleanly refuses: needs getdents+alloc).
+    FsListDir,
+
+    /// `sys.os.argCount()` / `@osArgCount()` -> `usize`, the forwarded argv count.
+    OsArgCount,
+    /// `sys.os.arg(i)` / `@osArg(i)` -> `[]const u8`, argv element `i` (empty out of
+    /// range).
+    OsArg,
+    /// `sys.os.args(alloc)` / `@osArgs(alloc)` -> `[][]const u8` of the argv,
+    /// materialized through the passed allocator. VM-only (native refuses: alloc+copy).
+    OsArgs,
+    /// `sys.os.getpid()` / `@osGetpid()` -> the process id (a deterministic `1` on
+    /// the VM unless `--real-pid`; the real pid natively).
+    OsGetpid,
+    /// `sys.os.exit(code)` / `@osExit(code)` -> never returns (clean process exit).
+    OsExit,
+
+    /// `@timeCap()` -> the `sys.time` real-clock capability value.
+    TimeCap,
+    /// `sys.time.nowReal()` / `@timeWallReal()` -> real wall-clock Unix nanos (host).
+    TimeWallReal,
+    /// `sys.time.monotonicReal()` / `@timeMonoReal()` -> real monotonic nanos
+    /// (non-decreasing within a run).
+    TimeMonoReal,
+    /// `sys.time.sleepReal(ns)` / `@timeSleepReal(ns)` -> void, after a real delay.
+    TimeSleepReal,
+
+    /// `@netCap()` -> the `sys.net` networking capability value.
+    NetCap,
+    /// `sys.net.listen(port)` / `@netListen(port)` -> `NetError!TcpListener`. Port 0
+    /// binds an ephemeral loopback port (read back via `localPort()`).
+    NetListen,
+    /// `listener.accept()` / `@netAccept(handle)` -> `NetError!TcpStream`.
+    NetAccept,
+    /// `sys.net.connect(host, port)` / `@netConnect(host, port)` ->
+    /// `NetError!TcpStream` (loopback only in tests).
+    NetConnect,
+    /// `stream.send(bytes)` / `@netSend(handle, bytes)` -> `NetError!usize`.
+    NetSend,
+    /// `stream.recv(buf)` / `@netRecv(handle, buf)` -> `NetError!usize`.
+    NetRecv,
+    /// `listener.localPort()` / `@netLocalPort(handle)` -> the bound `u16` port.
+    NetLocalPort,
+    /// `listener.close()` / `stream.close()` / `@netClose(handle)` -> void.
+    NetClose,
+
     /// An intrinsic the VM does not implement (e.g. a `std.testing.*` member
     /// reached outside the `run` path). Dispatch yields a clean panic naming it.
     Unsupported(String),

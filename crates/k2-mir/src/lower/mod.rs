@@ -158,6 +158,29 @@ impl<'a> Lowerer<'a> {
                 let mut m = HashMap::new();
                 m.insert("OutOfMemory".to_string(), ErrTag(1));
                 m.insert("NoSpaceLeft".to_string(), ErrTag(2));
+                // Pre-seed the v0.23 fs/net error names for the same reason: the
+                // `sys.fs`/`sys.net` capability door (a deferred-member intrinsic)
+                // synthesizes these `error.*` values in the VM directly from the
+                // host's `io::ErrorKind`, with no `error.*` literal in the source to
+                // register them — yet `@errorName`/`catch`/`switch` must still name
+                // them. The std `FsError`/`NetError` sets declare exactly these.
+                for (i, name) in [
+                    "FileNotFound",
+                    "AccessDenied",
+                    "AlreadyExists",
+                    "NotADirectory",
+                    "IsADirectory",
+                    "IoError",
+                    "ConnectionRefused",
+                    "ConnectionReset",
+                    "AddressInUse",
+                    "WouldBlock",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    m.insert(name.to_string(), ErrTag((i as u16) + 3));
+                }
                 m
             },
             diagnostics: Vec::new(),
