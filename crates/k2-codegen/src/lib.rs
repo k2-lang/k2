@@ -67,6 +67,7 @@
 //! ```
 
 mod aarch64;
+mod dwarf;
 mod elf;
 mod encode;
 mod fmt_native;
@@ -85,7 +86,7 @@ mod target;
 mod tests;
 
 pub use elf::ElfImage;
-pub use link::compile_program_to_object;
+pub use link::{compile_program_to_object, DebugCtx, DwarfSourceMap};
 pub use obj::ObjectImage;
 pub use target::Target;
 
@@ -181,6 +182,28 @@ pub fn compile_program_to_elf_for(
     target: Target,
 ) -> Result<ElfImage, CodegenError> {
     link::compile_program(prog, target)
+}
+
+/// Compiles a monomorphized [`MirProgram`] to a static x86-64 Linux ELF that
+/// additionally carries **DWARF v5 debug info** (`-g`): an ELF section-header
+/// table plus `.debug_info`/`.debug_abbrev`/`.debug_line`/`.debug_str` sections,
+/// validated here by `llvm-dwarfdump`/`addr2line` (no gdb is available — see
+/// `docs/dwarf.md`).
+///
+/// The DWARF sections are emitted as **unmapped** metadata after the loaded image,
+/// so the executed code, the entry point, the program headers, and the loaded
+/// segments are byte-identical to the [`compile_program_to_elf_for`] output for
+/// the same program — DWARF never changes what runs. The [`DebugCtx`] carries the
+/// source file path and compilation directory the CU/line-table reference.
+///
+/// DWARF emission is x86-64-freestanding only this milestone; for any other target
+/// this falls back to the plain (no-DWARF) path, matching the `-g`-off result.
+pub fn compile_program_to_elf_with_debug(
+    prog: &MirProgram,
+    target: Target,
+    debug: &DebugCtx,
+) -> Result<ElfImage, CodegenError> {
+    link::compile_program_with_debug(prog, target, Some(debug))
 }
 
 /// Before/after code-size statistics for the machine-level peephole pass, used by

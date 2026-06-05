@@ -253,14 +253,30 @@ impl<'p> FnLower<'p> {
     // ---------------------------------------------------------------------
 
     /// Lowers the whole function, returning its finalized code + cross-function
-    /// fixups for the program link pass to patch.
-    pub fn lower(
+    /// fixups for the program link pass to patch. The line marks are discarded;
+    /// the DWARF (`-g`) build path uses [`FnLower::lower_with_lines`] instead.
+    pub fn lower(self, rodata: &mut RoData) -> Result<crate::encode::FinishedFn, CodegenError> {
+        let (code, fixups, _lines) = self.lower_with_lines(rodata)?;
+        Ok((code, fixups))
+    }
+
+    /// Lowers the whole function, additionally returning the surviving DWARF
+    /// [`LineMark`]s (`(fn-relative byte offset, source line)`), for the
+    /// `.debug_line` program. Every statement/terminator boundary tags the
+    /// upcoming code with its 1-based source line via [`Asm::set_line`]; the
+    /// prologue is tagged with the `fn` keyword's line so a breakpoint on the
+    /// function lands on its opening line. `set_line` emits no bytes, so the
+    /// returned `code`/`fixups` are byte-identical to [`FnLower::lower`].
+    pub fn lower_with_lines(
         mut self,
         rodata: &mut RoData,
-    ) -> Result<(Vec<u8>, Vec<crate::encode::Fixup>), CodegenError> {
+    ) -> Result<crate::encode::FinishedFnLines, CodegenError> {
         self.asm.reserve_labels(self.func.blocks.len());
 
-        // ---- Prologue. ----
+        // ---- Prologue. ---- Tag it with the function's defining line so the
+        // address range covering `push rbp; mov rbp,rsp; sub rsp,N` attributes to
+        // the `fn` line (where a debugger sets a function breakpoint).
+        self.asm.set_line(self.func.span.line);
         self.asm.push(Gpr::Rbp);
         self.asm.mov_rr(Gpr::Rbp, Gpr::Rsp);
         let frame = self.plan.frame_size;
@@ -278,13 +294,24 @@ impl<'p> FnLower<'p> {
         // ---- Blocks. ----
         for (bi, block) in self.func.blocks.iter().enumerate() {
             self.asm.bind_label(LabelId(bi as u32));
+            // A synthesized panic/trap block carries its origin span instead of a
+            // span-bearing statement; tag the whole block with it.
+            if let Some(ts) = block.trap_span {
+                self.asm.set_line(ts.line);
+            }
             for stmt in &block.stmts {
+                if let Some(line) = stmt_line(stmt) {
+                    self.asm.set_line(line);
+                }
                 self.lower_stmt(stmt, rodata)?;
+            }
+            if let Some(line) = term_line(&block.term) {
+                self.asm.set_line(line);
             }
             self.lower_terminator(&block.term, rodata)?;
         }
 
-        Ok(self.asm.finish())
+        Ok(self.asm.finish_lines())
     }
 
     /// Restores callee-saved registers and emits `leave; ret`.
@@ -5519,6 +5546,34 @@ fn rvalue_kind(rv: &Rvalue) -> &'static str {
 fn arg(args: &[Operand], i: usize) -> Result<&Operand, CodegenError> {
     args.get(i)
         .ok_or_else(|| CodegenError::Unsupported(format!("intrinsic missing argument {i}")))
+}
+
+/// The 1-based source line a statement attributes its code to, for the DWARF
+/// `.debug_line` table — or `None` for a marker statement (`StorageLive`/`Dead`/
+/// `Note`) that emits no code and carries no span. A `0` line (synthetic, no real
+/// source) is also reported as `None` so the line program skips it.
+fn stmt_line(stmt: &Statement) -> Option<u32> {
+    let line = match stmt {
+        Statement::Assign { span, .. } | Statement::Eval { span, .. } => span.line,
+        Statement::Check(check) => check.span.line,
+        Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Note(_) => return None,
+    };
+    (line != 0).then_some(line)
+}
+
+/// The 1-based source line a terminator attributes its code to, when it carries
+/// one of its own. Only an error-propagating `Return` (a `try` site) does; every
+/// other terminator inherits the preceding statement's line (so `set_line` is not
+/// called and the current line carries through). `None` when there is no distinct
+/// line to attribute.
+fn term_line(term: &Terminator) -> Option<u32> {
+    match term {
+        Terminator::Return {
+            err_trace: Some(span),
+            ..
+        } => (span.line != 0).then_some(span.line),
+        _ => None,
+    }
 }
 
 /// `true` if an rvalue constructs or copies an aggregate value (so a forced-home

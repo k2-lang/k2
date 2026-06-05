@@ -25,8 +25,9 @@ use std::collections::HashMap;
 use k2_mir::{FnId, Linkage, MirProgram};
 
 use crate::aarch64;
+use crate::dwarf;
 use crate::elf::{self, ElfImage};
-use crate::encode::{Asm, FixupKind};
+use crate::encode::{Asm, FixupKind, LineMark};
 use crate::lower::FnLower;
 use crate::obj::{self, ObjReloc, ObjSymbol, ObjectImage};
 use crate::reg::Gpr;
@@ -47,9 +48,83 @@ struct LoweredFn {
     code: Vec<u8>,
     /// Surviving `Call`/`Data` fixups, with `at` offsets relative to `code[0]`.
     fixups: Vec<crate::encode::Fixup>,
+    /// Surviving DWARF line marks (post-peephole, `at` relative to `code[0]`),
+    /// collected only on the `-g` path; empty otherwise.
+    line_marks: Vec<LineMark>,
     /// The byte offset of this function within the assembled `.text` (filled in
     /// during stitching).
     text_off: usize,
+}
+
+/// The source-location context the `-g` DWARF path needs: the source file the
+/// program was compiled from, the compilation directory, and an optional
+/// merged-line → true-`(file, line)` map.
+///
+/// `src_path`/`comp_dir` become the compilation unit's `DW_AT_name`/`DW_AT_comp_dir`
+/// and the line table's primary file/directory entries. `source_map`, when
+/// present, makes DWARF **file-aware**: the driver compiles a single MERGED source
+/// (the user's file plus the appended `std` prelude and any `@import`-ed module),
+/// so a function's `Span.line` is a line of that merged text — which for an
+/// imported function is NOT a line of the user's file. The map recovers each merged
+/// line's true originating `(file, line)`, so the line table and `DW_AT_decl_file`
+/// point at the real file (the `std` source, say) at its real line instead of a
+/// nonexistent line of the main file. With no map (or a line the map cannot place)
+/// the location falls back to the primary file at its raw line, which is correct
+/// for a genuinely single-file program.
+#[derive(Clone, Default)]
+pub struct DebugCtx {
+    /// The source file path as given on the command line (its basename becomes the
+    /// CU/line-table file name; an absolute path is recorded verbatim).
+    pub src_path: String,
+    /// The compilation directory (`std::env::current_dir()`), recorded as
+    /// `DW_AT_comp_dir` / the line table's directory 0.
+    pub comp_dir: String,
+    /// The merged-source line map (see the type-level docs). Empty by default,
+    /// in which case the build behaves exactly as the original single-file path.
+    pub source_map: DwarfSourceMap,
+}
+
+/// A line-level map from a merged-text line (1-based) back to the original
+/// `(file display name, file line)` it came from, for the file-aware DWARF path.
+///
+/// This mirrors the driver's `multi::SourceMap` but lives in the codegen crate (no
+/// cross-crate dependency): the driver fills it in from the same segment facts it
+/// already records when it appends the `std` prelude / merges imported modules.
+/// A merged line not covered by any segment (synthesized scaffolding — a wrapper
+/// `struct {` header, an empty options root, …) resolves to `None`, and the caller
+/// keeps the primary file at the raw line, which never mis-points at a foreign
+/// file.
+#[derive(Clone, Debug, Default)]
+pub struct DwarfSourceMap {
+    /// Segments in ascending merged-line order. Each is
+    /// `(merged_start_line, line_count, file_display, file_start_line)`: merged
+    /// lines `[merged_start_line, merged_start_line + line_count)` map to
+    /// `file_display` lines starting at `file_start_line`.
+    segments: Vec<(u32, u32, String, u32)>,
+}
+
+impl DwarfSourceMap {
+    /// Builds a map from raw segment tuples
+    /// `(merged_start_line, line_count, file_display, file_start_line)`.
+    pub fn from_segments(segments: Vec<(u32, u32, String, u32)>) -> DwarfSourceMap {
+        DwarfSourceMap { segments }
+    }
+
+    /// `true` if no segments were recorded (the single-file fast path).
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Recovers the original `(file, line)` for a merged line (1-based), or `None`
+    /// if the line falls in synthesized scaffolding that maps to no real source.
+    fn resolve(&self, merged_line: u32) -> Option<(&str, u32)> {
+        for (start, count, file, file_start) in &self.segments {
+            if merged_line >= *start && merged_line < start + count {
+                return Some((file.as_str(), file_start + (merged_line - start)));
+            }
+        }
+        None
+    }
 }
 
 /// Compiles a whole [`MirProgram`] to a runnable ELF image for `target`, or fails
@@ -60,26 +135,51 @@ struct LoweredFn {
 /// (cross-compilation only) uses the [`crate::aarch64`] encoder + lowering and is
 /// dispatched separately because its `_start` shim and relocation widths differ.
 pub fn compile_program(prog: &MirProgram, target: Target) -> Result<ElfImage, CodegenError> {
+    compile_program_with_debug(prog, target, None)
+}
+
+/// Compiles a whole [`MirProgram`] to a runnable ELF image for `target`,
+/// optionally emitting DWARF v5 debug info (`debug = Some`). DWARF emission is
+/// x86-64-freestanding only; on aarch64 (or with `debug = None`) the plain path
+/// runs and `debug` is ignored.
+pub fn compile_program_with_debug(
+    prog: &MirProgram,
+    target: Target,
+    debug: Option<&DebugCtx>,
+) -> Result<ElfImage, CodegenError> {
     match target {
-        Target::X86_64Linux => compile_program_x86(prog),
+        Target::X86_64Linux => compile_program_x86(prog, debug),
+        // aarch64 DWARF is deferred (v0.27 scope: x86-64 freestanding only). The
+        // cross-compiled binary is still emitted, just without `.debug_*`.
         Target::Aarch64Linux => aarch64::link::compile_program_aarch64(prog),
     }
 }
 
-/// Compiles a whole [`MirProgram`] to a runnable x86-64 ELF image (the original
-/// pipeline, unchanged).
-fn compile_program_x86(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
+/// Compiles a whole [`MirProgram`] to a runnable x86-64 ELF image. When `debug` is
+/// `Some`, the same `.text`/`.rodata`/segments are emitted (byte-identical to the
+/// `None` path) plus trailing, unmapped DWARF `.debug_*` sections + a
+/// section-header table.
+fn compile_program_x86(
+    prog: &MirProgram,
+    debug: Option<&DebugCtx>,
+) -> Result<ElfImage, CodegenError> {
     let main_id = find_main(prog).ok_or(CodegenError::NoMain)?;
 
-    // ---- Lower every function, collecting code + fixups + the rodata blob. ----
+    // ---- Lower every function, collecting code + fixups (+ line marks on -g). ----
     let mut rodata = RoData::new();
     let mut lowered: Vec<LoweredFn> = Vec::with_capacity(prog.funcs.len());
     for func in &prog.funcs {
-        let (code, fixups) = FnLower::new(prog, func).lower(&mut rodata)?;
+        let (code, fixups, line_marks) = if debug.is_some() {
+            FnLower::new(prog, func).lower_with_lines(&mut rodata)?
+        } else {
+            let (code, fixups) = FnLower::new(prog, func).lower(&mut rodata)?;
+            (code, fixups, Vec::new())
+        };
         lowered.push(LoweredFn {
             id: func.id,
             code,
             fixups,
+            line_marks,
             text_off: 0,
         });
     }
@@ -180,7 +280,213 @@ fn compile_program_x86(prog: &MirProgram) -> Result<ElfImage, CodegenError> {
         )?;
     }
 
-    Ok(elf::write_elf(&text, rodata.bytes(), state_size))
+    // ---- (debug only) Build the DWARF sections from the stitched layout. ----
+    // The text bytes are final (every fixup is patched), so each function's
+    // absolute address range and per-statement line rows are now known. DWARF is
+    // pure trailing metadata: it reads `text`/`lowered` but never modifies them.
+    let debug_sections =
+        debug.map(|ctx| build_dwarf(prog, &lowered, text.len() as u64, elf::TEXT_VADDR, ctx));
+
+    Ok(elf::write_elf_with_debug(
+        &text,
+        rodata.bytes(),
+        state_size,
+        0x3E, // EM_X86_64
+        debug_sections.as_ref(),
+    ))
+}
+
+/// Builds the four DWARF v5 sections from the finalized x86-64 program layout: one
+/// `DW_TAG_subprogram` per lowered function (with a real, **file-aware** source
+/// location) and one `.debug_line` sequence per function rebasing its surviving
+/// fn-relative [`LineMark`]s to absolute `.text` addresses.
+///
+/// The `_start` shim and the runtime prelude have no source and are simply
+/// omitted (an address in them resolves to `??`, which is honest). Functions are
+/// indexed by `prog.funcs[id.index()]` to recover the display name + defining
+/// line; only functions actually lowered into `.text` (the `lowered` vector) get
+/// a DIE/sequence.
+///
+/// File awareness: the driver compiles one MERGED source (user file + appended
+/// `std` prelude + any imported module), so a function/row line is a line of the
+/// merged text. Each such line is translated back to its true `(file, line)` via
+/// [`DebugCtx::source_map`]; the file becomes (or reuses) a line-table entry and
+/// the line is the real source line. A line the map cannot place — or any line at
+/// all when no map was supplied (a genuinely single-file build) — stays attributed
+/// to the primary file (its referenceable index, see [`FileTable`]) at its raw
+/// line, so single-file mapping is unchanged.
+fn build_dwarf(
+    prog: &MirProgram,
+    lowered: &[LoweredFn],
+    text_len: u64,
+    text_vaddr: u64,
+    ctx: &DebugCtx,
+) -> elf::DebugSections {
+    let mut funcs: Vec<dwarf::DwFn> = Vec::with_capacity(lowered.len());
+    let mut lines: Vec<dwarf::DwSeq> = Vec::with_capacity(lowered.len());
+
+    // The line-table file builder: index 0 is always the primary user source.
+    let mut files = FileTable::new(basename(&ctx.src_path));
+
+    for lf in lowered {
+        let func = &prog.funcs[lf.id.index()];
+        let low_pc = text_vaddr + lf.text_off as u64;
+        let len = lf.code.len() as u64;
+
+        // Resolve the function's defining line to its true (file, line). A function
+        // whose merged line maps to no real source (synthesized scaffolding) keeps
+        // the primary file at the raw line.
+        let (decl_file, decl_line) = resolve_loc(&ctx.source_map, func.span.line, &mut files);
+        funcs.push(dwarf::DwFn {
+            name: func.name.clone(),
+            low_pc,
+            len,
+            file: decl_file,
+            decl_line,
+        });
+
+        // Build this function's line sequence: one row per surviving line mark
+        // (rebased to an absolute address) plus a terminating end_sequence row at
+        // the function's one-past-the-last byte. A function with no line marks is
+        // given a single row at its `fn` line so a breakpoint still resolves. Each
+        // row carries its OWN (file, line): a single function can contain code
+        // inlined from more than one source file (a user `test` that inlines a `std`
+        // helper), so resolving per row — not once for the function — is what keeps
+        // an inlined std row in `std.k2` instead of pointing at a nonexistent line
+        // of the user file. The line program emits a `DW_LNS_set_file` whenever the
+        // file changes between consecutive rows.
+        let mut rows: Vec<dwarf::DwRow> = Vec::with_capacity(lf.line_marks.len() + 2);
+        if lf.line_marks.is_empty() {
+            if decl_line != 0 {
+                rows.push(dwarf::DwRow {
+                    address: low_pc,
+                    file: decl_file,
+                    line: decl_line,
+                    end_sequence: false,
+                });
+            }
+        } else {
+            for lm in &lf.line_marks {
+                let (file, line) = match ctx.source_map.resolve(lm.line) {
+                    Some((f, l)) => (files.intern(f), l),
+                    None => (files.primary_index(), lm.line),
+                };
+                rows.push(dwarf::DwRow {
+                    address: text_vaddr + (lf.text_off + lm.at) as u64,
+                    file,
+                    line,
+                    end_sequence: false,
+                });
+            }
+        }
+        // Only emit a sequence when it has at least one real row (otherwise the
+        // function had no source line at all — skip it cleanly). The end_sequence
+        // row inherits the last row's file (it carries no real location).
+        if !rows.is_empty() {
+            let last_file = rows.last().map(|r| r.file).unwrap_or(decl_file);
+            rows.push(dwarf::DwRow {
+                address: low_pc + len,
+                file: last_file,
+                line: 0,
+                end_sequence: true,
+            });
+            lines.push(dwarf::DwSeq { rows });
+        }
+    }
+
+    let producer = format!("k2 v{}", env!("CARGO_PKG_VERSION"));
+    dwarf::build(&dwarf::DwarfInput {
+        producer: &producer,
+        files: files.into_files(),
+        comp_dir: &ctx.comp_dir,
+        text_vaddr,
+        text_len,
+        funcs,
+        lines,
+    })
+}
+
+/// Translates a merged-source `line` to its true `(file_index, line)`: the
+/// [`DwarfSourceMap`] recovers the originating file display name (interned into
+/// `files`, deduplicated) and the real line. A line the map cannot place — or any
+/// line when the map is empty (single-file build) — stays in the primary file (its
+/// referenceable index, never 0) at its raw line.
+fn resolve_loc(map: &DwarfSourceMap, line: u32, files: &mut FileTable) -> (u32, u32) {
+    match map.resolve(line) {
+        Some((file, real_line)) => (files.intern(file), real_line),
+        None => (files.primary_index(), line),
+    }
+}
+
+/// The line program's v5 file table under construction.
+///
+/// The layout is GNU-binutils-compatible: **file 0** and **file 1** are both the
+/// primary user source, and each distinct `@import`-ed file is appended at index
+/// **2+**. DWARF v5 makes index 0 the CU's primary (LLVM reads `DW_AT_name` from
+/// it); but GNU `addr2line`/binutils still chokes on a line program that *references*
+/// file index 0 ("bad file number"). So nothing the line program or `DW_AT_decl_file`
+/// emits ever points at index 0: the primary is referenced as **index 1** (its
+/// duplicate) and foreign files as their 2+ index. A single-file program therefore
+/// reproduces the historical file0==file1 table exactly, and `addr2line` stays warning
+/// -free under both GNU and LLVM. (`llvm-dwarfdump --verify` notes file 1 duplicates
+/// file 0 — a benign warning, exit 0 — which is the price of GNU compatibility.)
+struct FileTable {
+    /// File display names in index order; `paths[0]` and `paths[1]` are the
+    /// primary source (the GNU-compat duplicate), `paths[2..]` the imported files.
+    paths: Vec<String>,
+    /// `display name -> referenceable index`, so the same file is never added
+    /// twice. The primary maps to 1 (not 0); foreign files to their 2+ index.
+    index_of: HashMap<String, u32>,
+}
+
+impl FileTable {
+    /// A fresh table whose files 0 and 1 are both `primary` (the user's source
+    /// basename); the referenceable primary index is 1.
+    fn new(primary: &str) -> FileTable {
+        let name = basename(primary).to_string();
+        let mut index_of = HashMap::new();
+        index_of.insert(name.clone(), 1u32);
+        FileTable {
+            paths: vec![name.clone(), name],
+            index_of,
+        }
+    }
+
+    /// Returns the referenceable index of `display`, appending a new entry the
+    /// first time it is seen. The display string is reduced to its basename so
+    /// `addr2line` reports `std.k2` rather than a long path, matching the
+    /// primary-file convention. The returned index is never 0 (see the type docs).
+    fn intern(&mut self, display: &str) -> u32 {
+        let name = basename(display);
+        if let Some(&idx) = self.index_of.get(name) {
+            return idx;
+        }
+        let idx = self.paths.len() as u32;
+        self.paths.push(name.to_string());
+        self.index_of.insert(name.to_string(), idx);
+        idx
+    }
+
+    /// The referenceable index of the primary user source (always 1).
+    fn primary_index(&self) -> u32 {
+        1
+    }
+
+    /// Finalizes the table into the `dwarf` crate's file entries (all under
+    /// directory 0, the single `comp_dir`).
+    fn into_files(self) -> Vec<dwarf::DwFile> {
+        self.paths
+            .into_iter()
+            .map(|path| dwarf::DwFile { path, dir_index: 0 })
+            .collect()
+    }
+}
+
+/// The final path component of `path` (its basename), or the whole string when it
+/// has no separator. Used for the CU/line-table source file name so `addr2line`
+/// reports `hello.k2` rather than a long path.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// `true` if a fixup targets the runtime prelude or the writable state segment
@@ -231,6 +537,7 @@ pub fn compile_program_to_object(
             id: func.id,
             code,
             fixups,
+            line_marks: Vec::new(),
             text_off: 0,
         });
     }

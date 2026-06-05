@@ -39,6 +39,43 @@ pub const PAGE: u64 = 0x1000;
 const EHDR_SIZE: u64 = 64;
 /// The size in bytes of one ELF64 program header.
 const PHDR_SIZE: u64 = 56;
+/// The size in bytes of one ELF64 section header.
+const SHDR_SIZE: u64 = 64;
+
+// ELF section types used by the section-header table (the executable's
+// debug-info path only needs PROGBITS / STRTAB / NULL).
+/// `SHT_NULL`: the mandatory index-0 inactive section.
+const SHT_NULL: u32 = 0;
+/// `SHT_PROGBITS`: program-defined bytes (`.text`/`.rodata`/`.debug_*`).
+const SHT_PROGBITS: u32 = 1;
+/// `SHT_STRTAB`: a string table (`.shstrtab`).
+const SHT_STRTAB: u32 = 3;
+
+// ELF section flags. The `.debug_*` sections carry **none** of these (so the
+// kernel never maps them and they stay outside every `PT_LOAD`); only `.text`
+// and `.rodata` are `SHF_ALLOC`.
+/// `SHF_ALLOC`: the section occupies memory at run time.
+const SHF_ALLOC: u64 = 0x2;
+/// `SHF_EXECINSTR`: the section holds executable instructions.
+const SHF_EXECINSTR: u64 = 0x4;
+
+/// The four hand-emitted DWARF debug section blobs (DWARF v5), produced by
+/// [`crate::dwarf::build`] and handed to [`write_elf_with_debug`]. Each is a
+/// finished, self-contained byte buffer; the ELF writer only places them into
+/// non-loaded `SHT_PROGBITS` sections and records their offsets/sizes in the
+/// section-header table. They never participate in a `PT_LOAD`, so they cannot
+/// change the executed image.
+pub struct DebugSections {
+    /// `.debug_info`: the compilation-unit DIE + per-function subprogram DIEs.
+    pub info: Vec<u8>,
+    /// `.debug_abbrev`: the abbreviation table the DIEs reference.
+    pub abbrev: Vec<u8>,
+    /// `.debug_line`: the line-number program mapping code addresses to
+    /// `(file, line)`.
+    pub line: Vec<u8>,
+    /// `.debug_str`: the string pool the DIEs reference via `DW_FORM_strp`.
+    pub str_: Vec<u8>,
+}
 
 /// The virtual address where `.text` (and the `_start` entry) begins: one page
 /// past the load base, so the headers live in the first mapped page.
@@ -96,13 +133,6 @@ pub fn state_vaddr_for(text_len: usize, rodata_len: usize) -> u64 {
     LOAD_BASE + state_off
 }
 
-/// Builds the complete ELF image for the **default x86-64 target**
-/// (`e_machine = EM_X86_64`). A thin wrapper over [`write_elf_for`], kept so every
-/// existing caller and test compiles and emits byte-identically.
-pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
-    write_elf_for(text, rodata, state_size, 0x3E)
-}
-
 /// Builds the complete ELF image from the finalized `.text` machine code, the
 /// concatenated `.rodata` bytes, and the writable state segment size (the
 /// allocator registry / clock / RNG `.bss`), targeting the given ELF
@@ -118,6 +148,45 @@ pub fn write_elf(text: &[u8], rodata: &[u8], state_size: u64) -> ElfImage {
 /// static image directly. (aarch64 also supports 16K/64K pages; this writer
 /// documents and targets the 4 KiB configuration.)
 pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16) -> ElfImage {
+    write_elf_with_debug(text, rodata, state_size, e_machine, None)
+}
+
+/// Builds the complete ELF image, optionally appending a **section-header table**
+/// plus the four DWARF `.debug_*` sections after the loaded image.
+///
+/// When `debug` is `None`, the output is **byte-for-byte identical** to the
+/// historical [`write_elf_for`] (`e_shoff`/`e_shnum`/`e_shentsize`/`e_shstrndx`
+/// stay zero, nothing follows the loaded segments) — so every existing caller and
+/// the whole golden test corpus are unaffected, and the `-g`-off `k2c build-native`
+/// keeps emitting the exact v0.26 bytes.
+///
+/// When `debug` is `Some`, the loaded image (Ehdr + Phdrs + `.text` + `.rodata`,
+/// and the program headers that describe them) is emitted **unchanged**; only the
+/// four section-table-related Ehdr fields are filled in, and the debug sections,
+/// the section-name string table, and the section-header table are appended as
+/// trailing, **unmapped** `SHT_PROGBITS`/`SHT_STRTAB` metadata. The kernel maps
+/// and runs the identical image whether or not `debug` is set, which is the
+/// milestone's non-negotiable "DWARF never changes the executed code" guarantee.
+///
+/// Section-header table layout (executable, `debug = Some`):
+///
+/// ```text
+///   [0] (null)         SHT_NULL
+///   [1] .text          SHT_PROGBITS  ALLOC|EXECINSTR  sh_addr = TEXT_VADDR
+///   [2] .rodata        SHT_PROGBITS  ALLOC            (only if rodata present)
+///   [3] .debug_abbrev  SHT_PROGBITS  (no flags, sh_addr = 0)
+///   [4] .debug_str     SHT_PROGBITS
+///   [5] .debug_line    SHT_PROGBITS
+///   [6] .debug_info    SHT_PROGBITS
+///   [7] .shstrtab      SHT_STRTAB
+/// ```
+pub fn write_elf_with_debug(
+    text: &[u8],
+    rodata: &[u8],
+    state_size: u64,
+    e_machine: u16,
+    debug: Option<&DebugSections>,
+) -> ElfImage {
     let has_rodata = !rodata.is_empty();
     let has_state = state_size > 0;
     let phnum: u16 = 1 + u16::from(has_rodata) + u16::from(has_state);
@@ -138,6 +207,27 @@ pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16
     // image) through the end of the text bytes.
     let text_seg_filesz = text_off + text.len() as u64;
 
+    // ---- Pre-compute the trailing debug-section + section-header layout. ----
+    // This must happen *before* the Ehdr is written so its `e_shoff`/`e_shnum`/
+    // `e_shstrndx` fields are correct, but it changes nothing in the loaded image:
+    // every offset below is past the last loaded byte. `None` => the section table
+    // is absent and these stay zero (the historical byte-identical path).
+    let loaded_end_off = if has_rodata {
+        rodata_off + rodata.len() as u64
+    } else {
+        text_seg_filesz
+    };
+    let layout = debug.map(|ds| SectionLayout::compute(ds, loaded_end_off, has_rodata));
+    let (e_shoff, e_shnum, e_shstrndx) = match &layout {
+        Some(l) => (l.shoff, l.shnum, l.shstrndx),
+        None => (0, 0, 0),
+    };
+    let e_shentsize: u16 = if layout.is_some() {
+        SHDR_SIZE as u16
+    } else {
+        0
+    };
+
     let mut bytes: Vec<u8> = Vec::new();
 
     // ---- ELF header (Ehdr, 64 bytes) ----
@@ -153,14 +243,14 @@ pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16
     push_u32(&mut bytes, 1); // e_version
     push_u64(&mut bytes, text_vaddr); // e_entry = _start (start of .text)
     push_u64(&mut bytes, EHDR_SIZE); // e_phoff (phdrs follow the ehdr)
-    push_u64(&mut bytes, 0); // e_shoff (no section headers)
+    push_u64(&mut bytes, e_shoff); // e_shoff (0 unless debug sections present)
     push_u32(&mut bytes, 0); // e_flags
     push_u16(&mut bytes, EHDR_SIZE as u16); // e_ehsize
     push_u16(&mut bytes, PHDR_SIZE as u16); // e_phentsize
     push_u16(&mut bytes, phnum); // e_phnum
-    push_u16(&mut bytes, 0); // e_shentsize
-    push_u16(&mut bytes, 0); // e_shnum
-    push_u16(&mut bytes, 0); // e_shstrndx
+    push_u16(&mut bytes, e_shentsize); // e_shentsize
+    push_u16(&mut bytes, e_shnum); // e_shnum
+    push_u16(&mut bytes, e_shstrndx); // e_shstrndx
 
     // ---- Program header(s) ----
     // Text segment (R + X), mapping the headers + code from file offset 0.
@@ -216,6 +306,104 @@ pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16
         bytes.extend_from_slice(rodata);
     }
 
+    // ---- (debug only) Append the .debug_* sections + the section-header table. ----
+    // Everything below is past `loaded_end_off`, i.e. outside every PT_LOAD, so the
+    // mapped/executed image is byte-identical to the `debug = None` path.
+    if let (Some(ds), Some(l)) = (debug, &layout) {
+        debug_assert_eq!(bytes.len() as u64, loaded_end_off);
+        pad_to(&mut bytes, l.abbrev_off);
+        bytes.extend_from_slice(&ds.abbrev);
+        pad_to(&mut bytes, l.str_off);
+        bytes.extend_from_slice(&ds.str_);
+        pad_to(&mut bytes, l.line_off);
+        bytes.extend_from_slice(&ds.line);
+        pad_to(&mut bytes, l.info_off);
+        bytes.extend_from_slice(&ds.info);
+        pad_to(&mut bytes, l.shstrtab_off);
+        bytes.extend_from_slice(&l.shstrtab);
+        pad_to(&mut bytes, l.shoff);
+
+        // [0] null section.
+        push_shdr(&mut bytes, 0, SHT_NULL, 0, 0, 0, 16, 0);
+        // [1] .text (PROGBITS, ALLOC|EXEC) — real sh_addr so addr2line/objdump map it.
+        push_shdr(
+            &mut bytes,
+            l.name_text,
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_EXECINSTR,
+            text_vaddr,
+            text_off,
+            text.len() as u64,
+            16,
+        );
+        // [2] .rodata (PROGBITS, ALLOC), only when the program has read-only data.
+        if has_rodata {
+            push_shdr(
+                &mut bytes,
+                l.name_rodata,
+                SHT_PROGBITS,
+                SHF_ALLOC,
+                rodata_vaddr,
+                rodata_off,
+                rodata.len() as u64,
+                16,
+            );
+        }
+        // [3..7] the four DWARF sections: SHT_PROGBITS, no flags, sh_addr = 0 (so
+        // they never land in a PT_LOAD), align 1.
+        push_shdr(
+            &mut bytes,
+            l.name_abbrev,
+            SHT_PROGBITS,
+            0,
+            0,
+            l.abbrev_off,
+            ds.abbrev.len() as u64,
+            1,
+        );
+        push_shdr(
+            &mut bytes,
+            l.name_str,
+            SHT_PROGBITS,
+            0,
+            0,
+            l.str_off,
+            ds.str_.len() as u64,
+            1,
+        );
+        push_shdr(
+            &mut bytes,
+            l.name_line,
+            SHT_PROGBITS,
+            0,
+            0,
+            l.line_off,
+            ds.line.len() as u64,
+            1,
+        );
+        push_shdr(
+            &mut bytes,
+            l.name_info,
+            SHT_PROGBITS,
+            0,
+            0,
+            l.info_off,
+            ds.info.len() as u64,
+            1,
+        );
+        // [last] .shstrtab (STRTAB).
+        push_shdr(
+            &mut bytes,
+            l.name_shstrtab,
+            SHT_STRTAB,
+            0,
+            0,
+            l.shstrtab_off,
+            l.shstrtab.len() as u64,
+            1,
+        );
+    }
+
     ElfImage {
         bytes,
         text_len: text.len(),
@@ -223,6 +411,124 @@ pub fn write_elf_for(text: &[u8], rodata: &[u8], state_size: u64, e_machine: u16
         rodata_vaddr,
         state_vaddr,
     }
+}
+
+/// The pre-computed file offsets, the section-name string table, and the derived
+/// `e_shoff`/`e_shnum`/`e_shstrndx` for the trailing section-header table. Built
+/// once (before the Ehdr is written) so the Ehdr fields are correct, then consumed
+/// when the sections are appended. All offsets are past the loaded image.
+struct SectionLayout {
+    /// File offset of each appended blob (8-aligned for tidiness; align 1 is legal).
+    abbrev_off: u64,
+    str_off: u64,
+    line_off: u64,
+    info_off: u64,
+    shstrtab_off: u64,
+    /// File offset of the section-header table itself (`e_shoff`).
+    shoff: u64,
+    /// `e_shnum`: the number of section headers (7 without rodata, 8 with).
+    shnum: u16,
+    /// `e_shstrndx`: the `.shstrtab` index (computed dynamically — rodata shifts it).
+    shstrndx: u16,
+    /// The `.shstrtab` bytes (a `\0`-led pool of the section names).
+    shstrtab: Vec<u8>,
+    /// `sh_name` offsets into `.shstrtab` for each named section.
+    name_text: u32,
+    name_rodata: u32,
+    name_abbrev: u32,
+    name_str: u32,
+    name_line: u32,
+    name_info: u32,
+    name_shstrtab: u32,
+}
+
+impl SectionLayout {
+    /// Lays out the trailing sections starting at `loaded_end` (the first byte past
+    /// the last `PT_LOAD` content), building the `.shstrtab` and computing every
+    /// file offset + the three Ehdr section-table fields.
+    fn compute(ds: &DebugSections, loaded_end: u64, has_rodata: bool) -> SectionLayout {
+        // Build the section-name string table.
+        let mut shstrtab: Vec<u8> = vec![0];
+        let name_text = add_shstr(&mut shstrtab, ".text");
+        let name_rodata = add_shstr(&mut shstrtab, ".rodata");
+        let name_abbrev = add_shstr(&mut shstrtab, ".debug_abbrev");
+        let name_str = add_shstr(&mut shstrtab, ".debug_str");
+        let name_line = add_shstr(&mut shstrtab, ".debug_line");
+        let name_info = add_shstr(&mut shstrtab, ".debug_info");
+        let name_shstrtab = add_shstr(&mut shstrtab, ".shstrtab");
+
+        // File offsets for the appended blobs (8-aligned starts).
+        let abbrev_off = round_up(loaded_end, 8);
+        let str_off = round_up(abbrev_off + ds.abbrev.len() as u64, 8);
+        let line_off = round_up(str_off + ds.str_.len() as u64, 8);
+        let info_off = round_up(line_off + ds.line.len() as u64, 8);
+        let shstrtab_off = round_up(info_off + ds.info.len() as u64, 8);
+        let shoff = round_up(shstrtab_off + shstrtab.len() as u64, 8);
+
+        // Section count + the `.shstrtab` index: 1 null + .text (+ .rodata) + 4
+        // debug + .shstrtab. The `.shstrtab` is always last.
+        let shnum: u16 = if has_rodata { 8 } else { 7 };
+        let shstrndx = shnum - 1;
+
+        SectionLayout {
+            abbrev_off,
+            str_off,
+            line_off,
+            info_off,
+            shstrtab_off,
+            shoff,
+            shnum,
+            shstrndx,
+            shstrtab,
+            name_text,
+            name_rodata,
+            name_abbrev,
+            name_str,
+            name_line,
+            name_info,
+            name_shstrtab,
+        }
+    }
+}
+
+/// Appends a NUL-terminated section name to `.shstrtab` and returns its offset.
+fn add_shstr(out: &mut Vec<u8>, name: &str) -> u32 {
+    let off = out.len() as u32;
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    off
+}
+
+/// Zero-pads `out` up to file offset `to` (a no-op if already at/past it).
+fn pad_to(out: &mut Vec<u8>, to: u64) {
+    if (out.len() as u64) < to {
+        out.resize(to as usize, 0);
+    }
+}
+
+/// Appends one 64-byte `Elf64_Shdr` (`sh_link`/`sh_info`/`sh_entsize` zero — none
+/// of the executable's sections need them).
+#[allow(clippy::too_many_arguments)]
+fn push_shdr(
+    out: &mut Vec<u8>,
+    name: u32,
+    typ: u32,
+    flags: u64,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    addralign: u64,
+) {
+    push_u32(out, name); // sh_name
+    push_u32(out, typ); // sh_type
+    push_u64(out, flags); // sh_flags
+    push_u64(out, addr); // sh_addr (vaddr for ALLOC sections, 0 for .debug_*)
+    push_u64(out, offset); // sh_offset
+    push_u64(out, size); // sh_size
+    push_u32(out, 0); // sh_link
+    push_u32(out, 0); // sh_info
+    push_u64(out, addralign); // sh_addralign
+    push_u64(out, 0); // sh_entsize
 }
 
 /// Appends one `PT_LOAD` program header (56 bytes) with `p_align = PAGE`.

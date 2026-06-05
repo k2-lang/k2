@@ -540,7 +540,7 @@ fn layout_oracle_scalar_sizes() {
 #[test]
 fn elf_header_invariants_text_only() {
     // A single `nop` with no rodata -> one PT_LOAD.
-    let img = crate::elf::write_elf(&[0x90], &[], 0);
+    let img = crate::elf::write_elf_for(&[0x90], &[], 0, 0x3e);
     let b = &img.bytes;
     // Magic + class/data/version/osabi.
     assert_eq!(&b[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -563,7 +563,7 @@ fn elf_header_invariants_text_only() {
 #[test]
 fn elf_program_headers_two_segments() {
     // Code + a rodata string -> two PT_LOADs.
-    let img = crate::elf::write_elf(&[0x90, 0x90], b"hi\n", 0);
+    let img = crate::elf::write_elf_for(&[0x90, 0x90], b"hi\n", 0, 0x3e);
     let b = &img.bytes;
     assert_eq!(u16::from_le_bytes([b[56], b[57]]), 2); // e_phnum == 2
 
@@ -3211,5 +3211,486 @@ mod aarch64_cross {
             !has_neg_xzr,
             "the bogus `neg xzr, x11` (0xCB0B03FF) must be gone"
         );
+    }
+}
+
+// =========================================================================
+//  Tier — DWARF v5 debug info (v0.27)
+//
+//  Always-on, host-independent byte-level tests of the DWARF encoders and the
+//  ELF section-header table. No external tools are needed here; the oracle-gated
+//  (llvm-dwarfdump/addr2line/readelf) end-to-end checks live in
+//  `tests/dwarf_native.rs`.
+// =========================================================================
+
+#[cfg(test)]
+mod dwarf {
+    use crate::dwarf::{self, DwFile, DwFn, DwRow, DwSeq, DwarfInput};
+    use crate::elf::{self, DebugSections};
+
+    /// A single-file file table: just the primary source under `comp_dir` (dir 0).
+    fn one_file(name: &str) -> Vec<DwFile> {
+        vec![DwFile {
+            path: name.to_string(),
+            dir_index: 0,
+        }]
+    }
+
+    /// A small synthetic input: one function `main` at low_pc 0x401014, length
+    /// 0x40, with two source-line rows (lines 19 then 22) plus an end-sequence.
+    fn sample_input() -> DwarfInput<'static> {
+        DwarfInput {
+            producer: "k2 v0.27",
+            files: one_file("hello.k2"),
+            comp_dir: "/work",
+            text_vaddr: 0x40_1000,
+            text_len: 0x100,
+            funcs: vec![DwFn {
+                name: "main".to_string(),
+                low_pc: 0x40_1014,
+                len: 0x40,
+                file: 0,
+                decl_line: 19,
+            }],
+            lines: vec![DwSeq {
+                rows: vec![
+                    DwRow {
+                        address: 0x40_1014,
+                        file: 0,
+                        line: 19,
+                        end_sequence: false,
+                    },
+                    DwRow {
+                        address: 0x40_1030,
+                        file: 0,
+                        line: 22,
+                        end_sequence: false,
+                    },
+                    DwRow {
+                        address: 0x40_1054,
+                        file: 0,
+                        line: 0,
+                        end_sequence: true,
+                    },
+                ],
+            }],
+        }
+    }
+
+    /// `bytes` contains the subslice `needle`.
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn abbrev_declares_cu_and_subprogram() {
+        let ds = dwarf::build(&sample_input());
+        // First abbrev code is 1 (compile_unit), and the table contains the
+        // subprogram tag (0x2e) and ends with a 0 terminator.
+        assert_eq!(ds.abbrev[0], 1, "first abbrev code");
+        assert_eq!(ds.abbrev[1], 0x11, "DW_TAG_compile_unit");
+        assert!(contains(&ds.abbrev, &[0x2e]), "DW_TAG_subprogram present");
+        assert_eq!(*ds.abbrev.last().unwrap(), 0, "abbrev table 0-terminated");
+    }
+
+    #[test]
+    fn info_header_is_dwarf5_compile_unit() {
+        let ds = dwarf::build(&sample_input());
+        let b = &ds.info;
+        // unit_length (u32) excludes itself and equals len-4.
+        let unit_len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        assert_eq!(unit_len, b.len() - 4, "unit_length excludes its own field");
+        // version = 5, unit_type = DW_UT_compile(1), address_size = 8.
+        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 5, "version");
+        assert_eq!(b[6], 0x01, "unit_type = DW_UT_compile");
+        assert_eq!(b[7], 8, "address_size");
+        // debug_abbrev_offset = 0.
+        assert_eq!(u32::from_le_bytes([b[8], b[9], b[10], b[11]]), 0);
+    }
+
+    #[test]
+    fn info_encodes_low_pc_and_subprogram() {
+        let ds = dwarf::build(&sample_input());
+        // The CU's low_pc (0x401000) appears as an 8-byte address.
+        assert!(
+            contains(&ds.info, &0x40_1000u64.to_le_bytes()),
+            "CU low_pc present"
+        );
+        // The subprogram's low_pc (0x401014) appears too.
+        assert!(
+            contains(&ds.info, &0x40_1014u64.to_le_bytes()),
+            "subprogram low_pc present"
+        );
+    }
+
+    #[test]
+    fn str_pool_is_nul_led_and_holds_names() {
+        let ds = dwarf::build(&sample_input());
+        assert_eq!(
+            ds.str_[0], 0,
+            ".debug_str starts with a NUL (offset 0 = \"\")"
+        );
+        assert!(contains(&ds.str_, b"main\0"), "function name interned");
+        assert!(contains(&ds.str_, b"hello.k2\0"), "source name interned");
+        assert!(contains(&ds.str_, b"k2 v0.27\0"), "producer interned");
+    }
+
+    #[test]
+    fn line_program_is_dwarf5_with_set_address_and_end_sequence() {
+        let ds = dwarf::build(&sample_input());
+        let b = &ds.line;
+        // unit_length excludes itself.
+        let unit_len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        assert_eq!(unit_len, b.len() - 4, "line unit_length");
+        // version = 5.
+        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 5, "line version");
+        // address_size = 8, segment_selector_size = 0.
+        assert_eq!(b[6], 8);
+        assert_eq!(b[7], 0);
+        // A DW_LNE_set_address (00 09 02) and a DW_LNE_end_sequence (00 01 01).
+        assert!(
+            contains(b, &[0x00, 0x09, 0x02]),
+            "DW_LNE_set_address present"
+        );
+        assert!(
+            contains(b, &[0x00, 0x01, 0x01]),
+            "DW_LNE_end_sequence present"
+        );
+    }
+
+    #[test]
+    fn line_program_opcode_base_and_set_address_value() {
+        let ds = dwarf::build(&sample_input());
+        let b = &ds.line;
+        // The set_address opcode is followed by the first row's u64 address.
+        let pos = b
+            .windows(3)
+            .position(|w| w == [0x00, 0x09, 0x02])
+            .expect("set_address opcode");
+        let addr_at = pos + 3;
+        assert_eq!(
+            u64::from_le_bytes(b[addr_at..addr_at + 8].try_into().unwrap()),
+            0x40_1014,
+            "set_address operand = first row address"
+        );
+    }
+
+    #[test]
+    fn build_never_panics_on_empty_program() {
+        // No functions, no lines: must still produce well-formed sections.
+        let input = DwarfInput {
+            producer: "k2 v0.27",
+            files: one_file("empty.k2"),
+            comp_dir: "/work",
+            text_vaddr: 0x40_1000,
+            text_len: 0,
+            funcs: vec![],
+            lines: vec![],
+        };
+        let ds = dwarf::build(&input);
+        assert!(!ds.info.is_empty());
+        assert!(!ds.abbrev.is_empty());
+        assert!(!ds.line.is_empty());
+        assert_eq!(ds.str_[0], 0);
+    }
+
+    /// A GNU-compatible multi-file file table: files 0 and 1 are the primary
+    /// source (the duplicate), file 2 is an imported file. Mirrors what
+    /// `link::FileTable` emits for a program that inlines `@import`-ed code.
+    fn multi_file_table() -> Vec<DwFile> {
+        vec![
+            DwFile {
+                path: "main.k2".to_string(),
+                dir_index: 0,
+            },
+            DwFile {
+                path: "main.k2".to_string(),
+                dir_index: 0,
+            },
+            DwFile {
+                path: "std.k2".to_string(),
+                dir_index: 0,
+            },
+        ]
+    }
+
+    /// A two-function multi-file input: a user `main` (file 1) plus an inlined std
+    /// helper sequence in file 2, exercising the per-row `DW_LNS_set_file`.
+    fn multi_file_input() -> DwarfInput<'static> {
+        DwarfInput {
+            producer: "k2 v0.27",
+            files: multi_file_table(),
+            comp_dir: "/work",
+            text_vaddr: 0x40_1000,
+            text_len: 0x200,
+            funcs: vec![
+                DwFn {
+                    name: "main".to_string(),
+                    low_pc: 0x40_1014,
+                    len: 0x40,
+                    file: 1, // the primary's referenceable index (never 0)
+                    decl_line: 7,
+                },
+                DwFn {
+                    name: "expectEqual[testing]".to_string(),
+                    low_pc: 0x40_1100,
+                    len: 0x30,
+                    file: 2, // the imported std file
+                    decl_line: 1188,
+                },
+            ],
+            lines: vec![
+                // `main`'s sequence: a row in the user file (1), then a row whose
+                // line came from inlined std code (file 2), then end_sequence.
+                DwSeq {
+                    rows: vec![
+                        DwRow {
+                            address: 0x40_1014,
+                            file: 1,
+                            line: 7,
+                            end_sequence: false,
+                        },
+                        DwRow {
+                            address: 0x40_1030,
+                            file: 2,
+                            line: 1174,
+                            end_sequence: false,
+                        },
+                        DwRow {
+                            address: 0x40_1054,
+                            file: 1,
+                            line: 0,
+                            end_sequence: true,
+                        },
+                    ],
+                },
+                // The std helper's own sequence (all file 2).
+                DwSeq {
+                    rows: vec![
+                        DwRow {
+                            address: 0x40_1100,
+                            file: 2,
+                            line: 1188,
+                            end_sequence: false,
+                        },
+                        DwRow {
+                            address: 0x40_1130,
+                            file: 2,
+                            line: 0,
+                            end_sequence: true,
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// Decodes the v5 line-program header's `file_names_count` and the path of each
+    /// file entry (every file in this emitter uses `DW_FORM_string` + a ULEB dir
+    /// index). Returns the list of file paths in index order. Test-only.
+    fn line_file_table(line: &[u8]) -> Vec<String> {
+        // Header layout (see `build_line`): unit_length(4) version(2) addr_size(1)
+        // seg_sel(1) header_length(4) then min_inst(1) max_ops(1) default_is_stmt(1)
+        // line_base(1) line_range(1) opcode_base(1) std_opcode_lengths(12)
+        // dir_format_count(1) [path,form ulebs] dir_count(uleb) dir0(string)
+        // file_format_count(1) [path,form; dir,form ulebs] file_count(uleb) files...
+        let mut i = 4 + 2 + 1 + 1 + 4; // skip to min_instruction_length
+        i += 6; // min_inst..opcode_base (6 single bytes)
+        i += 12; // standard_opcode_lengths[12]
+                 // Directory table: format_count pairs, then count, then the dir strings.
+        let dir_fmt = line[i] as usize;
+        i += 1;
+        i += dir_fmt * 2; // each (content_type, form) is a 1-byte ULEB pair here
+        let (dir_count, adv) = read_uleb_at(line, i);
+        i += adv;
+        for _ in 0..dir_count {
+            // one DW_FORM_string per directory.
+            while line[i] != 0 {
+                i += 1;
+            }
+            i += 1; // the NUL
+        }
+        // File table.
+        let file_fmt = line[i] as usize;
+        i += 1;
+        i += file_fmt * 2; // (path,form) + (dir_index,form)
+        let (file_count, adv) = read_uleb_at(line, i);
+        i += adv;
+        let mut paths = Vec::new();
+        for _ in 0..file_count {
+            let start = i;
+            while line[i] != 0 {
+                i += 1;
+            }
+            paths.push(String::from_utf8_lossy(&line[start..i]).into_owned());
+            i += 1; // the NUL
+                    // dir index (ULEB) — skip.
+            let (_, adv) = read_uleb_at(line, i);
+            i += adv;
+        }
+        paths
+    }
+
+    /// Reads a ULEB128 at `b[i..]`, returning `(value, bytes_consumed)`. Test-only.
+    fn read_uleb_at(b: &[u8], mut i: usize) -> (u64, usize) {
+        let start = i;
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = b[i];
+            i += 1;
+            result |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        (result, i - start)
+    }
+
+    #[test]
+    fn file_table_is_gnu_compatible_and_multi_file() {
+        // The line-program file table must be well-formed: file 0 and file 1 are the
+        // primary (the GNU-compat duplicate), file 2 is the imported file, and the
+        // line program references the primary as 1 / the import as 2 — never 0.
+        let ds = dwarf::build(&multi_file_input());
+        let paths = line_file_table(&ds.line);
+        assert_eq!(paths.len(), 3, "file table holds 3 entries; got {paths:?}");
+        assert_eq!(paths[0], "main.k2", "file 0 = primary");
+        assert_eq!(
+            paths[1], "main.k2",
+            "file 1 = primary duplicate (GNU compat)"
+        );
+        assert_eq!(paths[2], "std.k2", "file 2 = imported file");
+
+        // `DW_LNS_set_file` (0x04) appears: the line program switches file registers
+        // (to the import in `main`'s mixed sequence and for the std sequence).
+        assert!(
+            contains(&ds.line, &[0x04, 0x02]),
+            "a DW_LNS_set_file selecting file 2 (std) is present"
+        );
+
+        // The line program never sets file 0 (`DW_LNS_set_file 0`), the value GNU
+        // binutils rejects with "bad file number".
+        assert!(
+            !contains(&ds.line, &[0x04, 0x00]),
+            "no DW_LNS_set_file selects the GNU-hostile file index 0"
+        );
+
+        // Both source basenames are interned in .debug_str (the CU name + the
+        // primary; std appears only in the line table, not necessarily in str).
+        assert!(contains(&ds.str_, b"main.k2\0"), "primary name interned");
+    }
+
+    #[test]
+    fn subprogram_decl_files_are_per_function() {
+        // Each subprogram's DW_AT_decl_file is its own file index, ULEB-encoded
+        // right after its 8-byte high_pc. We assert the two decl_file values (1 for
+        // the user `main`, 2 for the imported helper) both appear in .debug_info.
+        let ds = dwarf::build(&multi_file_input());
+        // main's high_pc is its len (0x40) as data8; decl_file (1) follows it.
+        assert!(
+            contains(&ds.info, &[0x40, 0, 0, 0, 0, 0, 0, 0, 0x01]),
+            "main's high_pc=0x40 is followed by decl_file=1"
+        );
+        // the std helper's high_pc is 0x30; decl_file (2) follows it.
+        assert!(
+            contains(&ds.info, &[0x30, 0, 0, 0, 0, 0, 0, 0, 0x02]),
+            "the helper's high_pc=0x30 is followed by decl_file=2"
+        );
+    }
+
+    // ---- ELF section-header table ----
+
+    /// A minimal `DebugSections` for section-table layout tests.
+    fn sample_sections() -> DebugSections {
+        dwarf::build(&sample_input())
+    }
+
+    #[test]
+    fn no_debug_path_is_byte_identical() {
+        // The `None` path must equal the historical writer exactly.
+        let a = elf::write_elf_with_debug(&[0x90, 0x90], b"hi\n", 0, 0x3e, None);
+        let b = elf::write_elf_for(&[0x90, 0x90], b"hi\n", 0, 0x3e);
+        assert_eq!(
+            a.bytes, b.bytes,
+            "debug=None is byte-identical to write_elf"
+        );
+    }
+
+    #[test]
+    fn section_table_present_and_well_formed() {
+        let ds = sample_sections();
+        let img = elf::write_elf_with_debug(&[0x90; 16], b"hi\n", 0, 0x3e, Some(&ds));
+        let b = &img.bytes;
+        // e_shoff != 0, e_shentsize == 64, e_shnum >= 7.
+        let e_shoff = super::read_u64(b, 40);
+        assert_ne!(e_shoff, 0, "e_shoff set");
+        assert_eq!(u16::from_le_bytes([b[58], b[59]]), 64, "e_shentsize");
+        let e_shnum = u16::from_le_bytes([b[60], b[61]]);
+        assert_eq!(e_shnum, 8, "null+.text+.rodata+4 debug+.shstrtab");
+        let e_shstrndx = u16::from_le_bytes([b[62], b[63]]);
+        assert_eq!(e_shstrndx, 7, ".shstrtab is the last section");
+
+        // Walk the section names via .shstrtab and assert the debug sections
+        // exist with sh_flags == 0 and outside every PT_LOAD.
+        let shoff = e_shoff as usize;
+        let shstr_hdr = shoff + e_shstrndx as usize * 64;
+        let shstr_off = super::read_u64(b, shstr_hdr + 24) as usize;
+        let mut names = Vec::new();
+        for i in 0..e_shnum as usize {
+            let h = shoff + i * 64;
+            let name_off = super::read_u32(b, h) as usize;
+            let name = cstr_at(b, shstr_off + name_off);
+            let flags = super::read_u64(b, h + 8);
+            let sh_off = super::read_u64(b, h + 24);
+            let sh_size = super::read_u64(b, h + 32);
+            names.push(name.clone());
+            if name.starts_with(".debug_") {
+                assert_eq!(flags, 0, "{name} must have no flags (unmapped)");
+                // Outside the text PT_LOAD: text segment is [0, text_seg_filesz).
+                assert!(
+                    sh_off >= 0x1000 + 16,
+                    "{name} must start past the loaded text bytes"
+                );
+                assert!(sh_size > 0, "{name} non-empty");
+            }
+        }
+        for want in [
+            ".text",
+            ".rodata",
+            ".debug_abbrev",
+            ".debug_str",
+            ".debug_line",
+            ".debug_info",
+            ".shstrtab",
+        ] {
+            assert!(names.iter().any(|n| n == want), "section {want} present");
+        }
+    }
+
+    #[test]
+    fn text_section_has_real_vaddr() {
+        let ds = sample_sections();
+        let img = elf::write_elf_with_debug(&[0x90; 16], &[], 0, 0x3e, Some(&ds));
+        let b = &img.bytes;
+        let e_shoff = super::read_u64(b, 40) as usize;
+        // Section [1] is .text; its sh_addr (offset 16 in the shdr) is TEXT_VADDR.
+        let text_hdr = e_shoff + 64;
+        assert_eq!(
+            super::read_u64(b, text_hdr + 16),
+            0x40_1000,
+            ".text sh_addr"
+        );
+    }
+
+    /// Reads a NUL-terminated string from `b` starting at `at`.
+    fn cstr_at(b: &[u8], at: usize) -> String {
+        let end = b[at..]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|p| at + p)
+            .unwrap_or(b.len());
+        String::from_utf8_lossy(&b[at..end]).into_owned()
     }
 }

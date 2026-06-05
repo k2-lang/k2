@@ -1249,6 +1249,10 @@ struct NativeFlags<'a> {
     target: Target,
     /// Whether to emit an object + link it with libc via the system `cc`.
     link_libc: bool,
+    /// Whether to emit DWARF v5 debug info (`-g`/`--debug-info`). Defaults to ON in
+    /// `--debug` mode and OFF in `--release-*`; an explicit `-g`/`--no-debug-info`
+    /// overrides. DWARF is unmapped metadata — it never changes the executed code.
+    debug_info: bool,
     /// The args after the path (forwarded argv / output options).
     rest: Vec<&'a String>,
 }
@@ -1267,6 +1271,9 @@ fn parse_native_flags<'a>(args: &'a [String], cmd: &str) -> Result<NativeFlags<'
     let mut opt_flag = false;
     let mut target = Target::default();
     let mut link_libc = false;
+    // `None` = follow the build-mode default (on in Debug, off in Release); `Some`
+    // = an explicit `-g` / `--no-debug-info` override.
+    let mut debug_info: Option<bool> = None;
     let mut rest: Vec<&String> = Vec::new();
     let mut seen_path = false;
     for arg in args {
@@ -1288,6 +1295,8 @@ fn parse_native_flags<'a>(args: &'a [String], cmd: &str) -> Result<NativeFlags<'
             "--debug" => mode = BuildMode::Debug,
             "--opt" => opt_flag = true,
             "--link-libc" => link_libc = true,
+            "-g" | "--debug-info" => debug_info = Some(true),
+            "--no-debug-info" => debug_info = Some(false),
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown `{cmd}` flag `{other}`"));
             }
@@ -1299,12 +1308,17 @@ fn parse_native_flags<'a>(args: &'a [String], cmd: &str) -> Result<NativeFlags<'
     }
     let path =
         path.ok_or_else(|| format!("`{cmd}` needs a <file.k2> argument (or `-` for stdin)"))?;
+    // Resolve the DWARF default: on in Debug mode, off in Release (the explicit
+    // flag, if any, wins). DWARF on a non-x86_64-linux target or the libc path is
+    // ignored downstream (v0.27 scope), so this is just the user's intent.
+    let debug_info = debug_info.unwrap_or(matches!(mode, BuildMode::Debug));
     Ok(NativeFlags {
         path,
         mode,
         opt_flag,
         target,
         link_libc,
+        debug_info,
         rest,
     })
 }
@@ -1340,6 +1354,94 @@ fn find_cc() -> Option<String> {
         }
     }
     None
+}
+
+/// Compiles a [`MirProgram`] to a freestanding native ELF, emitting **DWARF v5
+/// debug info** when `debug_info` is set and the target supports it (x86-64 Linux,
+/// the freestanding path). For any other target, or when `debug_info` is off, this
+/// is exactly [`k2_codegen::compile_program_to_elf_for`] — byte-identical output —
+/// so a `-g`-off (or aarch64) build is unchanged.
+///
+/// DWARF emission needs the source path (for the CU/line-table file name) and the
+/// compilation directory (`std::env::current_dir()`, for `DW_AT_comp_dir`). A
+/// `-` (stdin) source is named `<stdin>`; a current-dir lookup that fails (no
+/// permissions) falls back to `.` rather than aborting — DWARF must never fail the
+/// build.
+fn compile_native_elf(
+    prog: &MirProgram,
+    path: &str,
+    target: Target,
+    debug_info: bool,
+) -> Result<k2_codegen::ElfImage, k2_codegen::CodegenError> {
+    if debug_info && target == Target::X86_64Linux {
+        let comp_dir = env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| ".".to_string());
+        let src_path = if path == "-" {
+            "<stdin>".to_string()
+        } else {
+            path.to_string()
+        };
+        // Build the merged-line -> true-(file, line) map so the DWARF is
+        // file-aware: `parse_program` compiles the user source with the `std`
+        // prelude APPENDED, so an `@import`-ed std function's `Span.line` is a line
+        // of that combined text (beyond the end of the user file). The map recovers
+        // each line's real file/line; a single-file program with no std code lowered
+        // simply never consults the std segment.
+        let source_map = build_native_source_map(path, &src_path);
+        let ctx = k2_codegen::DebugCtx {
+            src_path,
+            comp_dir,
+            source_map,
+        };
+        k2_codegen::compile_program_to_elf_with_debug(prog, target, &ctx)
+    } else {
+        k2_codegen::compile_program_to_elf_for(prog, target)
+    }
+}
+
+/// Builds the [`k2_codegen::DwarfSourceMap`] for a freestanding `-g` build, mirroring
+/// EXACTLY the text layout [`parse_program`] produces: the user source first
+/// (merged lines `1..=user_lines`, mapping 1:1 to the user file), then the appended
+/// `std` prelude — one synthesized `const __k2_std_root = struct {` header line that
+/// maps to no user source, then the `std` body (mapping to `std.k2` line 1 onward).
+///
+/// `path` is the source file path on disk (or `-` for stdin); `display` is the name
+/// to report for the user file (its basename is used in the DWARF). A read failure
+/// (or stdin, whose bytes are already consumed by the front end) yields an empty
+/// map, so the build is still correct as a single-file program — DWARF must never
+/// fail the build.
+fn build_native_source_map(path: &str, display: &str) -> k2_codegen::DwarfSourceMap {
+    // The std prelude's char layout is not available for `-` (stdin already
+    // consumed) or an unreadable file; fall back to the single-file path.
+    let Some(source) = (if path == "-" {
+        None
+    } else {
+        fs::read_to_string(path).ok()
+    }) else {
+        return k2_codegen::DwarfSourceMap::default();
+    };
+
+    // `line_count_of` counts the lines a body contributes, matching the multi-file
+    // merge: every line, plus one more if the body does not end in a newline.
+    let line_count_of = |s: &str| s.lines().count() as u32 + u32::from(!s.ends_with('\n'));
+
+    let user_lines = line_count_of(&source);
+    let mut segments: Vec<(u32, u32, String, u32)> = Vec::with_capacity(2);
+    // User source: merged lines 1.. map 1:1 to the user file.
+    let user_name = display.rsplit('/').next().unwrap_or(display).to_string();
+    segments.push((1, user_lines, user_name, 1));
+
+    // The std body begins after the user source (newline-terminated by
+    // `parse_program`) plus the one synthesized wrapper header line
+    // `const __k2_std_root = struct {`. That header maps to no real source, so the
+    // body's first merged line is `user_lines + 2`.
+    let std_body_start = user_lines + 2;
+    let std_lines = line_count_of(k2_std::STD_BODY);
+    segments.push((std_body_start, std_lines, "std.k2".to_string(), 1));
+
+    k2_codegen::DwarfSourceMap::from_segments(segments)
 }
 
 /// Links a relocatable object into a dynamic executable by invoking the system
@@ -1394,7 +1496,7 @@ fn cmd_build_native(args: &[String]) -> Result<ExitCode, String> {
         return build_native_libc(&prog, path, target, &out);
     }
 
-    let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
+    let img = match compile_native_elf(&prog, path, target, flags.debug_info) {
         Ok(img) => img,
         Err(e) => {
             let _ = writeln!(
@@ -1560,12 +1662,13 @@ fn run_native_libc(
 ///   k2c run-native <file.k2> [flags] [-- argv...]
 fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
     let flags = parse_native_flags(args, "run-native")?;
-    let (path, mode, opt_flag, target, link_libc, forwarded) = (
+    let (path, mode, opt_flag, target, link_libc, debug_info, forwarded) = (
         flags.path,
         flags.mode,
         flags.opt_flag,
         flags.target,
         flags.link_libc,
+        flags.debug_info,
         flags.rest,
     );
 
@@ -1594,7 +1697,9 @@ fn cmd_run_native(args: &[String]) -> Result<ExitCode, String> {
         return run_native_libc(&prog, path, target, &forwarded);
     }
 
-    let img = match k2_codegen::compile_program_to_elf_for(&prog, target) {
+    // `run-native -g` emits the DWARF (it is unmapped, so execution is identical),
+    // letting a user `run-native -g … && gdb` the produced temp on a gdb host.
+    let img = match compile_native_elf(&prog, path, target, debug_info) {
         Ok(img) => img,
         Err(e) => {
             let _ = writeln!(
@@ -2397,6 +2502,9 @@ fn print_usage() {
          \x20   run --release-fast <f>  Optimize + execute with safety checks stripped.\n\
          \x20   run-native <file.k2>  Compile to a native x86-64 ELF, execute it, propagate exit code.\n\
          \x20   build-native <f> -o <out>  Compile to a static Linux ELF written to <out>.\n\
+         \x20       -g, --debug-info   Emit DWARF v5 debug info (default ON in --debug, OFF in\n\
+         \x20                          --release-*; --no-debug-info opts out). x86-64 freestanding\n\
+         \x20                          only; DWARF is unmapped metadata and never changes what runs.\n\
          \x20       --target=<triple>  Select the target ISA. Supported triples:\n\
          \x20         x86_64-linux   (default; build + run + native==VM verified)\n\
          \x20         aarch64-linux  (cross-compile; structurally validated, NOT executed here —\n\

@@ -10,7 +10,55 @@ is being designed in the open and nothing is stable yet.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-file DWARF mis-attributed `@import`-ed code to the main file's
+  nonexistent lines (v0.27 follow-up).** The native backend compiles a *merged*
+  source (the user's file with the `std` prelude appended), so an inlined std
+  function's span line is a line of that merged text — beyond the end of the
+  user's file. The initial v0.27 emitter assumed a single source file and emitted
+  a hardcoded `DW_AT_decl_file` / a one-entry line-table file, so e.g.
+  `expectEqual[testing]` resolved to `errors.k2:1373` (a line that does not exist
+  in the 184-line `errors.k2`). The emitter is now **file-aware**: a merged-line →
+  true-`(file, line)` map (mirroring the v0.24 multi-file `SourceMap`) is threaded
+  through `DebugCtx`, the line program emits one file entry per distinct source
+  file and a per-row `DW_LNS_set_file`, and each `DW_TAG_subprogram`'s
+  `DW_AT_decl_file` carries its own file. An inlined std address now resolves to
+  `std.k2` at its real line; user addresses still map to the correct user
+  `(file, line)`; single-file mapping is unchanged; `llvm-dwarfdump --verify`
+  stays clean and both GNU and LLVM `addr2line` resolve without a "bad file
+  number" error. Resolving per *row* (not per function) is what keeps a `std`
+  statement inlined into a user `test` body in `std.k2` rather than at a
+  nonexistent user-file line. Regression tests assert the file table is
+  well-formed and that no address resolves to a line beyond the user file's
+  length.
+
 ### Added
+
+- **DWARF v5 debug info in the native x86-64 backend (v0.27).** `k2c
+  build-native -g` / `run-native -g` (default ON in `--debug`, OFF in
+  `--release-*`; `--no-debug-info` opts out) emit a real ELF **section-header
+  table** plus `.debug_abbrev` / `.debug_str` / `.debug_line` / `.debug_info`
+  sections, so a debugger maps machine addresses to k2 source locations and shows
+  k2 function names. The `.debug_info` carries a `DW_TAG_compile_unit`
+  (producer / source name / comp_dir / `low_pc`/`high_pc` over `.text` /
+  `stmt_list`) and one `DW_TAG_subprogram` per emitted function (name, `low_pc`,
+  `high_pc`, `decl_file`, `decl_line`); the `.debug_line` program maps each
+  machine-code range to its `(file, line)` from the MIR per-statement spans, one
+  sequence per function. Hand-emitted in pure `std` (no `gimli`/`object`),
+  validated by `llvm-dwarfdump --verify` (zero errors), `addr2line` (in-`main`
+  address → right `hello.k2` line + function name), and `readelf -S`.
+  - The DWARF is **pure unmapped metadata**: the loaded image — program headers,
+    `.text`, `.rodata`, the state segment — is byte-for-byte identical with and
+    without `-g` (only four section-table header fields differ), so DWARF never
+    changes what runs. `build-native --no-debug-info hello.k2` reproduces the
+    exact prior 8520-byte binary. Line marks ride through the machine peephole
+    like fixups, so a moved/deleted instruction never desyncs the table.
+  - Scope: x86-64 freestanding only this milestone; aarch64 and `--link-libc`
+    ignore `-g` (binary still produced). Local-variable / base-type DIEs are
+    deferred (additive, never touch `.text`). See `docs/dwarf.md`. No gdb here;
+    live debugging is expected to work under gdb/lldb on a host that has them,
+    consuming the same DWARF the oracle tools validate.
 
 - **OS / IO / net / time capabilities through `*System` (v0.23).** Real OS
   effects, every one a capability *value* reached only through the root

@@ -173,6 +173,19 @@ pub enum FixupKind {
     State(u32),
 }
 
+/// A finished function's bytes plus the cross-function fixups the link pass must
+/// still patch — the result of [`Asm::finish`] / [`FnLower::lower`].
+///
+/// [`FnLower::lower`]: crate::lower::FnLower::lower
+pub type FinishedFn = (Vec<u8>, Vec<Fixup>);
+
+/// A finished function's bytes, its fixups, and the surviving DWARF line marks —
+/// the result of [`Asm::finish_lines`] / [`FnLower::lower_with_lines`] on the
+/// `-g` path.
+///
+/// [`FnLower::lower_with_lines`]: crate::lower::FnLower::lower_with_lines
+pub type FinishedFnLines = (Vec<u8>, Vec<Fixup>, Vec<LineMark>);
+
 /// One unresolved reference embedded in the code stream.
 #[derive(Clone, Copy, Debug)]
 pub struct Fixup {
@@ -231,6 +244,19 @@ pub(crate) enum ITag {
     Other,
 }
 
+/// One recorded source-line boundary: at byte offset `at` in [`Asm::buf`] the
+/// emitted code starts corresponding to 1-based source `line`. These are pure
+/// metadata — they never emit a byte — and feed the `.debug_line` program. Like
+/// fixups, they are bucketed into instructions during the peephole and rebased on
+/// re-serialization, so a deleted/moved instruction never desyncs the line table.
+#[derive(Clone, Copy, Debug)]
+pub struct LineMark {
+    /// The byte offset within the function's code the line range begins at.
+    pub at: usize,
+    /// The 1-based source line.
+    pub line: u32,
+}
+
 /// One recorded instruction boundary: the byte offset where the instruction
 /// begins and its peephole classification. The instruction's length is the
 /// distance to the next mark (or the buffer end for the last).
@@ -260,6 +286,15 @@ pub struct Asm {
     /// itself), so a directly-built `Asm` — a test, the runtime prelude, the
     /// `_start` shim — is peepholed too.
     marks: Vec<Mark>,
+    /// One [`LineMark`] per source-line transition (DWARF line-table side-channel).
+    /// Recording is opt-in via [`Asm::set_line`] (only the MIR lowering calls it),
+    /// so a directly-built `Asm` with no `set_line` calls carries none and the
+    /// `-g`-off path is unaffected. Threaded through the peephole exactly like
+    /// `fixups`, so line offsets track instruction motion/deletion.
+    line_marks: Vec<LineMark>,
+    /// The most recently set source line (`0` = unknown / none yet), so a repeated
+    /// line emits no duplicate mark.
+    cur_line: u32,
     /// How many `.text` bytes the most recent [`Asm::peephole`] removed (for the
     /// codegen size statistics).
     peephole_saved_bytes: usize,
@@ -278,6 +313,10 @@ struct Instr {
     bytes: Vec<u8>,
     /// Fixup holes inside this instruction, as `(relative offset, kind)`.
     fixups: Vec<(usize, FixupKind)>,
+    /// Line marks that fall inside this instruction, as `(relative offset, line)`.
+    /// Carried alongside the bytes so deleting an instruction drops its line marks
+    /// and re-serialization rebases the rest — the line table can never desync.
+    line_marks: Vec<(usize, u32)>,
 }
 
 // This is a deliberately *complete* encoder for the instruction set the
@@ -306,6 +345,21 @@ impl Asm {
     /// against this).
     pub fn code(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Records that the code emitted from the current position onward corresponds
+    /// to 1-based source `line`, for the DWARF `.debug_line` table. This only
+    /// appends to the [`Asm::line_marks`] side-channel — **no byte is emitted** —
+    /// so it can never change the executed code. A `0` line (unknown) and a repeat
+    /// of the current line are ignored, keeping the line program compact.
+    pub fn set_line(&mut self, line: u32) {
+        if line != 0 && line != self.cur_line {
+            self.line_marks.push(LineMark {
+                at: self.buf.len(),
+                line,
+            });
+            self.cur_line = line;
+        }
     }
 
     /// Records the start of a new instruction with peephole tag `tag`. Called
@@ -1321,6 +1375,7 @@ impl Asm {
         let buf = std::mem::take(&mut self.buf);
         let fixups = std::mem::take(&mut self.fixups);
         let marks = std::mem::take(&mut self.marks);
+        let line_marks = std::mem::take(&mut self.line_marks);
 
         let mut instrs: Vec<Instr> = Vec::with_capacity(marks.len());
         for (i, m) in marks.iter().enumerate() {
@@ -1329,18 +1384,28 @@ impl Asm {
                 tag: m.tag,
                 bytes: buf[m.at..end].to_vec(),
                 fixups: Vec::new(),
+                line_marks: Vec::new(),
             });
         }
         // Bucket each fixup into the instruction that contains its hole.
         for fx in fixups {
-            // Find the last mark whose `at <= fx.at` (the instruction it belongs to).
-            let idx = match marks.binary_search_by(|m| m.at.cmp(&fx.at)) {
-                Ok(i) => i,
-                Err(0) => 0,
-                Err(i) => i - 1,
-            };
-            let rel = fx.at - marks[idx].at;
-            instrs[idx].fixups.push((rel, fx.kind));
+            let idx = mark_index(&marks, fx.at);
+            instrs[idx].fixups.push((fx.at - marks[idx].at, fx.kind));
+        }
+        // Bucket each line mark into the instruction it begins. A line mark at the
+        // very end of the buffer (a `set_line` with no following instruction) has
+        // no owner and is dropped — it would mark an empty range.
+        for lm in line_marks {
+            if marks.is_empty() {
+                break;
+            }
+            let idx = mark_index(&marks, lm.at);
+            // Guard: a mark whose offset is beyond the last instruction's start is
+            // still owned by that last instruction (rel may equal its length when
+            // the line change landed exactly at the end — harmless, the row's
+            // address then coincides with the next instruction's start).
+            let rel = lm.at - marks[idx].at;
+            instrs[idx].line_marks.push((rel, lm.line));
         }
         instrs
     }
@@ -1352,6 +1417,7 @@ impl Asm {
     fn reassemble_from_instrs(&mut self, instrs: Vec<Instr>) {
         let mut buf: Vec<u8> = Vec::new();
         let mut fixups: Vec<Fixup> = Vec::new();
+        let mut line_marks: Vec<LineMark> = Vec::new();
         for inst in &instrs {
             let base = buf.len();
             if let ITag::Label { label } = inst.tag {
@@ -1365,9 +1431,16 @@ impl Asm {
                     kind: *kind,
                 });
             }
+            for (rel, line) in &inst.line_marks {
+                line_marks.push(LineMark {
+                    at: base + rel,
+                    line: *line,
+                });
+            }
         }
         self.buf = buf;
         self.fixups = fixups;
+        self.line_marks = line_marks;
     }
 
     /// Finalizes this function's code: resolves every intra-function
@@ -1379,8 +1452,23 @@ impl Asm {
     ///
     /// The machine-level [`Asm::peephole`] runs first, so the returned bytes are
     /// the minimized stream; the `rel32` resolution below sees the final offsets.
-    pub fn finish(mut self) -> (Vec<u8>, Vec<Fixup>) {
+    /// The discarded line marks (if any) are available via [`Asm::finish_lines`];
+    /// this convenience entry point keeps the many `Asm::finish()` callers (the
+    /// `_start` shim, the runtime prelude, the encoder tests) unchanged.
+    pub fn finish(self) -> FinishedFn {
+        let (code, fixups, _lines) = self.finish_lines();
+        (code, fixups)
+    }
+
+    /// Like [`Asm::finish`], but also returns the **surviving** [`LineMark`]s
+    /// (post-peephole, rebased to final code offsets), for the DWARF `.debug_line`
+    /// table. The MIR lowering uses this; everything else uses [`Asm::finish`].
+    pub fn finish_lines(mut self) -> FinishedFnLines {
         self.peephole();
+        // The peephole rebuilds `line_marks` when it runs; when it is disabled or
+        // there are no marks it returns early, leaving `self.line_marks` as the
+        // raw recorded marks (offsets are still valid — nothing moved).
+        let line_marks = std::mem::take(&mut self.line_marks);
         let mut remaining = Vec::new();
         for fx in std::mem::take(&mut self.fixups) {
             match fx.kind {
@@ -1397,7 +1485,19 @@ impl Asm {
                 | FixupKind::State(_) => remaining.push(fx),
             }
         }
-        (self.buf, remaining)
+        (self.buf, remaining, line_marks)
+    }
+}
+
+/// Returns the index of the last [`Mark`] whose `at <= off` — the instruction the
+/// byte offset `off` falls inside. `marks` must be non-empty and ascending (it is,
+/// by construction). Shared by the fixup and line-mark bucketing in
+/// [`Asm::explode_to_instrs`].
+fn mark_index(marks: &[Mark], off: usize) -> usize {
+    match marks.binary_search_by(|m| m.at.cmp(&off)) {
+        Ok(i) => i,
+        Err(0) => 0,
+        Err(i) => i - 1,
     }
 }
 
@@ -1508,13 +1608,18 @@ fn peep_mov_zero_to_xor(instrs: &mut [Instr]) -> bool {
             _ => continue,
         };
         if flags_clobbered_before_use_in_block(instrs, i + 1) {
-            // Re-emit as `xor dst, dst` (`REX.W 31 /r`, register-direct).
+            // Re-emit as `xor dst, dst` (`REX.W 31 /r`, register-direct). Preserve
+            // the instruction's line marks: the source position is unchanged, only
+            // the encoding shrank (a relative offset of 0 stays valid for the new,
+            // shorter bytes — both encodings start at the same logical address).
             let mut a = Asm::new();
             a.xor_rr(dst, dst);
+            let line_marks = std::mem::take(&mut instrs[i].line_marks);
             instrs[i] = Instr {
                 tag: ITag::XorSelf { dst },
                 bytes: a.buf,
                 fixups: Vec::new(),
+                line_marks,
             };
             changed = true;
         }
@@ -1663,10 +1768,12 @@ fn peep_jump_to_jump(instrs: &mut [Instr]) -> bool {
 /// its single `Local` fixup (the `rel32` hole at byte offset 1).
 fn rewrite_jmp_target(inst: &mut Instr, target: LabelId) {
     // `jmp rel32` is `E9 <rel32>`; the fixup hole is the 4 bytes after the opcode.
+    let line_marks = std::mem::take(&mut inst.line_marks);
     *inst = Instr {
         tag: ITag::Jmp { label: target },
         bytes: vec![0xE9, 0, 0, 0, 0],
         fixups: vec![(1, FixupKind::Local(target))],
+        line_marks,
     };
 }
 
@@ -1674,10 +1781,12 @@ fn rewrite_jmp_target(inst: &mut Instr, target: LabelId) {
 /// condition code (recovered from the opcode) and its `Local` fixup (offset 2).
 fn rewrite_jcc_target(inst: &mut Instr, target: LabelId) {
     let tttn = jcc_tttn(&inst.bytes).expect("a Jcc instruction must be a 6-byte 0F 8x rel32");
+    let line_marks = std::mem::take(&mut inst.line_marks);
     *inst = Instr {
         tag: ITag::Jcc { label: target },
         bytes: vec![0x0F, 0x80 | tttn, 0, 0, 0, 0],
         fixups: vec![(2, FixupKind::Local(target))],
+        line_marks,
     };
 }
 
@@ -1727,6 +1836,73 @@ mod peephole_tests {
         a.ret();
         let (code, _) = a.finish();
         assert_eq!(code, vec![0x48, 0x31, 0xc0, 0xc3]);
+    }
+
+    /// Line marks survive the peephole: when a `mov r,0` is rewritten to `xor`
+    /// (shrinking the stream), the line mark attached to it is preserved and
+    /// rebased to a valid in-bounds offset, and the surviving marks stay
+    /// monotonically ordered. This is what keeps the `.debug_line` table from
+    /// desyncing when instructions move or shrink.
+    #[test]
+    fn line_marks_survive_peephole_rewrite() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.set_line(10);
+        a.mov_ri(Gpr::Rax, 0); // -> xor rax, rax (3 bytes, was 7)
+        a.set_line(11);
+        a.mov_rr(Gpr::Rbx, Gpr::Rcx);
+        a.ret();
+        let (code, _fixups, lines) = a.finish_lines();
+        // Two line marks survive, in order, each within the final code bounds.
+        assert_eq!(lines.len(), 2, "both line marks survive");
+        assert_eq!(lines[0].line, 10);
+        assert_eq!(lines[1].line, 11);
+        assert!(lines[0].at < lines[1].at, "marks stay ordered");
+        assert!(lines[1].at < code.len(), "marks stay in bounds");
+        // The first instruction was rewritten to the 3-byte xor.
+        assert_eq!(&code[0..3], &[0x48, 0x31, 0xc0]);
+        assert_eq!(lines[0].at, 0, "first mark still at the function start");
+    }
+
+    /// A line mark attached to a *deleted* instruction is dropped, but the
+    /// surviving marks remain valid and in-bounds (the table never desyncs).
+    #[test]
+    fn line_marks_with_deleted_self_move() {
+        let mut a = Asm::new();
+        a.reserve_labels(0);
+        a.set_line(5);
+        a.mov_rr(Gpr::Rax, Gpr::Rax); // self-move: deleted by the peephole
+        a.set_line(6);
+        a.mov_rr(Gpr::Rbx, Gpr::Rcx);
+        a.ret();
+        let (code, _fixups, lines) = a.finish_lines();
+        // Every surviving mark points inside the final code.
+        for lm in &lines {
+            assert!(lm.at <= code.len(), "surviving mark in bounds");
+        }
+        // The line-6 mark survives (its instruction was kept).
+        assert!(lines.iter().any(|lm| lm.line == 6), "line 6 mark survives");
+    }
+
+    /// `set_line` emits no bytes: the code with line marks recorded is identical
+    /// to the code without them. This is the "DWARF never changes the executed
+    /// code" guarantee at the assembler level.
+    #[test]
+    fn set_line_emits_no_bytes() {
+        let mut with = Asm::new();
+        with.reserve_labels(0);
+        with.set_line(1);
+        with.mov_ri(Gpr::Rax, 7);
+        with.set_line(2);
+        with.ret();
+        let (code_with, _, _) = with.finish_lines();
+
+        let mut without = Asm::new();
+        without.reserve_labels(0);
+        without.mov_ri(Gpr::Rax, 7);
+        without.ret();
+        let (code_without, _) = without.finish();
+        assert_eq!(code_with, code_without, "line marks change no bytes");
     }
 
     /// A `mov r, 0` is NOT rewritten when a flag consumer (`jcc`) could observe the
