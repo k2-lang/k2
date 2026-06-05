@@ -250,6 +250,22 @@ pub struct ModuleNode {
     pub artifact_id: u32,
 }
 
+/// One dependency node (the result of `b.dependency(name, opts)`) — v0.25. The
+/// driver resolved this name to a root source before `build(b)` ran; recording it
+/// here only mints a handle. `dep.module()` later materializes a synthetic library
+/// artifact rooted at the resolved path (lazily, on first use), and `module_node`
+/// caches the `Module` value over it.
+#[derive(Clone, Debug)]
+pub struct DependencyNode {
+    /// This dependency's stable id.
+    pub id: u32,
+    /// The declared dependency name (the import name).
+    pub name: String,
+    /// The synthetic library artifact's id, once `dep.module()` has minted it
+    /// (lazily). `None` until first use.
+    pub artifact_id: Option<u32>,
+}
+
 /// One named step in the build graph.
 #[derive(Clone, Debug)]
 pub struct StepNode {
@@ -285,6 +301,8 @@ pub struct BuildGraph {
     pub artifacts: Vec<Artifact>,
     /// Every `lib.module()` value, in creation order.
     pub module_nodes: Vec<ModuleNode>,
+    /// Every `b.dependency(...)` node, in creation order (v0.25).
+    pub dependencies: Vec<DependencyNode>,
     /// Every step (named + artifact-embedded), in creation order.
     pub steps: Vec<StepNode>,
     /// The artifact ids passed to `b.installArtifact(...)`, in install order.
@@ -302,6 +320,7 @@ impl BuildGraph {
             options: Vec::new(),
             artifacts: Vec::new(),
             module_nodes: Vec::new(),
+            dependencies: Vec::new(),
             steps: Vec::new(),
             install: Vec::new(),
             target,

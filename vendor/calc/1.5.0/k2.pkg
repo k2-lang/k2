@@ -1,0 +1,1 @@
+pub const package = .{ .name="calc", .version="1.5.0", .root_source="src/root.k2" };

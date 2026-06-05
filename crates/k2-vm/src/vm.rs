@@ -16,8 +16,8 @@ use k2_syntax::Span;
 use k2_types::TypeId;
 
 use crate::build_graph::{
-    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, ModuleNode, OptMode, StepNode,
-    TargetTriple,
+    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, DependencyNode, ModuleNode,
+    OptMode, StepNode, TargetTriple,
 };
 use crate::compile::{compile_program, default_value, int_repr_of};
 use crate::fmt::format_into;
@@ -40,6 +40,29 @@ pub struct BuildInputs {
     /// The `-Dkey=value` option map (deterministic order via the driver's
     /// `BTreeMap`).
     pub dopts: Vec<(String, String)>,
+    /// v0.25: the dependencies the DRIVER resolved (offline) BEFORE `build(b)`
+    /// ran. Each maps a declared dependency name to its resolved root source path
+    /// plus the names+roots of its own direct dependencies (so a dep's
+    /// `@import("child")` wires through the same named-module machinery). Empty for
+    /// a project with no dependencies — the no-dependency path is unchanged.
+    pub resolved_deps: Vec<ResolvedDepSeed>,
+}
+
+/// A driver-resolved dependency seeded into the VM before `build(b)` runs (v0.25).
+/// When `dep.module()` fires, the VM mints a synthetic `Library` artifact rooted
+/// at `root_abs` and wires `children` as its named modules — so the dependency's
+/// code (and its transitive deps) compile + import through the existing multi-file
+/// merge + `addModule` path, with NO new compile path.
+#[derive(Clone, Debug)]
+pub struct ResolvedDepSeed {
+    /// The declared dependency name (the import name the consumer wires).
+    pub name: String,
+    /// The absolute path to the dependency's resolved root module.
+    pub root_abs: String,
+    /// This dependency's OWN direct dependencies: `(child_import_name,
+    /// child_root_abs)`, in sorted order, wired as named modules on the synthetic
+    /// library so the dep's `@import(child)` resolves.
+    pub children: Vec<(String, String)>,
 }
 
 /// The driver-seeded OS-effect inputs for a v0.23 run: the forwarded program argv,
@@ -116,6 +139,11 @@ const WALL_CHECK_INTERVAL: u64 = 1 << 20;
 /// Rust stack overflow — though the VM does not recurse in Rust, this bounds
 /// pathological heap-frame growth).
 const MAX_DEPTH: usize = 200_000;
+
+/// The sentinel an `@buildDependency` handle carries in its second field so the
+/// shared `module()` intrinsic can tell a `Dependency` handle (`{ id, DEP_TAG }`)
+/// from an `Artifact` handle (a bare id). A large, unlikely-to-collide constant.
+const DEP_HANDLE_TAG: i128 = 0x004b_325f_4445_5031; // "K2_DEP1" ascii-ish
 
 /// A reason the VM stopped: a clean program panic, an error that escaped `main`,
 /// or an explicit exit.
@@ -2629,6 +2657,8 @@ impl<'p> Vm<'p> {
                 Ok(Value::Unit)
             }
             IntrinsicId::BuildArtifactModuleSelf => Ok(self.build_artifact_module_self(args)),
+            IntrinsicId::BuildDependency => self.build_dependency(args),
+            IntrinsicId::BuildDependencyModule => self.build_dependency_module(args),
             IntrinsicId::BuildArtifactStep => Ok(self.build_artifact_step(args)),
             IntrinsicId::BuildArtifactForwardArgs => {
                 self.build_artifact_forward_args(args);
@@ -2896,7 +2926,28 @@ impl<'p> Vm<'p> {
 
     /// `@buildArtifactModuleSelf(id)`: mint a `Module` value (a `{ id }` struct)
     /// that exposes artifact `id`'s root source, so `lib.module()` is reusable.
+    ///
+    /// `dep.module()` (v0.25) lowers to this SAME intrinsic (both spell `module`),
+    /// so we first demux on the receiver shape: a `Dependency` handle is a 2-field
+    /// struct `{ id, DEP_HANDLE_TAG }`; such a receiver routes to
+    /// `build_dependency_module` (mint a synthetic library) instead. A bare-int /
+    /// 1-field receiver is an ordinary artifact id.
     fn build_artifact_module_self(&mut self, args: &[Value]) -> Value {
+        if let Some(Value::Struct(fields)) = args.first() {
+            if fields.len() == 2
+                && fields.get(1).and_then(|f| f.as_usize()) == Some(DEP_HANDLE_TAG as usize)
+            {
+                let dep_id = fields.first().and_then(|f| f.as_usize()).unwrap_or(0) as u32;
+                // Route to the dependency-module handler; on a resolution failure
+                // (an undeclared dep) it returns a panic Halt, which we surface as a
+                // best-effort empty module here (the driver's compile then fails
+                // with a clear missing-import diagnostic). In practice the driver
+                // pre-resolved the dep, so this always succeeds.
+                return self
+                    .build_dependency_module(&[Value::int(dep_id as i128, IntRepr::USIZE)])
+                    .unwrap_or(Value::Struct(Rc::new(vec![Value::int(0, IntRepr::USIZE)])));
+            }
+        }
         let artifact_id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
         let ctx = self.build.as_mut().unwrap();
         // Reuse an existing module node for this artifact if one was minted.
@@ -2916,6 +2967,203 @@ impl<'p> Vm<'p> {
             mod_id
         };
         Value::Struct(Rc::new(vec![Value::int(mod_id as i128, IntRepr::USIZE)]))
+    }
+
+    /// `b.dependency(name, opts)` (v0.25): record a dependency node and return its
+    /// `Dependency` handle `{ id }`. The DRIVER already resolved every declared
+    /// dependency to a root source path (seeded into `BuildInputs.resolved_deps`);
+    /// this performs NO I/O. The `name` is read from the first string operand; the
+    /// `opts` struct is present for diagnostics only — the authoritative binding is
+    /// the driver's seed, looked up by `name` lazily in `dep.module()`.
+    fn build_dependency(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        // `name` is the first string-ish operand (the `b` receiver id precedes it
+        // as an int, and the opts struct follows).
+        let name = args
+            .iter()
+            .find(|a| matches!(a, Value::Str(_) | Value::Slice { .. }))
+            .map(|a| self.read_bytes(Some(a)))
+            .unwrap_or_default();
+        // The driver must have resolved this dependency (it scans the project
+        // `k2.pkg`). A `b.dependency("foo")` whose name the driver did not resolve
+        // means `foo` is not declared in `k2.pkg` (or the project has no manifest):
+        // fail `build(b)` immediately with a clear diagnostic rather than minting a
+        // dangling handle that would later wire a wrong/empty module.
+        let resolved = self
+            .build
+            .as_ref()
+            .unwrap()
+            .inputs
+            .resolved_deps
+            .iter()
+            .any(|d| d.name == name);
+        if !resolved {
+            return Err(Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some(format!(
+                    "build.k2 calls b.dependency(\"{name}\") but k2.pkg declares no dependency \"{name}\""
+                )),
+            }));
+        }
+        let ctx = self.build.as_mut().unwrap();
+        // Reuse an existing dependency node for this name (idempotent declaration).
+        let dep_id = if let Some(d) = ctx.graph.dependencies.iter().find(|d| d.name == name) {
+            d.id
+        } else {
+            let dep_id = ctx.graph.dependencies.len() as u32;
+            ctx.graph.dependencies.push(DependencyNode {
+                id: dep_id,
+                name,
+                artifact_id: None,
+            });
+            dep_id
+        };
+        // The `Dependency` handle is a TWO-field struct `{ id, sentinel=DEP_TAG }`.
+        // `dep.module()` and `lib.module()` both spell `module` and both lower to
+        // the value-rooted `BuildArtifactModuleSelf` intrinsic (dispatch is by
+        // method name, not receiver type). The sentinel lets that handler demux:
+        // a 2-field handle carrying `DEP_TAG` is a dependency (resolve via the
+        // synthetic library), a bare int / 1-field handle is an artifact id.
+        Ok(Value::Struct(Rc::new(vec![
+            Value::int(dep_id as i128, IntRepr::USIZE),
+            Value::int(DEP_HANDLE_TAG, IntRepr::USIZE),
+        ])))
+    }
+
+    /// `dep.module()` (v0.25): return a `Module` value exposing the dependency's
+    /// resolved root artifact. On first use, mints a SYNTHETIC `Library` artifact
+    /// for the dep (rooted at the driver-resolved absolute path) and wires the
+    /// dep's OWN direct dependencies as named modules on it, so the dep's code (and
+    /// its transitive deps) compile + import through the ordinary multi-file merge +
+    /// `addModule` machinery. A `dep.module()` for a name the driver did not resolve
+    /// is a clean panic (a `b.dependency` not declared in `k2.pkg`).
+    fn build_dependency_module(&mut self, args: &[Value]) -> Result<Value, Halt> {
+        let dep_id = args.first().and_then(|v| v.as_usize()).unwrap_or(0) as u32;
+        // The dependency name + any already-minted artifact id.
+        let (name, existing_artifact) = {
+            let ctx = self.build.as_ref().unwrap();
+            match ctx.graph.dependencies.iter().find(|d| d.id == dep_id) {
+                Some(d) => (d.name.clone(), d.artifact_id),
+                None => {
+                    return Err(Halt::Panic(PanicInfo {
+                        reason: TrapReason::Panic,
+                        detail: Some(format!("dep.module(): unknown dependency id {dep_id}")),
+                    }));
+                }
+            }
+        };
+        // Mint (or reuse) the synthetic library artifact for this dependency.
+        let artifact_id = match existing_artifact {
+            Some(aid) => aid,
+            None => self.mint_dependency_library(&name)?,
+        };
+        // Mint/reuse a Module node over the synthetic library (like module_self).
+        let ctx = self.build.as_mut().unwrap();
+        let mod_id = if let Some(m) = ctx
+            .graph
+            .module_nodes
+            .iter()
+            .find(|m| m.artifact_id == artifact_id)
+        {
+            m.id
+        } else {
+            let mod_id = ctx.graph.module_nodes.len() as u32;
+            ctx.graph.module_nodes.push(ModuleNode {
+                id: mod_id,
+                artifact_id,
+            });
+            mod_id
+        };
+        Ok(Value::Struct(Rc::new(vec![Value::int(
+            mod_id as i128,
+            IntRepr::USIZE,
+        )])))
+    }
+
+    /// Creates the synthetic `Library` artifact for dependency `name` from the
+    /// driver-seeded resolution, recursively minting libraries for its transitive
+    /// children and wiring them as named modules. Returns the artifact id, or a
+    /// clean panic if the name was never resolved by the driver (a `b.dependency`
+    /// without a matching `k2.pkg` declaration).
+    fn mint_dependency_library(&mut self, name: &str) -> Result<u32, Halt> {
+        // If a synthetic library for this dep already exists (reached via another
+        // dep's children), reuse it. Synthetic libs are named `__dep_<name>`.
+        let synth_name = format!("__dep_{name}");
+        if let Some(ctx) = self.build.as_ref() {
+            if let Some(a) = ctx.graph.artifacts.iter().find(|a| a.name == synth_name) {
+                return Ok(a.id);
+            }
+        }
+        // Look up the driver's seed for this dependency.
+        let seed = self
+            .build
+            .as_ref()
+            .unwrap()
+            .inputs
+            .resolved_deps
+            .iter()
+            .find(|d| d.name == name)
+            .cloned();
+        let Some(seed) = seed else {
+            return Err(Halt::Panic(PanicInfo {
+                reason: TrapReason::Panic,
+                detail: Some(format!(
+                    "b.dependency(\"{name}\") was not resolved by the driver (declare it in k2.pkg)"
+                )),
+            }));
+        };
+        // Recursively mint libraries for the children and wire them as modules.
+        let mut child_modules: Vec<(String, u32)> = Vec::new();
+        for (child_name, _child_root) in &seed.children {
+            let child_artifact = self.mint_dependency_library(child_name)?;
+            // Mint/reuse a module node over the child library.
+            let ctx = self.build.as_mut().unwrap();
+            let mod_id = if let Some(m) = ctx
+                .graph
+                .module_nodes
+                .iter()
+                .find(|m| m.artifact_id == child_artifact)
+            {
+                m.id
+            } else {
+                let mod_id = ctx.graph.module_nodes.len() as u32;
+                ctx.graph.module_nodes.push(ModuleNode {
+                    id: mod_id,
+                    artifact_id: child_artifact,
+                });
+                mod_id
+            };
+            child_modules.push((child_name.clone(), mod_id));
+        }
+        // Push the synthetic library. Its `root_source` is the ABSOLUTE resolved
+        // path, so `build_root.join(root_source)` yields it unchanged (the driver's
+        // `artifact_named_modules`/`compile_artifact` then merge it via the existing
+        // multi-file machinery, with the dep's children as named modules).
+        let ctx = self.build.as_mut().unwrap();
+        let id = ctx.graph.artifacts.len() as u32;
+        let step_id = ctx.graph.steps.len() as u32;
+        ctx.graph.steps.push(StepNode {
+            id: step_id,
+            name: None,
+            desc: format!("build {synth_name}"),
+            deps: Vec::new(),
+        });
+        ctx.graph.artifacts.push(Artifact {
+            id,
+            kind: ArtifactKind::Library,
+            name: synth_name,
+            root_source: Some(seed.root_abs.clone()),
+            modules: child_modules,
+            options: Vec::new(),
+            exe_id: None,
+            forward_args: false,
+            step_id,
+        });
+        // Record the artifact id back onto the dependency node (if this dep has one
+        // — children minted recursively may not have a top-level dependency node).
+        if let Some(d) = ctx.graph.dependencies.iter_mut().find(|d| d.name == name) {
+            d.artifact_id = Some(id);
+        }
+        Ok(id)
     }
 
     /// `artifact.step` (field read): return a `Step` handle `{ step_id }` for the
@@ -4077,6 +4325,17 @@ impl<'p> Vm<'p> {
     fn handle_of_receiver(&self, recv: &Value) -> Value {
         match recv {
             Value::Sched { .. } => recv.clone(),
+            // A `Dependency` handle is a 2-field `{ id, DEP_HANDLE_TAG }` struct
+            // (v0.25): preserve it WHOLE so `build_artifact_module_self` can demux
+            // `dep.module()` from `lib.module()` (both spell `module`). Every other
+            // handle struct flattens to its id (first field), unchanged.
+            Value::Struct(fields)
+                if fields.len() == 2
+                    && fields.get(1).and_then(|f| f.as_usize())
+                        == Some(DEP_HANDLE_TAG as usize) =>
+            {
+                recv.clone()
+            }
             Value::Struct(fields) => fields.first().cloned().unwrap_or(Value::Unit),
             Value::Ptr(p) => match self.heap.load(*p) {
                 Ok(inner) => self.handle_of_receiver(&inner),
@@ -5099,6 +5358,8 @@ fn is_build_intrinsic(id: &IntrinsicId) -> bool {
             | IntrinsicId::BuildTargetOs
             | IntrinsicId::BuildTargetAbi
             | IntrinsicId::BuildArtifactStep
+            | IntrinsicId::BuildDependency
+            | IntrinsicId::BuildDependencyModule
     )
 }
 

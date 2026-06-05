@@ -1,0 +1,2 @@
+const calc = @import("calc");
+pub fn main(sys: *System) !void { const o = sys.io.stdout(); try o.print("tag={s}\n", .{calc.tag()}); }

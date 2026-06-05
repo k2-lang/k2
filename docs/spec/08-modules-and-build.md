@@ -353,13 +353,12 @@ pub fn build(b: *Build) void {
     const with_tls = b.option(bool, "with-tls", "Build with TLS support") orelse false;
 
     // --- External dependencies (resolved from the manifest, §7) --------------
-    // `dependency` looks up a package declared in k2.pkg by name and pins it to
-    // the content-addressed version recorded in the lockfile.
-    const json_dep = b.dependency("json", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const json_mod = json_dep.module("json");   // the dep's exported module
+    // `dependency` looks up a package by name and pins it to the version recorded
+    // in the lockfile. The SOURCE is declarable so the offline resolver (§7.5) can
+    // pick it: a registry semver constraint, OR a local `.path`. `dep.module()`
+    // returns the dependency's root module (a package has exactly one root).
+    const json_dep = b.dependency("json", .{ .version = "^2.3.0" });
+    const json_mod = json_dep.module();          // the dep's exported root module
 
     // --- The library artifact ------------------------------------------------
     const lib = b.addLibrary(.{
@@ -576,6 +575,52 @@ explicit toolchain step (`k2 pkg fetch`, run automatically by `k2 build` when a
 locked dependency is absent from the cache). This keeps the comptime sandbox
 honest: comptime code never reaches the network, consistent with **No ambient
 authority** applied to the build engine itself.
+
+### 7.5 The offline realization (v0.25)
+
+The current toolchain ships the **offline, local** realization of §7. There is no
+network and no remote registry, so "fetching" = resolving against LOCAL sources:
+
+- **Path dependencies** — `b.dependency("name", .{ .path = "../dir" })` and a
+  `.dependencies = .{ .name = .{ .path = "..." } }` entry in `k2.pkg`. The path is
+  resolved relative to the manifest's directory; it bypasses version selection
+  (pinned to the directory), but its own `k2.pkg`'s transitive deps still resolve.
+- **A vendored registry** — `b.dependency("name", .{ .version = "^1.0.0" })` is
+  resolved against a local directory laid out as
+  `<registry>/<pkg>/<version>/k2.pkg` + sources. The registry root is configured
+  with precedence `--registry <dir>` > `K2_REGISTRY` env > a project `k2.pkg`'s
+  `.registry = "vendor"` field > the default `<build-root>/vendor`.
+
+**Resolution happens in the driver, BEFORE `build(b)` runs** — reading the
+registry, parsing manifests, and hashing bytes is I/O, which the comptime sandbox
+forbids inside `build(b)` (§6.1). So `b.dependency(...)` only *records* a handle;
+the driver pre-resolved every declared dependency (semver-selected the highest
+matching registry version, resolved the transitive graph, detected version
+conflicts and cycles) and seeded the result, and `dep.module()` mints a synthetic
+library over the resolved root so the dep compiles + imports through the ordinary
+multi-file merge + `addModule` machinery.
+
+**The manifest is read, not executed.** A `k2.pkg`'s flat `pub const package =
+.{ … }` literal is parsed structurally (offline, deterministic) rather than run on
+the comptime VM (which would be circular and I/O-laden during resolution). The
+fields read are `.name`, `.version`, `.root_source`, `.registry`, and
+`.dependencies` (each `.{ .version = "…" }` or `.{ .path = "…" }`).
+
+**The dependency lockfile is `deps.lock`**, alongside the unchanged `build.lock`.
+It records, sorted by name, each resolved `package version source=<…> hash=<…>
+root=<…>` plus the transitive `[graph]` edges, with a `deps_hash` over the body.
+Identical manifest + registry yields a **byte-identical** `deps.lock`; a present
+lock pins the chosen versions (an ordinary build never silently moves a
+dependency), and `k2c build --update` / `k2c update` re-resolves to the newest
+matching versions and rewrites the lock. The semver grammar accepts caret (`^`),
+tilde (`~`), exact, partial-bare, wildcard (`1.x`, `*`), and comparator chains
+(`>=1.0.0, <2.0.0`); a missing package, an unsatisfiable constraint, a version
+conflict, and a dependency cycle are each reported with a clear diagnostic and a
+nonzero exit — never a silent wrong build. The content `hash` here is the same
+offline FNV-1a family as `build.lock` (change-detection + reproducibility, not a
+cryptographic integrity claim); the networked, content-addressed `(url, hash)`
+fetch of §7.2 is the format-compatible superset a future online manager swaps in
+by replacing only this resolve phase.
 
 ---
 

@@ -16,11 +16,13 @@
 //! cryptographic integrity claim (that is the post-0.12 networked package
 //! manager's job).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use k2_vm::BuildGraph;
 
 use crate::multi::InputFiles;
+use crate::pkg::ResolvedDeps;
 
 /// FNV-1a over bytes, rendered as 16-hex. The same hash the multi-file merge uses
 /// for module names; here it fingerprints file contents and the canonical lock
@@ -140,4 +142,136 @@ pub fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
     }
     std::fs::write(path, contents)?;
     Ok(false)
+}
+
+// ===========================================================================
+// `deps.lock` — the dependency-resolution lockfile (v0.25)
+// ===========================================================================
+
+/// One parsed `[deps]` line of a `deps.lock`: a resolved package's pinned
+/// version, source, content hash, and root path. Read back when a `k2c build`
+/// (without `--update`) honors the existing lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockedDep {
+    /// The package name.
+    pub name: String,
+    /// The pinned version (`1.2.0`).
+    pub version: String,
+    /// The source descriptor (`registry`, `registry:<n>`, `path:<p>`).
+    pub source: String,
+    /// The package content hash recorded at lock time.
+    pub hash: String,
+    /// The package root module path, relative to the package dir.
+    pub root: String,
+}
+
+/// A parsed `deps.lock`: the locked packages by name, in the order read. Used by
+/// the driver to honor a present lock (use the locked version, recompute its hash
+/// to detect drift).
+#[derive(Clone, Debug, Default)]
+pub struct ParsedDepsLock {
+    /// The locked packages, keyed by name.
+    pub deps: BTreeMap<String, LockedDep>,
+}
+
+impl ParsedDepsLock {
+    /// Looks up a locked package by name.
+    pub fn get(&self, name: &str) -> Option<&LockedDep> {
+        self.deps.get(name)
+    }
+}
+
+/// Serializes the resolved dependency graph into the canonical `deps.lock` text.
+/// Every collection is emitted in sorted order, so identical manifest+registry
+/// inputs yield a BYTE-IDENTICAL lock. The `deps_hash` line is the FNV-1a of the
+/// canonical body below it.
+///
+/// Format:
+/// ```text
+/// # k2 deps lock v1
+/// deps_hash = <hash>
+/// registry = vendor
+/// [deps]
+/// bar 0.3.1 source=path:../local-bar hash=<h> root=root.k2
+/// calc 1.2.0 source=registry hash=<h> root=src/root.k2
+/// [graph]
+/// foo -> baz
+/// ```
+pub fn serialize_deps(resolved: &ResolvedDeps) -> String {
+    let mut body = String::new();
+    body.push_str(&format!("registry = {}\n", resolved.registry_display));
+
+    // [deps] — one line per resolved package, sorted by name.
+    let mut deps: Vec<&crate::pkg::ResolvedDep> = resolved.deps.iter().collect();
+    deps.sort_by(|a, b| a.name.cmp(&b.name));
+    body.push_str("[deps]\n");
+    for d in deps {
+        body.push_str(&format!(
+            "{} {} source={} hash={} root={}\n",
+            d.name, d.version, d.source_desc, d.hash, d.root_rel,
+        ));
+    }
+
+    // [graph] — the transitive edges, sorted.
+    let mut edges: Vec<&(String, String)> = resolved.edges.iter().collect();
+    edges.sort();
+    body.push_str("[graph]\n");
+    for (parent, child) in edges {
+        body.push_str(&format!("{parent} -> {child}\n"));
+    }
+
+    let deps_hash = fnv1a_hex(body.as_bytes());
+    format!("# k2 deps lock v1\ndeps_hash = {deps_hash}\n{body}")
+}
+
+/// Parses a `deps.lock` text back into a [`ParsedDepsLock`]. Tolerant of a
+/// missing/old file (the caller falls back to a full resolve); a line it cannot
+/// parse is skipped rather than fatal, so a hand-edited lock never panics the
+/// process.
+pub fn parse_deps(text: &str) -> ParsedDepsLock {
+    let mut out = ParsedDepsLock::default();
+    let mut in_deps = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[deps]" {
+            in_deps = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_deps = false;
+            continue;
+        }
+        if !in_deps || line.is_empty() {
+            continue;
+        }
+        // `name version source=... hash=... root=...`
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let Some(version) = parts.next() else {
+            continue;
+        };
+        let mut source = String::new();
+        let mut hash = String::new();
+        let mut root = String::new();
+        for kv in parts {
+            if let Some(v) = kv.strip_prefix("source=") {
+                source = v.to_string();
+            } else if let Some(v) = kv.strip_prefix("hash=") {
+                hash = v.to_string();
+            } else if let Some(v) = kv.strip_prefix("root=") {
+                root = v.to_string();
+            }
+        }
+        out.deps.insert(
+            name.to_string(),
+            LockedDep {
+                name: name.to_string(),
+                version: version.to_string(),
+                source,
+                hash,
+                root,
+            },
+        );
+    }
+    out
 }

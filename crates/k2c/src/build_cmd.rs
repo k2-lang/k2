@@ -27,11 +27,12 @@ use k2_mir::BuildMode;
 use k2_opt::{optimize, OptLevel};
 use k2_vm::{
     run_build_graph, run_program_code, run_tests, Artifact, ArtifactKind, BuildGraph, BuildInputs,
-    OptMode, OsInputs, RunArgs, TargetTriple,
+    OptMode, OsInputs, ResolvedDepSeed, RunArgs, TargetTriple,
 };
 
 use crate::lock;
 use crate::multi::{self, CompileInputs, InputFiles};
+use crate::pkg::{self, ResolveConfig, ResolvedDeps};
 
 /// Parsed `k2c build` command-line arguments.
 struct BuildArgs {
@@ -47,6 +48,12 @@ struct BuildArgs {
     dopts: Vec<(String, String)>,
     /// Program arguments forwarded after `--`.
     forwarded: Vec<String>,
+    /// v0.25: an explicit `--registry <dir>` override for the local vendored
+    /// registry root (highest-precedence registry config).
+    registry: Option<PathBuf>,
+    /// v0.25: `--update` re-resolves dependencies from scratch, ignoring any
+    /// present `deps.lock`, and rewrites the lock.
+    update: bool,
 }
 
 /// Entry point for `k2c build`.
@@ -64,6 +71,22 @@ pub fn cmd_build(args: &[String]) -> Result<ExitCode, String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+
+    // --- 0. Pre-resolve dependencies (v0.25, the offline package manager). ----
+    // Resolution is I/O (read the registry, parse manifests, hash bytes), which
+    // the comptime sandbox forbids inside build(b) — so the driver does it FIRST,
+    // honoring an existing `deps.lock` unless `--update`. The result seeds
+    // BuildInputs.resolved_deps; the VM later mints synthetic dep libraries from
+    // it. A missing/unsatisfiable/conflict/cycle is reported here (before any
+    // compile) with a nonzero exit — never a silent wrong build.
+    let resolved_deps = match resolve_dependencies(&build_root, &parsed) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "build: {}", e.message);
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let dep_seeds = dependency_seeds(&resolved_deps);
 
     // --- 1. Compile build.k2 (with the bundled `build` module injected) and run
     //        build(b) on the VM to RECORD the graph. ---------------------------
@@ -92,6 +115,7 @@ pub fn cmd_build(args: &[String]) -> Result<ExitCode, String> {
         target: parsed.target.clone(),
         optimize: parsed.optimize,
         dopts: parsed.dopts.clone(),
+        resolved_deps: dep_seeds,
     };
     let graph = match run_build_graph(&prog, inputs) {
         Ok(g) => g,
@@ -111,6 +135,17 @@ pub fn cmd_build(args: &[String]) -> Result<ExitCode, String> {
     let lock_text = lock::serialize(&graph, &all_inputs, &parsed.dopts);
     let lock_path = build_root.join("build.lock");
     let _ = lock::write_if_changed(&lock_path, &lock_text);
+
+    // The v0.25 dependency lock: pins each resolved package@version + source +
+    // content hash, in deterministic order. Identical manifest+registry yields a
+    // byte-identical `deps.lock`. Only written when the project declares deps (a
+    // no-dependency project never gets a `deps.lock`, keeping the existing
+    // examples untouched).
+    if !resolved_deps.deps.is_empty() {
+        let deps_lock_text = lock::serialize_deps(&resolved_deps);
+        let deps_lock_path = build_root.join("deps.lock");
+        let _ = lock::write_if_changed(&deps_lock_path, &deps_lock_text);
+    }
 
     // --- 3. Execute the requested step. --------------------------------------
     match parsed.step.as_str() {
@@ -134,6 +169,47 @@ pub fn cmd_build(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// Entry point for `k2c update` (v0.25): re-resolve every declared dependency from
+/// scratch (ignoring any present `deps.lock`), write a fresh `deps.lock`, and exit
+/// WITHOUT compiling. A thin alias for the resolve+lock phase of `k2c build
+/// --update`. Accepts `--build-file PATH` and `--registry DIR`.
+pub fn cmd_update(args: &[String]) -> Result<ExitCode, String> {
+    let mut parsed = parse_args(args)?;
+    parsed.update = true; // `update` always re-resolves from scratch
+    let build_file = &parsed.build_file;
+    let build_root = build_file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let resolved = match resolve_dependencies(&build_root, &parsed) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "update: {}", e.message);
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
+    if resolved.deps.is_empty() {
+        let _ = writeln!(
+            io::stdout(),
+            "# no dependencies declared (no k2.pkg, or an empty .dependencies)"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let deps_lock_text = lock::serialize_deps(&resolved);
+    let deps_lock_path = build_root.join("deps.lock");
+    let _ = lock::write_if_changed(&deps_lock_path, &deps_lock_text);
+
+    let mut out = io::stdout();
+    let _ = writeln!(out, "# resolved {} package(s)", resolved.deps.len());
+    for d in &resolved.deps {
+        let _ = writeln!(out, "  {} {} ({})", d.name, d.version, d.source_desc);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Parses the `build` command line.
 fn parse_args(args: &[String]) -> Result<BuildArgs, String> {
     let mut step: Option<String> = None;
@@ -142,6 +218,8 @@ fn parse_args(args: &[String]) -> Result<BuildArgs, String> {
     let mut target = TargetTriple::host();
     let mut dopts: Vec<(String, String)> = Vec::new();
     let mut forwarded: Vec<String> = Vec::new();
+    let mut registry: Option<PathBuf> = None;
+    let mut update = false;
     let mut after_dashdash = false;
 
     let mut it = args.iter();
@@ -159,6 +237,17 @@ fn parse_args(args: &[String]) -> Result<BuildArgs, String> {
                 .next()
                 .ok_or_else(|| "`--build-file` needs a path".to_string())?;
             build_file = PathBuf::from(p);
+            continue;
+        }
+        if arg == "--registry" {
+            let p = it
+                .next()
+                .ok_or_else(|| "`--registry` needs a directory path".to_string())?;
+            registry = Some(PathBuf::from(p));
+            continue;
+        }
+        if arg == "--update" {
+            update = true;
             continue;
         }
         if let Some(rest) = arg.strip_prefix("-D") {
@@ -200,6 +289,8 @@ fn parse_args(args: &[String]) -> Result<BuildArgs, String> {
         target,
         dopts,
         forwarded,
+        registry,
+        update,
     })
 }
 
@@ -551,22 +642,72 @@ fn collect_run_artifacts<'g>(
 
 /// Resolves an artifact's wired named modules (`addModule`) to their on-disk root
 /// files: `(import_name, absolute_path)` in insertion order.
+///
+/// This is TRANSITIVE: a wired module's OWN named modules are included too, so a
+/// dependency's `@import("child")` resolves when the consumer only wired the
+/// parent. The merge's `named` map is global (it rewrites `@import` in EVERY
+/// merged file), so threading the whole transitive closure here lets a registry
+/// package's `@import("baz")` rewrite to `baz`'s namespace even though the
+/// top-level artifact never named `baz`. Cycle-safe (a `seen` set guards a
+/// dependency that re-imports an ancestor); a name first wired by the consumer
+/// wins over a deeper re-binding (the consumer's wiring is authoritative).
 fn artifact_named_modules(
     graph: &BuildGraph,
     artifact: &Artifact,
     build_root: &Path,
 ) -> Vec<(String, PathBuf)> {
-    let mut named_modules = Vec::new();
+    let mut named_modules: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut seen_artifacts: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    collect_named_modules(
+        graph,
+        artifact,
+        build_root,
+        &mut named_modules,
+        &mut seen_names,
+        &mut seen_artifacts,
+    );
+    named_modules
+}
+
+/// The recursive helper for [`artifact_named_modules`]: appends `artifact`'s wired
+/// modules, then recurses into each wired module's defining library so transitive
+/// named imports (a dependency's deps) are surfaced into the same global merge map.
+fn collect_named_modules(
+    graph: &BuildGraph,
+    artifact: &Artifact,
+    build_root: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    seen_names: &mut std::collections::BTreeSet<String>,
+    seen_artifacts: &mut std::collections::BTreeSet<u32>,
+) {
+    if !seen_artifacts.insert(artifact.id) {
+        return;
+    }
     for (name, mod_id) in &artifact.modules {
-        if let Some(mod_artifact_id) = graph.module_artifact(*mod_id) {
-            if let Some(mod_artifact) = graph.artifact(mod_artifact_id) {
-                if let Some(mod_root) = &mod_artifact.root_source {
-                    named_modules.push((name.clone(), build_root.join(mod_root)));
-                }
+        let Some(mod_artifact_id) = graph.module_artifact(*mod_id) else {
+            continue;
+        };
+        let Some(mod_artifact) = graph.artifact(mod_artifact_id) else {
+            continue;
+        };
+        if let Some(mod_root) = &mod_artifact.root_source {
+            // The consumer's own wiring is authoritative: a name already bound is
+            // not overridden by a deeper (transitive) binding of the same name.
+            if seen_names.insert(name.clone()) {
+                out.push((name.clone(), build_root.join(mod_root)));
             }
         }
+        // Recurse into the wired library to surface ITS named modules too.
+        collect_named_modules(
+            graph,
+            mod_artifact,
+            build_root,
+            out,
+            seen_names,
+            seen_artifacts,
+        );
     }
-    named_modules
 }
 
 /// Unions the resolved `.k2` input set of `build.k2` with that of EVERY buildable
@@ -661,6 +802,138 @@ fn compile_artifact(
         ));
     }
     Ok(prog)
+}
+
+/// Pass A of the v0.25 package manager: read the project `k2.pkg` (if any),
+/// resolve every declared dependency offline (path + registry/semver), honoring an
+/// existing `deps.lock` unless `--update`. Returns the resolved table (empty if the
+/// project declares no dependencies). All resolution errors (missing/unsatisfiable/
+/// conflict/cycle/malformed) surface here as a clear [`pkg::ResolveError`].
+fn resolve_dependencies(
+    build_root: &Path,
+    parsed: &BuildArgs,
+) -> Result<ResolvedDeps, pkg::ResolveError> {
+    let manifest_path = build_root.join("k2.pkg");
+    // No project manifest ⇒ no dependencies (the existing no-dep path).
+    if !manifest_path.exists() {
+        return Ok(ResolvedDeps::default());
+    }
+    let manifest = pkg::read_manifest(&manifest_path)?;
+    if manifest.dependencies.is_empty() {
+        return Ok(ResolvedDeps::default());
+    }
+
+    let (registry_root, registry_display) = registry_config(build_root, &manifest, parsed);
+
+    // Load a present `deps.lock` (unless --update) so the resolver PINS to the
+    // locked versions where they still satisfy the manifest — an ordinary build
+    // never silently moves a dependency (spec §7.3). `--update` ignores the lock
+    // and re-resolves to the newest matching versions.
+    let lock_path = build_root.join("deps.lock");
+    let parsed_lock = if parsed.update {
+        lock::ParsedDepsLock::default()
+    } else {
+        std::fs::read_to_string(&lock_path)
+            .map(|t| lock::parse_deps(&t))
+            .unwrap_or_default()
+    };
+    let locked: std::collections::BTreeMap<String, String> = parsed_lock
+        .deps
+        .iter()
+        .map(|(name, d)| (name.clone(), d.version.clone()))
+        .collect();
+
+    let config = ResolveConfig {
+        registry_root,
+        registry_display,
+        locked,
+    };
+
+    let resolved = pkg::resolve_project(&manifest, build_root, &config)?;
+    // With the lock honored, the pinned version is already chosen; a content-hash
+    // mismatch on a locked package (its bytes changed underneath the lock) is a
+    // clear "lock out of date" error rather than a silent rebuild.
+    check_lock_drift(&parsed_lock, &resolved)?;
+    Ok(resolved)
+}
+
+/// Verifies that each freshly-resolved dependency whose version matches the
+/// present `deps.lock` still has the locked content hash. A content-hash mismatch
+/// (the package bytes changed while pinned) is a clear "lock out of date"
+/// diagnostic (run `k2c update`) rather than a silent rebuild against changed
+/// bytes. A version DIFFERENCE is not flagged here — the resolver already pins to
+/// the locked version when it remains valid, so a difference means the lock was
+/// intentionally re-resolved (`--update`) or the locked version is gone.
+fn check_lock_drift(
+    locked: &lock::ParsedDepsLock,
+    resolved: &ResolvedDeps,
+) -> Result<(), pkg::ResolveError> {
+    for dep in &resolved.deps {
+        if let Some(l) = locked.get(&dep.name) {
+            let cur_version = dep.version.to_string();
+            // Only compare hashes when the version is the locked one (a re-resolve
+            // to a different version legitimately has a different hash).
+            if l.version == cur_version && !l.hash.is_empty() && l.hash != dep.hash {
+                return Err(pkg::ResolveError {
+                    message: format!(
+                        "deps.lock out of date: {}@{} content changed (hash mismatch); run `k2c update`",
+                        dep.name, cur_version
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the registry root + its display string with the precedence
+/// `--registry` > `K2_REGISTRY` env > project `k2.pkg` `.registry` > default
+/// `<build_root>/vendor`. The display is a short, lock-friendly string (the
+/// configured spelling, not the absolute path) for a reproducible header.
+fn registry_config(
+    build_root: &Path,
+    manifest: &pkg::Manifest,
+    parsed: &BuildArgs,
+) -> (PathBuf, String) {
+    if let Some(reg) = &parsed.registry {
+        return (reg.clone(), reg.display().to_string());
+    }
+    if let Ok(env) = std::env::var("K2_REGISTRY") {
+        if !env.is_empty() {
+            return (PathBuf::from(&env), env);
+        }
+    }
+    if let Some(reg) = &manifest.registry {
+        return (build_root.join(reg), reg.clone());
+    }
+    (build_root.join("vendor"), "vendor".to_string())
+}
+
+/// Flattens the resolved dependency table into the VM seeds the `*Build` floor
+/// reads (v0.25): each declared dependency's resolved root path plus its OWN
+/// children's `(name, root)` pairs, so a synthetic library can wire them as named
+/// modules. EVERY resolved package is seeded (not just the top-level ones), so a
+/// transitive child reached only through another dep is mintable.
+fn dependency_seeds(resolved: &ResolvedDeps) -> Vec<ResolvedDepSeed> {
+    let mut seeds: Vec<ResolvedDepSeed> = Vec::new();
+    for dep in &resolved.deps {
+        let mut children: Vec<(String, String)> = Vec::new();
+        for child_name in &dep.children {
+            if let Some(child) = resolved.get(child_name) {
+                children.push((
+                    child_name.clone(),
+                    child.root_abs.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        children.sort();
+        seeds.push(ResolvedDepSeed {
+            name: dep.name.clone(),
+            root_abs: dep.root_abs.to_string_lossy().into_owned(),
+            children,
+        });
+    }
+    seeds
 }
 
 /// Maps a raw `i32` exit code to a process [`ExitCode`], clamped to a `u8` (the

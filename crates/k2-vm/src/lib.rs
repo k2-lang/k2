@@ -55,13 +55,13 @@ use std::process::ExitCode;
 use k2_mir::{BuildMode, MirProgram};
 
 pub use build_graph::{
-    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, ModuleNode, OptMode, StepNode,
-    TargetTriple,
+    Artifact, ArtifactKind, BuildGraph, BuildOptVal, DeclaredOption, DependencyNode, ModuleNode,
+    OptMode, StepNode, TargetTriple,
 };
 pub use value::{Capability, IntRepr, SchedKind, Value};
 pub use vm::{
-    BuildInputs, Coverage, FailKind, Halt, OsInputs, PanicInfo, RunOpts, TestFailure, TestOutcome,
-    TestStatus, Vm,
+    BuildInputs, Coverage, FailKind, Halt, OsInputs, PanicInfo, ResolvedDepSeed, RunOpts,
+    TestFailure, TestOutcome, TestStatus, Vm,
 };
 
 /// Runs `build(b)` over a compiled `build.k2` program and returns the recorded

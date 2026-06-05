@@ -1,0 +1,11 @@
+const build = @import("build");
+pub fn build(b: *Build) void {
+    const t = b.standardTarget();
+    const o = b.standardOptimize();
+    const c = b.dependency("calc", .{ .version = "^1.0.0" });
+    const exe = b.addExecutable(.{ .name="app", .root_source=b.path("main.k2"), .target=t, .optimize=o });
+    exe.addModule("calc", c.module());
+    const r = b.addRunArtifact(exe);
+    const run = b.step("run", "run"); run.dependOn(&r.step);
+    b.installArtifact(exe);
+}

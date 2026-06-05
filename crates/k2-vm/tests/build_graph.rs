@@ -77,6 +77,7 @@ fn records_artifacts_options_and_steps_in_order() {
             target: TargetTriple::host(),
             optimize: OptMode::Debug,
             dopts: vec![("verbose".to_string(), "true".to_string())],
+            resolved_deps: Vec::new(),
         },
     )
     .expect("build(b) runs");
@@ -118,6 +119,7 @@ fn option_absent_returns_default() {
             target: TargetTriple::host(),
             optimize: OptMode::Debug,
             dopts: Vec::new(),
+            resolved_deps: Vec::new(),
         },
     )
     .expect("build(b) runs");
@@ -137,6 +139,7 @@ fn target_and_optimize_surface_from_inputs() {
             target: TargetTriple::parse("aarch64-linux-musl"),
             optimize: OptMode::ReleaseFast,
             dopts: Vec::new(),
+            resolved_deps: Vec::new(),
         },
     )
     .expect("build(b) runs");

@@ -63,6 +63,40 @@ pub const Module = struct {
     id: u32,
 };
 
+/// Declaration options for `b.dependency` (v0.25, the offline package manager).
+/// EXACTLY ONE source must be given: `.path` (a local directory) OR `.version`
+/// (a semver constraint resolved against the local vendored registry). `.registry`
+/// optionally overrides the registry-package name (default: the dependency name).
+///
+/// Resolution + locking happen in the DRIVER, before `build(b)` runs (it is I/O,
+/// which the comptime sandbox forbids inside `build(b)`); this struct is recorded
+/// for diagnostics, with the authoritative binding seeded by the driver.
+pub const DependencyOptions = struct {
+    /// A local path source (a directory with the dep's `k2.pkg` + sources). When
+    /// set, version resolution is bypassed.
+    path: []const u8 = "",
+    /// A semver constraint ("^1.2.0" / "~1.2" / "1.2.0" / ">=1.0.0" / "1.x").
+    /// Resolved against the registry to the HIGHEST satisfying version.
+    version: []const u8 = "",
+    /// An optional registry package name (defaults to the dependency name).
+    registry: []const u8 = "",
+};
+
+/// A resolved dependency package (v0.25). Its root module is reachable via
+/// `dep.module()`, wireable into an artifact with `exe.addModule("foo",
+/// dep.module())` so the artifact's code can `@import("foo")` it. The actual
+/// resolution against the offline registry/path is performed by the driver BEFORE
+/// `build(b)` runs; this handle only records the dependency node.
+pub const Dependency = struct {
+    /// The dependency's id into the VM-recorded graph.
+    id: u32,
+
+    /// The dependency package's root module, wireable into an artifact.
+    pub fn module(self: *Dependency) Module {
+        return @buildDependencyModule(self.id);
+    }
+};
+
 /// A build artifact: a library, executable, or test. The shared handle routes
 /// every method by its `id` into the VM's recorded graph.
 pub const Artifact = struct {
@@ -134,6 +168,16 @@ pub const Build = struct {
     /// string.
     pub fn option(self: *Build, comptime T: type, name: []const u8, desc: []const u8) ?T {
         return @buildOption(T, name, desc);
+    }
+
+    /// Declare a dependency on package `name` (v0.25), resolved offline from a
+    /// local path or the local vendored registry (by semver). Expose its root
+    /// module via `dep.module()` and wire it with `exe.addModule(name,
+    /// dep.module())` so the artifact's code can `@import(name)` it. The resolution
+    /// + lock happen in the driver BEFORE `build(b)` runs (resolution is I/O); this
+    /// records the handle.
+    pub fn dependency(self: *Build, name: []const u8, opts: DependencyOptions) Dependency {
+        return @buildDependency(name, opts);
     }
 
     /// Declare a library artifact.

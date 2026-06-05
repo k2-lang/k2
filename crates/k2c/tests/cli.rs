@@ -3292,3 +3292,860 @@ fn test_merged_fail_caret_names_true_file_and_line() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+//  v0.25 — the offline package manager: path + registry deps, semver
+//  resolution, a reproducible deps.lock, transitive deps, and clear
+//  missing/conflict/cycle diagnostics. Every fixture is local, self-contained
+//  (a temp dir keyed on the pid), and self-cleaning — no network, no host state.
+// ---------------------------------------------------------------------------
+
+/// Creates a fresh temp directory for a package-manager fixture, keyed on `tag`
+/// and the process id (self-cleaning: removed on entry). Returns the directory.
+fn pkg_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("k2_pkg_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Writes `body` to `dir/rel`, creating parent directories. A small helper for
+/// building registry + project trees in the fixtures below.
+fn write_file(dir: &std::path::Path, rel: &str, body: &str) {
+    let p = dir.join(rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(p, body).unwrap();
+}
+
+/// Writes a registry package version (`<dir>/vendor/<pkg>/<version>/...`) with a
+/// `k2.pkg` (carrying `deps` verbatim) and a root source.
+fn write_registry_pkg(
+    dir: &std::path::Path,
+    pkg: &str,
+    version: &str,
+    deps: &str,
+    root_body: &str,
+) {
+    let base = format!("vendor/{pkg}/{version}");
+    let manifest = format!(
+        "pub const package = .{{ .name=\"{pkg}\", .version=\"{version}\", \
+         .root_source=\"src/root.k2\"{deps} }};\n"
+    );
+    write_file(dir, &format!("{base}/k2.pkg"), &manifest);
+    write_file(dir, &format!("{base}/src/root.k2"), root_body);
+}
+
+/// Builds the canonical fixture: a project that depends on a REGISTRY package
+/// `calc` (via `^1.0.0`, with versions 1.0.0/1.2.0/2.0.0 present) and a PATH
+/// package `strutil`. Returns the project directory.
+fn build_canonical_fixture(tag: &str) -> PathBuf {
+    let dir = pkg_dir(tag);
+
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .version=\"0.1.0\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\"^1.0.0\" }, \
+         .strutil = .{ .path=\"strutil\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget();\n\
+         \x20   const o = b.standardOptimize();\n\
+         \x20   const calc = b.dependency(\"calc\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const strutil = b.dependency(\"strutil\", .{ .path = \"strutil\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"calc\", calc.module());\n\
+         \x20   exe.addModule(\"strutil\", strutil.module());\n\
+         \x20   const r = b.addRunArtifact(exe);\n\
+         \x20   const run = b.step(\"run\", \"run the app\");\n\
+         \x20   run.dependOn(&r.step);\n\
+         \x20   b.installArtifact(exe);\n\
+         }\n",
+    );
+    write_file(
+        &dir,
+        "main.k2",
+        "const calc = @import(\"calc\");\n\
+         const strutil = @import(\"strutil\");\n\
+         pub fn main(sys: *System) !void {\n\
+         \x20   const o = sys.io.stdout();\n\
+         \x20   try o.print(\"calc.mul(2,3)={d}\\n\", .{calc.mul(2, 3)});\n\
+         \x20   try o.print(\"strutil.shout={s}\\n\", .{strutil.shout()});\n\
+         }\n",
+    );
+
+    // The path dependency.
+    write_file(
+        &dir,
+        "strutil/k2.pkg",
+        "pub const package = .{ .name=\"strutil\", .version=\"0.1.0\", .root_source=\"root.k2\" };\n",
+    );
+    write_file(
+        &dir,
+        "strutil/root.k2",
+        "pub fn shout() []const u8 { return \"HI\"; }\n",
+    );
+
+    // The registry: calc 1.0.0 (add only), 1.2.0 (add+mul, the winner), 2.0.0.
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "1.0.0",
+        "",
+        "pub fn add(a: i64, b: i64) i64 { return a + b; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "1.2.0",
+        "",
+        "pub fn add(a: i64, b: i64) i64 { return a + b; }\n\
+         pub fn mul(a: i64, b: i64) i64 { return a * b; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "2.0.0",
+        "",
+        "pub fn add(a: i64, b: i64) i64 { return a + b + 100; }\n\
+         pub fn mul(a: i64, b: i64) i64 { return 0; }\n",
+    );
+    dir
+}
+
+#[test]
+fn pkg_builds_path_and_registry_deps_and_runs() {
+    let dir = build_canonical_fixture("buildrun");
+    let out = k2c()
+        .arg("build")
+        .arg("run")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build run must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // calc 1.2.0's `mul` (a 1.2.0-only symbol) AND the path dep's `shout` both work.
+    assert!(stdout.contains("calc.mul(2,3)=6"), "got: {stdout}");
+    assert!(stdout.contains("strutil.shout=HI"), "got: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_resolver_picks_highest_matching_version() {
+    let dir = build_canonical_fixture("highest");
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(out.status.success(), "build must succeed");
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    // ^1.0.0 over {1.0.0, 1.2.0, 2.0.0} must select 1.2.0 (NOT 1.0.0, NOT 2.0.0).
+    assert!(
+        lock.contains("calc 1.2.0 "),
+        "deps.lock must pin calc 1.2.0; got:\n{lock}"
+    );
+    assert!(!lock.contains("calc 2.0.0 "), "must not pick 2.0.0");
+    assert!(!lock.contains("calc 1.0.0 "), "must not pick 1.0.0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_deps_lock_is_reproducible() {
+    let dir = build_canonical_fixture("reproducible");
+    let run = || {
+        k2c().arg("build").current_dir(&dir).output().unwrap();
+        std::fs::read_to_string(dir.join("deps.lock")).unwrap()
+    };
+    let lock1 = run();
+    let lock2 = run();
+    assert_eq!(lock1, lock2, "deps.lock must be byte-identical across runs");
+    assert!(
+        lock1.starts_with("# k2 deps lock v1"),
+        "header; got:\n{lock1}"
+    );
+    assert!(
+        lock1.contains("deps_hash = "),
+        "deps_hash line; got:\n{lock1}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_locked_version_is_used_not_reresolved() {
+    let dir = build_canonical_fixture("locked");
+    // First build locks calc 1.2.0.
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(out.status.success());
+    let lock1 = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(lock1.contains("calc 1.2.0 "), "first build pins 1.2.0");
+
+    // Add calc 1.3.0 to the registry; a build WITHOUT --update must keep 1.2.0.
+    write_registry_pkg(&dir, "calc", "1.3.0", "", "pub fn add(a:i64,b:i64) i64 { return a+b; }\npub fn mul(a:i64,b:i64) i64 { return a*b; }\n");
+    let out2 = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(
+        out2.status.success(),
+        "locked rebuild must succeed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let lock2 = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock2.contains("calc 1.2.0 "),
+        "the lock must still pin 1.2.0; got:\n{lock2}"
+    );
+
+    // `build --update` re-resolves and moves to 1.3.0.
+    let out3 = k2c()
+        .arg("build")
+        .arg("--update")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out3.status.success());
+    let lock3 = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock3.contains("calc 1.3.0 "),
+        "--update must move to 1.3.0; got:\n{lock3}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_update_subcommand_rewrites_lock() {
+    let dir = build_canonical_fixture("updatecmd");
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        out.status.success(),
+        "k2c update must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock.contains("calc 1.2.0 "),
+        "update writes a lock pinning 1.2.0"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("resolved 2 package"),
+        "summary; got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_missing_package_is_reported() {
+    let dir = pkg_dir("missing");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .nope = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const d = b.dependency(\"nope\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"nope\", d.module());\n\
+         }\n",
+    );
+    write_file(&dir, "main.k2", "pub fn main(sys: *System) !void {}\n");
+    // The registry directory exists but has no `nope` package.
+    std::fs::create_dir_all(dir.join("vendor")).unwrap();
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(!out.status.success(), "a missing package must exit nonzero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nope"),
+        "must name the missing package; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("not found") || stderr.contains("package not found"),
+        "clear missing diagnostic; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_unsatisfiable_constraint_is_reported() {
+    let dir = pkg_dir("unsat");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\"^2.0.0\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const d = b.dependency(\"calc\", .{ .version = \"^2.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"calc\", d.module());\n\
+         }\n",
+    );
+    write_file(&dir, "main.k2", "pub fn main(sys: *System) !void {}\n");
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "1.0.0",
+        "",
+        "pub fn add(a:i64,b:i64) i64 { return a+b; }\n",
+    );
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "an unsatisfiable constraint must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no version") && stderr.contains("^2.0.0"),
+        "clear unsatisfiable diagnostic; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_version_conflict_is_reported() {
+    let dir = pkg_dir("conflict");
+    // Root wants calc ^1.0.0; foo (^1.0.0) transitively wants calc ^2.0.0.
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\"^1.0.0\" }, .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const c = b.dependency(\"calc\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const f = b.dependency(\"foo\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"calc\", c.module());\n\
+         \x20   exe.addModule(\"foo\", f.module());\n\
+         }\n",
+    );
+    write_file(&dir, "main.k2", "pub fn main(sys: *System) !void {}\n");
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "1.0.0",
+        "",
+        "pub fn add(a:i64,b:i64) i64 { return a+b; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "2.0.0",
+        "",
+        "pub fn add(a:i64,b:i64) i64 { return a+b; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .calc = .{ .version=\"^2.0.0\" } }",
+        "const calc=@import(\"calc\"); pub fn go() i64 { return calc.add(1,2); }\n",
+    );
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a version conflict must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("conflict"),
+        "must mention conflict; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("^1.0.0") && stderr.contains("^2.0.0"),
+        "names both constraints; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_dependency_cycle_is_reported() {
+    let dir = pkg_dir("cycle");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .a = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const a = b.dependency(\"a\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"a\", a.module());\n\
+         }\n",
+    );
+    write_file(&dir, "main.k2", "pub fn main(sys: *System) !void {}\n");
+    // a -> b -> a.
+    write_registry_pkg(
+        &dir,
+        "a",
+        "1.0.0",
+        ", .dependencies = .{ .b = .{ .version=\"^1.0.0\" } }",
+        "pub fn x() i64 { return 1; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "b",
+        "1.0.0",
+        ", .dependencies = .{ .a = .{ .version=\"^1.0.0\" } }",
+        "pub fn y() i64 { return 2; }\n",
+    );
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a dependency cycle must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cycle"),
+        "must report a cycle; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_transitive_dep_composes() {
+    let dir = pkg_dir("transitive");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const foo = b.dependency(\"foo\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"foo\", foo.module());\n\
+         \x20   const r = b.addRunArtifact(exe);\n\
+         \x20   const run = b.step(\"run\", \"run\");\n\
+         \x20   run.dependOn(&r.step);\n\
+         \x20   b.installArtifact(exe);\n\
+         }\n",
+    );
+    write_file(
+        &dir,
+        "main.k2",
+        "const foo = @import(\"foo\");\n\
+         pub fn main(sys: *System) !void {\n\
+         \x20   const o = sys.io.stdout();\n\
+         \x20   try o.print(\"foo.compute={d}\\n\", .{foo.compute(10)});\n\
+         }\n",
+    );
+    // foo 1.0.0 depends on baz ^0.3.0; baz 0.3.4 (winner) over 0.3.1, 0.2.0.
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .baz = .{ .version=\"^0.3.0\" } }",
+        "const baz=@import(\"baz\");\npub fn compute(x: i64) i64 { return baz.triple(x) + 1; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "baz",
+        "0.2.0",
+        "",
+        "pub fn triple(x: i64) i64 { return 0; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "baz",
+        "0.3.1",
+        "",
+        "pub fn triple(x: i64) i64 { return 0; }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "baz",
+        "0.3.4",
+        "",
+        "pub fn triple(x: i64) i64 { return x * 3; }\n",
+    );
+
+    let out = k2c()
+        .arg("build")
+        .arg("run")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "transitive build run must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // baz 0.3.4's triple(10)=30, +1 = 31 — proves the right baz version composed.
+    assert!(stdout.contains("foo.compute=31"), "got: {stdout}");
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock.contains("baz 0.3.4 "),
+        "lock pins baz 0.3.4; got:\n{lock}"
+    );
+    assert!(
+        lock.contains("foo -> baz"),
+        "lock records the transitive edge; got:\n{lock}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_path_dep_bypasses_semver() {
+    let dir = pkg_dir("pathdep");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", \
+         .dependencies = .{ .strutil = .{ .path=\"strutil\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const s = b.dependency(\"strutil\", .{ .path = \"strutil\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"strutil\", s.module());\n\
+         \x20   const r = b.addRunArtifact(exe);\n\
+         \x20   const run = b.step(\"run\", \"run\");\n\
+         \x20   run.dependOn(&r.step);\n\
+         }\n",
+    );
+    write_file(
+        &dir,
+        "main.k2",
+        "const strutil = @import(\"strutil\");\n\
+         pub fn main(sys: *System) !void {\n\
+         \x20   const o = sys.io.stdout();\n\
+         \x20   try o.print(\"{s}\\n\", .{strutil.shout()});\n\
+         }\n",
+    );
+    write_file(
+        &dir,
+        "strutil/k2.pkg",
+        "pub const package = .{ .name=\"strutil\", .version=\"0.1.0\", .root_source=\"root.k2\" };\n",
+    );
+    write_file(
+        &dir,
+        "strutil/root.k2",
+        "pub fn shout() []const u8 { return \"YO\"; }\n",
+    );
+    // NO registry exists at all — a path dep needs none.
+    let out = k2c()
+        .arg("build")
+        .arg("run")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a path-only project must build with no registry: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("YO"), "got: {stdout}");
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock.contains("strutil 0.1.0 source=path:"),
+        "path source descriptor; got:\n{lock}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkg_undeclared_dependency_is_reported() {
+    let dir = pkg_dir("undeclared");
+    // build.k2 calls b.dependency("ghost") but k2.pkg declares no such dependency.
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", .dependencies = .{ .real = .{ .path=\"real\" } } };\n",
+    );
+    write_file(
+        &dir,
+        "build.k2",
+        "const build = @import(\"build\");\n\
+         pub fn build(b: *Build) void {\n\
+         \x20   const t = b.standardTarget(); const o = b.standardOptimize();\n\
+         \x20   const g = b.dependency(\"ghost\", .{ .version = \"^1.0.0\" });\n\
+         \x20   const exe = b.addExecutable(.{ .name=\"app\", .root_source=b.path(\"main.k2\"), .target=t, .optimize=o });\n\
+         \x20   exe.addModule(\"ghost\", g.module());\n\
+         }\n",
+    );
+    write_file(&dir, "main.k2", "pub fn main(sys: *System) !void {}\n");
+    write_file(
+        &dir,
+        "real/k2.pkg",
+        "pub const package = .{ .name=\"real\", .version=\"0.1.0\", .root_source=\"root.k2\" };\n",
+    );
+    write_file(&dir, "real/root.k2", "pub fn x() i64 { return 1; }\n");
+    let out = k2c().arg("build").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "an undeclared dependency must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ghost"),
+        "must name the undeclared dependency; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+//  Regression fixtures for the v0.25 resolver-correctness findings. Each uses
+//  `k2c update` (resolve + write deps.lock, no compile) over a local vendor
+//  registry, so it exercises the resolver directly, offline and self-cleaning.
+// ---------------------------------------------------------------------------
+
+/// Finding 1: an EXACT constraint that names a prerelease must resolve to that
+/// prerelease, NOT the higher stable release (or a higher prerelease) of the same
+/// core. Before the fix `exact_upper` bumped the patch, so `1.2.4-rc.1` matched a
+/// range over the whole `1.2.4` core and the resolver locked the stable `1.2.4`.
+#[test]
+fn pkg_exact_prerelease_pin_resolves_to_itself() {
+    let dir = pkg_dir("exactpre");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\"1.2.4-rc.1\" } } };\n",
+    );
+    let body = "pub fn add(a:i64,b:i64) i64 { return a+b; }\n";
+    // The registry holds the rc.1 pin plus same-core neighbours that the buggy
+    // range used to swallow: an earlier alpha, a higher rc.2, and the stable.
+    write_registry_pkg(&dir, "calc", "1.2.4-alpha", "", body);
+    write_registry_pkg(&dir, "calc", "1.2.4-rc.1", "", body);
+    write_registry_pkg(&dir, "calc", "1.2.4-rc.2", "", body);
+    write_registry_pkg(&dir, "calc", "1.2.4", "", body);
+
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        out.status.success(),
+        "exact prerelease pin must resolve: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock.contains("calc 1.2.4-rc.1 "),
+        "must pin the exact prerelease; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("calc 1.2.4 ") && !lock.contains("calc 1.2.4-rc.2 "),
+        "must NOT leak to the stable core or a higher prerelease; got:\n{lock}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finding 2 (satisfiable side): two parents impose `>=1.2.0` and `<1.5.0` on the
+/// same package; the highest version satisfying BOTH is `1.4.0`. Because `calc`
+/// sorts before `foo`, the old resolver greedily grabbed `1.6.0` under only
+/// `>=1.2.0`, then rejected the graph as a false conflict. Re-selection under the
+/// full constraint set must now pick `1.4.0` and report NO conflict.
+#[test]
+fn pkg_satisfiable_multi_constraint_resolves() {
+    let dir = pkg_dir("multisat");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\">=1.2.0\" }, .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    let body = "pub fn add(a:i64,b:i64) i64 { return a+b; }\n";
+    write_registry_pkg(&dir, "calc", "1.3.0", "", body);
+    write_registry_pkg(&dir, "calc", "1.4.0", "", body);
+    write_registry_pkg(&dir, "calc", "1.6.0", "", body);
+    // foo transitively constrains calc to <1.5.0.
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .calc = .{ .version=\"<1.5.0\" } }",
+        "const calc=@import(\"calc\"); pub fn go() i64 { return calc.add(1,2); }\n",
+    );
+
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        out.status.success(),
+        "a satisfiable multi-constraint graph must NOT be a conflict; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(dir.join("deps.lock")).unwrap();
+    assert!(
+        lock.contains("calc 1.4.0 "),
+        "must re-select calc 1.4.0 (highest in [1.2.0,1.5.0)); got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("calc 1.6.0 "),
+        "must NOT keep the greedily-grabbed 1.6.0; got:\n{lock}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finding 2 (conflict side): a GENUINELY unsatisfiable multi-constraint graph
+/// (`>=1.2.0` ∩ `<1.5.0` with only `1.6.0` present) must still be reported as a
+/// conflict — re-selection must not paper over a real one.
+#[test]
+fn pkg_genuine_multi_constraint_conflict_still_reported() {
+    let dir = pkg_dir("multiconf");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .version=\">=1.2.0\" }, .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    let body = "pub fn add(a:i64,b:i64) i64 { return a+b; }\n";
+    // Only 1.6.0 exists — it satisfies >=1.2.0 but violates foo's <1.5.0.
+    write_registry_pkg(&dir, "calc", "1.6.0", "", body);
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .calc = .{ .version=\"<1.5.0\" } }",
+        "const calc=@import(\"calc\"); pub fn go() i64 { return calc.add(1,2); }\n",
+    );
+
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a real multi-constraint conflict must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("conflict"),
+        "must mention conflict; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("1.2.0") && stderr.contains("1.5.0"),
+        "must name both constraints; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finding 3: a PATH dep whose name collides with a transitive REGISTRY constraint
+/// must be validated against that constraint, not silently pinned. Here the path
+/// `calc@0.1.0` is used where `foo` transitively requires `^2.0.0`; the resolver
+/// must report a clear conflict rather than building against the unapproved 0.1.0.
+#[test]
+fn pkg_path_dep_version_conflict_is_detected() {
+    let dir = pkg_dir("pathconf");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .calc = .{ .path=\"localcalc\" }, .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    // The local path calc, pinned at 0.1.0 (no `mul`).
+    write_file(
+        &dir,
+        "localcalc/k2.pkg",
+        "pub const package = .{ .name=\"calc\", .version=\"0.1.0\", .root_source=\"root.k2\" };\n",
+    );
+    write_file(
+        &dir,
+        "localcalc/root.k2",
+        "pub fn add(a:i64,b:i64) i64 { return a+b; }\n",
+    );
+    // foo demands calc ^2.0.0 transitively; a calc 2.0.0 exists in the registry.
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .calc = .{ .version=\"^2.0.0\" } }",
+        "const calc=@import(\"calc\"); pub fn go() i64 { return calc.add(1,2); }\n",
+    );
+    write_registry_pkg(
+        &dir,
+        "calc",
+        "2.0.0",
+        "",
+        "pub fn add(a:i64,b:i64) i64 { return a+b; }\npub fn mul(a:i64,b:i64) i64 { return a*b; }\n",
+    );
+
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a path dep that violates a transitive registry constraint must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("conflict"),
+        "must mention conflict; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("calc") && stderr.contains("0.1.0") && stderr.contains("^2.0.0"),
+        "must name the path pin and the unmet constraint; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finding 4: two parents importing the same name with DIFFERENT `.registry`
+/// overrides map to different registry packages; honoring only the first and
+/// silently dropping the other is a wrong build. The resolver must report a clear
+/// conflict naming both registry targets.
+#[test]
+fn pkg_registry_name_override_collision_is_reported() {
+    let dir = pkg_dir("regname");
+    write_file(
+        &dir,
+        "k2.pkg",
+        "pub const package = .{ .name=\"app\", .registry=\"vendor\", \
+         .dependencies = .{ .x = .{ .version=\"^1.0.0\", .registry=\"alpha\" }, \
+         .foo = .{ .version=\"^1.0.0\" } } };\n",
+    );
+    let body = "pub fn id(a:i64) i64 { return a; }\n";
+    // The shared import name `x` resolves to `alpha` (project) vs `beta` (foo).
+    write_registry_pkg(&dir, "alpha", "1.0.0", "", body);
+    write_registry_pkg(&dir, "beta", "1.0.0", "", body);
+    write_registry_pkg(
+        &dir,
+        "foo",
+        "1.0.0",
+        ", .dependencies = .{ .x = .{ .version=\"^1.0.0\", .registry=\"beta\" } }",
+        "const x=@import(\"x\"); pub fn go() i64 { return x.id(1); }\n",
+    );
+
+    let out = k2c().arg("update").current_dir(&dir).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "conflicting registry_name overrides must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("conflicting registry packages"),
+        "must report the registry-name conflict; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "must name both registry targets; got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

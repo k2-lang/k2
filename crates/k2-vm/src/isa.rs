@@ -221,6 +221,16 @@ pub enum IntrinsicId {
     /// handle for the artifact's embedded step, so `&run_exe.step` is a real step
     /// a user step can `dependOn`.
     BuildArtifactStep,
+    /// `b.dependency(name, opts)` -> a `Dependency` handle `{ id }` (v0.25). The
+    /// driver has already resolved every declared dependency to a root source path
+    /// (seeded into `BuildInputs.resolved_deps`); this only mints the handle, with
+    /// `opts` read for diagnostics. NO I/O — resolution happened in the driver.
+    BuildDependency,
+    /// `dep.module()` -> a `Module` value exposing the dependency's resolved root
+    /// artifact. The VM mints a SYNTHETIC library artifact for the dep on first
+    /// use (rooted at the driver-resolved path), so the dep participates in
+    /// `addModule`/`named_modules` exactly like a user `addLibrary`.
+    BuildDependencyModule,
 
     // ---- The v0.23 fs/os/time/net capability floor ----------------------
     //

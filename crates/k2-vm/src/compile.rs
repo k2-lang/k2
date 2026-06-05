@@ -739,6 +739,13 @@ impl<'p> FnCompiler<'p> {
                 "buildInstall" => IntrinsicId::BuildInstall,
                 "buildStep" => IntrinsicId::BuildStep,
                 "buildStepDependOn" => IntrinsicId::BuildStepDependOn,
+                // v0.25 offline package manager. `b.dependency(...)` records a
+                // dependency handle; `dep.module()` mints a synthetic library over
+                // the driver-resolved root. Both are spelled as `@build*` builtins
+                // in the `build` module's bodies, so there is NO method-name
+                // collision with `lib.module()` (which is value-rooted `["module"]`).
+                "buildDependency" => IntrinsicId::BuildDependency,
+                "buildDependencyModule" => IntrinsicId::BuildDependencyModule,
                 // The v0.23 fs/os/time/net floor: thin `@builtin` leaf intrinsics
                 // the std `fs`/`os`/`time`/`net` wrapper methods call (passing a
                 // `u32` handle id / a path / a byte buffer), backed by Rust `std` on
@@ -916,6 +923,7 @@ impl<'p> FnCompiler<'p> {
                     ["standardTarget"] => IntrinsicId::BuildStdTarget,
                     ["standardOptimize"] => IntrinsicId::BuildStdOptimize,
                     ["option"] => IntrinsicId::BuildOption,
+                    ["dependency"] => IntrinsicId::BuildDependency,
                     ["addLibrary"] => IntrinsicId::BuildAddLibrary,
                     ["addExecutable"] => IntrinsicId::BuildAddExecutable,
                     ["addTest"] => IntrinsicId::BuildAddTest,

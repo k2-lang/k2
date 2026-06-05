@@ -41,7 +41,9 @@ mod build_cmd;
 mod imports;
 mod lock;
 mod multi;
+mod pkg;
 mod render;
+mod semver;
 mod test_cmd;
 
 use std::env;
@@ -108,6 +110,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "run-native" => cmd_run_native(rest),
         "build-native" => cmd_build_native(rest),
         "build" => build_cmd::cmd_build(rest),
+        "update" => build_cmd::cmd_update(rest),
         "test" => test_cmd::cmd_test(rest),
         "bench" => cmd_bench(rest),
         "lsp" => cmd_lsp(rest),
@@ -2399,6 +2402,10 @@ fn print_usage() {
          \x20         aarch64-linux  (cross-compile; structurally validated, NOT executed here —\n\
          \x20                         no emulator on this host; expected to run on real aarch64 Linux)\n\
          \x20   bench [file.k2 ...]  Benchmark Debug vs ReleaseFast executed VM instructions.\n\
+         \x20   build [step]         Run build.k2; resolve offline deps (k2.pkg), lock, run a step.\n\
+         \x20       --registry <dir>   Local vendored registry root (default <root>/vendor).\n\
+         \x20       --update           Re-resolve deps from scratch, ignoring deps.lock.\n\
+         \x20   update               Re-resolve deps (offline) and rewrite deps.lock; no compile.\n\
          \x20   lsp                  Run the language server over stdio (LSP / JSON-RPC).\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
