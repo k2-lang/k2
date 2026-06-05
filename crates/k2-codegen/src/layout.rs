@@ -134,6 +134,22 @@ fn layout_depth(arena: &TypeArena, ty: TypeId, depth: u32) -> Option<Layout> {
                 align: el.align.max(1),
             })
         }
+        // `@Vector(N, T)` is laid out like a contiguous array of its element type,
+        // but with an XMM-style alignment: `align = min(16, (N*elem).next_pow2())`
+        // and `size = round_up(N*elem, align)`. This mirrors `reflect::layout_depth`
+        // exactly so `@sizeOf`/`@alignOf` and the native byte image agree. Without
+        // this arm `layout_of(@Vector)` was `None`, which routed a vector literal
+        // through the synthetic-layout path and mis-strode bool-const lanes to
+        // 8-byte stores (only lane 0 survived) — see `build_aggregate`.
+        Type::Vector { len, elem } => {
+            let el = layout_depth(arena, elem, depth + 1)?;
+            let raw = el.size.saturating_mul(len as u64);
+            let align = raw.max(1).next_power_of_two().min(16);
+            Some(Layout {
+                size: round_up(raw, align),
+                align,
+            })
+        }
         Type::Struct(id) => {
             let fields = arena.structs[id.0 as usize].fields.clone();
             let mut offset = 0u64;
@@ -180,7 +196,10 @@ pub fn field_offsets(arena: &TypeArena, struct_ty: TypeId) -> Vec<u64> {
 /// `Index` projection). Falls back to a word for a non-layoutable element.
 pub fn elem_size(arena: &TypeArena, container_ty: TypeId) -> u64 {
     let elem = match arena.get(container_ty) {
-        Type::Array { elem, .. } | Type::Slice { elem, .. } => *elem,
+        // A `@Vector(N, T)` strides by its element size just like an array, so a
+        // vector literal's per-lane stores land at the correct 1/2/4/8-byte stride
+        // (a bool vector stores 1-byte lanes, not 8-byte words).
+        Type::Array { elem, .. } | Type::Slice { elem, .. } | Type::Vector { elem, .. } => *elem,
         // A pointer-as-array (rare) or already an element type: size it directly.
         _ => return layout_of(arena, container_ty).map(|l| l.size).unwrap_or(8),
     };

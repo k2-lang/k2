@@ -72,6 +72,22 @@ impl crate::check::Checker<'_> {
                     .find(|(_, f)| f.name == field)
                 {
                     let ty = f.ty;
+                    // A `packed struct` field carries its bit descriptor so both
+                    // backends do an identical shift+mask (spec §02). The sign for
+                    // sign-extension comes from the field's integer type.
+                    if let (true, Some(off), Some(width)) =
+                        (info.is_packed(), f.bit_offset, f.bit_width)
+                    {
+                        let signed = matches!(self.arena.get(ty), Type::Int { signed: true, .. });
+                        self.record_member(
+                            span,
+                            MemberRes::PackedField(
+                                idx as u32,
+                                crate::ty::PackedField { off, width, signed },
+                            ),
+                        );
+                        return ty;
+                    }
                     self.record_member(span, MemberRes::Field(idx as u32));
                     return ty;
                 }

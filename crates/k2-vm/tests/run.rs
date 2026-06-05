@@ -814,3 +814,59 @@ pub fn main(sys: *System) !void {
 "#;
     assert_stdout(src, "x=5\n");
 }
+
+#[test]
+fn regression_packed_struct_bitcast_to_integer() {
+    // v0.21 (MAJOR): `@bitCast(packed struct) -> backing integer`. The VM stores
+    // a packed struct as per-field values; it must pack them via the field bit
+    // offsets/widths to match the native single-backing-integer image:
+    // 5 | (20 << 3) | (200 << 8) == 51365. Previously the VM rendered `<int>`.
+    let src = r#"
+const P = packed struct { a: u3, b: u5, c: u8 };
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const p: P = .{ .a = 5, .b = 20, .c = 200 };
+    const raw: u16 = @bitCast(p);
+    try out.print("{d}\n", .{raw});
+}
+"#;
+    assert_stdout(src, "51365\n");
+}
+
+#[test]
+fn regression_integer_bitcast_to_packed_struct_unpacks_fields() {
+    // The reverse direction `@bitCast(int) -> packed struct` is VM-only (native
+    // cleanly refuses a scalar-into-aggregate bitcast). It used to abort the VM
+    // with an internal "field access on non-aggregate" error; it must now unpack
+    // each field's bits, with sign-extension for a signed field:
+    // 51365 -> { a=5, b=20, c=200 }; 0xFF over { a: i4, b: u4 } -> { a=-1, b=15 }.
+    let src = r#"
+const P = packed struct { a: u3, b: u5, c: u8 };
+const S = packed struct { a: i4, b: u4 };
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const raw: u16 = 51365;
+    const p: P = @bitCast(raw);
+    const s: S = @bitCast(@as(u8, 0xFF));
+    try out.print("{d} {d} {d} {d} {d}\n", .{ p.a, p.b, p.c, s.a, s.b });
+}
+"#;
+    assert_stdout(src, "5 20 200 -1 15\n");
+}
+
+#[test]
+fn regression_reduce_bool_vector_formats_as_bool() {
+    // v0.21 (MAJOR): `@reduce(.And/.Or/.Xor, @Vector(N, bool))` declares a `bool`
+    // result; the VM's bitwise fold used to yield an int, so `{}` printed `1`/`0`
+    // instead of `true`/`false`. A bitwise op on two bools now carries a bool.
+    let src = r#"
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const t: @Vector(4, bool) = @splat(true);
+    const f: @Vector(4, bool) = @splat(false);
+    const x: @Vector(4, bool) = .{ true, false, true, true };
+    try out.print("{} {} {}\n", .{ @reduce(.And, t), @reduce(.Or, f), @reduce(.Xor, x) });
+}
+"#;
+    assert_stdout(src, "true false true\n");
+}

@@ -315,6 +315,10 @@ impl TypeArena {
     pub fn optional(&mut self, inner: TypeId) -> TypeId {
         self.intern(Type::Optional(inner))
     }
+    /// The SIMD vector type `@Vector(N, T)`.
+    pub fn vector(&mut self, len: u32, elem: TypeId) -> TypeId {
+        self.intern(Type::Vector { len, elem })
+    }
 
     // ---- equality & coercion -------------------------------------------
 
@@ -554,6 +558,7 @@ impl TypeArena {
                 };
                 format!("[{l}]{}", self.fmt(*elem))
             }
+            Type::Vector { len, elem } => format!("@Vector({len}, {})", self.fmt(*elem)),
             Type::Struct(s) => self.structs[s.0 as usize].name.clone(),
             Type::Enum(e) => self.enums[e.0 as usize].name.clone(),
             Type::Union(u) => self.unions[u.0 as usize].name.clone(),

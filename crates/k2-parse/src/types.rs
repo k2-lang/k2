@@ -64,17 +64,34 @@ impl Parser {
             // into the (deeply nested) body.
             let _ = self.too_deep();
             return Container {
-                kind: ContainerKind::Struct { is_extern: false },
+                kind: ContainerKind::Struct {
+                    is_extern: false,
+                    is_packed: false,
+                },
                 members: Vec::new(),
                 span: self.here(),
             };
         }
         let start = self.here();
         let is_extern = self.eat(TokenKind::KwExtern).is_some();
+        // `packed` is a CONTEXTUAL qualifier (not a reserved keyword), accepted
+        // here only directly before `struct` — mirroring how `anytype` is a
+        // contextual identifier. `packed struct {...}` requests the LSB-first
+        // bit-packed layout (spec §02).
+        let is_packed = !is_extern
+            && self.at(TokenKind::Ident)
+            && self.cur().text == "packed"
+            && self.peek_kind(1) == TokenKind::KwStruct;
+        if is_packed {
+            self.bump(); // `packed`
+        }
         let kind = match self.cur_kind() {
             TokenKind::KwStruct => {
                 self.bump();
-                ContainerKind::Struct { is_extern }
+                ContainerKind::Struct {
+                    is_extern,
+                    is_packed,
+                }
             }
             TokenKind::KwEnum => {
                 self.bump();
@@ -108,7 +125,10 @@ impl Parser {
             _ => {
                 let span = self.here();
                 self.error(span, "expected `struct`, `enum`, or `union`");
-                ContainerKind::Struct { is_extern }
+                ContainerKind::Struct {
+                    is_extern,
+                    is_packed,
+                }
             }
         };
 

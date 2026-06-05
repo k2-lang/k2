@@ -25,8 +25,9 @@ use k2_syntax::{
 use crate::arena::TypeArena;
 use crate::diag::Diagnostic;
 use crate::ty::{
-    EnumInfo, EnumVariant, ErrSetRef, FieldInfo, FnSig, IntBits, MemberDecl, MemberRes, ParamInfo,
-    StructInfo, Type, TypeId, UnionInfo, UnionTagKind, UnionVariant,
+    struct_layout_of, EnumInfo, EnumVariant, ErrSetRef, FieldInfo, FnSig, IntBits, MemberDecl,
+    MemberRes, ParamInfo, StructInfo, StructLayout, Type, TypeId, UnionInfo, UnionTagKind,
+    UnionVariant,
 };
 use crate::Typed;
 
@@ -617,6 +618,7 @@ impl<'a> Checker<'a> {
                     | "@typeName"
                     | "@TypeOf"
                     | "@This"
+                    | "@Vector"
                     // A top-level `const x = @compileError("m");` is an
                     // unconditionally-reached position, so the engine must run it
                     // and fire the message (spec §07.9.1) — a dead-branch
@@ -793,7 +795,7 @@ impl<'a> Checker<'a> {
             // An `extern struct` of representable fields lays out per the C ABI.
             Type::Struct(id) => {
                 let info = &self.arena.structs[id.0 as usize];
-                info.is_extern && info.fields.iter().all(|f| self.is_ffi_representable(f.ty))
+                info.is_extern() && info.fields.iter().all(|f| self.is_ffi_representable(f.ty))
             }
             _ => false,
         }
@@ -1177,14 +1179,23 @@ impl<'a> Checker<'a> {
         // reference Self; for simplicity we evaluate fields with the current
         // self_stack, then push the final type for nested decls.
         match &c.kind {
-            ContainerKind::Struct { is_extern } => self.eval_struct(c, name, *is_extern),
+            ContainerKind::Struct {
+                is_extern,
+                is_packed,
+            } => self.eval_struct(c, name, *is_extern, *is_packed),
             ContainerKind::Enum { tag } => self.eval_enum(c, name, tag.as_deref()),
             ContainerKind::Union { tag } => self.eval_union(c, name, tag),
         }
     }
 
     /// Evaluates a `struct {...}` body into a [`Type::Struct`].
-    fn eval_struct(&mut self, c: &Container, name: &str, is_extern: bool) -> TypeId {
+    fn eval_struct(
+        &mut self,
+        c: &Container,
+        name: &str,
+        is_extern: bool,
+        is_packed: bool,
+    ) -> TypeId {
         let mut fields = Vec::new();
         for m in &c.members {
             if let Member::Field(f) = m {
@@ -1192,26 +1203,115 @@ impl<'a> Checker<'a> {
                     Some(t) => self.eval_type(t),
                     None => self.arena.t_deferred(),
                 };
+                let align = self.eval_field_align_static(f);
                 fields.push(FieldInfo {
                     name: f.name.clone(),
                     ty,
                     has_default: f.default.is_some(),
                     is_comptime: f.is_comptime,
+                    align,
+                    bit_offset: None,
+                    bit_width: None,
                     span: f.span,
                 });
             }
+        }
+        let layout = struct_layout_of(is_extern, is_packed);
+        if layout == StructLayout::Packed {
+            self.fill_packed_offsets(c.span, &mut fields);
         }
         let info = StructInfo {
             def: self.def_of(c.span),
             name: name.to_string(),
             span: c.span,
-            is_extern,
+            layout,
             fields,
             decls: Vec::new(),
         };
         let ty = self.arena.intern_struct(info);
         self.eval_container_decls(c, ty);
         ty
+    }
+
+    /// Evaluates a struct field's `align(N)` clause (static, non-generic path) to
+    /// its byte count, diagnosing a non-power-of-two value. `None` => no clause.
+    fn eval_field_align_static(&mut self, f: &k2_syntax::Field) -> Option<u64> {
+        let expr = f.align.as_ref()?;
+        self.eval_align_expr(expr)
+    }
+
+    /// Evaluates a struct field's `align(N)` clause in a comptime env (the
+    /// generic-instantiation path), reusing the same power-of-two validation.
+    pub(crate) fn eval_field_align(
+        &mut self,
+        _env: &mut crate::comptime::Env,
+        f: &k2_syntax::Field,
+    ) -> Option<u64> {
+        // The align expression of a generic field is almost always a literal or a
+        // `const` — reuse the static comptime evaluator, which already runs in a
+        // fresh env.
+        let expr = f.align.as_ref()?;
+        self.eval_align_expr(expr)
+    }
+
+    /// Folds an `align(N)` expression to a byte count, requiring a positive
+    /// power-of-two (spec §03). A malformed value is diagnosed and dropped
+    /// (treated as "no explicit align"), never silently honored.
+    fn eval_align_expr(&mut self, expr: &Expr) -> Option<u64> {
+        let v = self.comptime_eval_value(expr).and_then(|v| v.as_int());
+        match v {
+            Some(n) if n > 0 && (n as u128).is_power_of_two() => Some(n as u64),
+            Some(n) => {
+                self.error(
+                    expr.span(),
+                    format!("`align({n})` must be a positive power of two"),
+                );
+                None
+            }
+            None => {
+                // A non-comptime align is a diagnostic, not a silent default.
+                self.error(expr.span(), "`align(...)` must be comptime-known");
+                None
+            }
+        }
+    }
+
+    /// Fills `bit_offset`/`bit_width` for every field of a `packed struct`,
+    /// LSB-first, in declaration order (spec §02). A field whose type is not
+    /// bit-addressable (a pointer/slice/array/aggregate other than a nested
+    /// packed struct) is a diagnostic; the total backing width is capped at 128
+    /// bits (the widest integer both backends represent).
+    pub(crate) fn fill_packed_offsets(&mut self, span: Span, fields: &mut [FieldInfo]) {
+        let mut bit = 0u64;
+        for f in fields.iter_mut() {
+            let signed = matches!(self.arena.get(f.ty), Type::Int { signed: true, .. });
+            match crate::reflect::packed_bit_width(&self.arena, f.ty) {
+                Some(w) => {
+                    f.bit_offset = Some(bit as u32);
+                    f.bit_width = Some(w as u32);
+                    bit += w;
+                }
+                None => {
+                    let fname = f.name.clone();
+                    self.error(
+                        f.span,
+                        format!(
+                            "packed-struct field `{fname}` must be an integer, bool, enum, \
+                             or nested packed-struct type"
+                        ),
+                    );
+                    f.bit_offset = Some(bit as u32);
+                    f.bit_width = Some(0);
+                }
+            }
+            let _ = signed;
+        }
+        if bit > 128 {
+            self.error(
+                span,
+                format!("packed struct is {bit} bits wide; the maximum is 128 bits"),
+            );
+        }
     }
 
     /// Evaluates an `enum {...}` body into a [`Type::Enum`].

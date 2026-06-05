@@ -55,15 +55,13 @@ impl crate::check::Checker<'_> {
             // comptime-known (it drives `[serializedSize(Packet)]u8`).
             "@sizeOf" | "@alignOf" | "@offsetOf" | "@bitSizeOf" => {
                 self.synth_all(args);
-                if matches!(name, "@sizeOf" | "@alignOf" | "@bitSizeOf") {
-                    let call = Expr::Builtin {
-                        name: name.to_string(),
-                        args: args.to_vec(),
-                        span,
-                    };
-                    if let Some(crate::value::Value::Int(ci)) = self.comptime_eval_value(&call) {
-                        self.comptime_span_ints.insert((span.start, span.end), ci.v);
-                    }
+                let call = Expr::Builtin {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                    span,
+                };
+                if let Some(crate::value::Value::Int(ci)) = self.comptime_eval_value(&call) {
+                    self.comptime_span_ints.insert((span.start, span.end), ci.v);
                 }
                 self.arena.t_usize()
             }
@@ -71,6 +69,54 @@ impl crate::check::Checker<'_> {
             "@TypeOf" => {
                 self.synth_all(args);
                 self.arena.t_type()
+            }
+            // `@Vector(N, T)` -> a vector *type* (the value is a `type`). `N` must
+            // be comptime-known and `T` numeric (spec §02). A non-comptime length
+            // is diagnosed here rather than silently deferring to a `deferred`
+            // type the backend cannot lay out.
+            "@Vector" => {
+                self.synth_all(args);
+                if let Some(n_arg) = args.first() {
+                    if self
+                        .comptime_eval_value(n_arg)
+                        .and_then(|v| v.as_int())
+                        .is_none()
+                    {
+                        self.error(span, "`@Vector` length must be comptime-known");
+                        return self.arena.t_error();
+                    }
+                }
+                self.arena.t_type()
+            }
+            // `@splat(value)` -> a vector broadcast. Like `@intCast`, the result
+            // type is supplied by context (the expected `@Vector`), so without an
+            // expectation it synths to Deferred.
+            "@splat" => {
+                self.synth_all(args);
+                self.arena.t_deferred()
+            }
+            // `@reduce(.Op, vec)` -> the vector's element type. The second operand
+            // must be a `@Vector`; a scalar (or any non-vector) is a diagnostic.
+            "@reduce" => {
+                if args.len() == 2 {
+                    let vt = self.synth(&args[1]);
+                    self.synth(&args[0]);
+                    if let Type::Vector { elem, .. } = self.arena.get(vt) {
+                        return *elem;
+                    }
+                    if !self.arena.is_bottom(vt) {
+                        self.error(
+                            span,
+                            format!(
+                                "`@reduce` expects a `@Vector` operand, found `{}`",
+                                self.arena.fmt(vt)
+                            ),
+                        );
+                        return self.arena.t_error();
+                    }
+                }
+                self.synth_all(args);
+                self.arena.t_deferred()
             }
             // Casts: permissive; their result type is whatever the context wants,
             // so without an expectation they synth to Deferred (the `check`

@@ -651,6 +651,13 @@ impl Parser {
                     _ => self.parse_inline_loop(Some(label), true),
                 }
             }
+            // `packed struct {...}` — `packed` is a contextual qualifier (not a
+            // reserved keyword), recognized here only directly before `struct`.
+            TokenKind::Ident
+                if self.cur().text == "packed" && self.peek_kind(1) == TokenKind::KwStruct =>
+            {
+                Expr::Container(Box::new(self.parse_container()))
+            }
             TokenKind::Ident | TokenKind::EscapedIdent => {
                 let name = self.cur().text.clone();
                 self.bump();

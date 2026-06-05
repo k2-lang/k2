@@ -594,6 +594,13 @@ impl crate::check::Checker<'_> {
             return self.bottom_of(lt, rt);
         }
 
+        // Element-wise vector arithmetic/compare (spec §02): both operands must be
+        // the SAME `@Vector(N, T)`. Arithmetic/bitwise yield that vector;
+        // comparisons yield `@Vector(N, bool)`.
+        if matches!(self.arena.get(lt), Type::Vector { .. }) {
+            return self.vector_binary_result(op, lt, rt, span);
+        }
+
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 self.arith_result(op, lt, rt, span)
@@ -712,6 +719,49 @@ impl crate::check::Checker<'_> {
             }
         }
         false
+    }
+
+    /// The result type of an element-wise vector binary op (spec §02). Both sides
+    /// must be the same `@Vector(N, T)`. Arithmetic/bitwise (`+ - * / % & | ^`)
+    /// yield the same vector; comparisons (`== != < <= > >=`) yield
+    /// `@Vector(N, bool)`. A mismatched operand type is a diagnostic.
+    fn vector_binary_result(&mut self, op: BinOp, lt: TypeId, rt: TypeId, span: Span) -> TypeId {
+        if !self.arena.same(lt, rt) {
+            self.error(
+                span,
+                format!(
+                    "vector operator requires two operands of the same vector type, found `{}` and `{}`",
+                    self.arena.fmt(lt),
+                    self.arena.fmt(rt)
+                ),
+            );
+            return self.arena.t_error();
+        }
+        match op {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr => lt,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                if let Type::Vector { len, .. } = self.arena.get(lt) {
+                    let len = *len;
+                    let bool_t = self.arena.t_bool();
+                    self.arena.vector(len, bool_t)
+                } else {
+                    self.arena.t_bool()
+                }
+            }
+            _ => {
+                self.error(span, "unsupported operator on vector operands");
+                self.arena.t_error()
+            }
+        }
     }
 
     /// Arithmetic result type: both operands must be the same numeric type after

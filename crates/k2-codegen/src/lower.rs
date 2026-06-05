@@ -445,6 +445,19 @@ impl<'p> FnLower<'p> {
             self.asm.mov_ri(dst, 0);
             return Ok(());
         }
+        // A trailing packed-struct FIELD: the field's bits live inside the
+        // struct's backing integer, reached by shift+mask rather than a byte
+        // load. Load the whole backing integer from the struct's address, then
+        // extract `(off, width)` and sign-extend signed fields (spec §02).
+        if let Some((
+            Proj::Field {
+                packed: Some(pf), ..
+            },
+            prefix,
+        )) = place.proj.split_last()
+        {
+            return self.load_packed_field(place.base, prefix, *pf, dst);
+        }
         // A trailing `SliceMeta` over an ARRAY base is a value, not a memory load:
         // `.len` is the constant element count, `.ptr` is the array's address.
         if let Some((Proj::SliceMeta { which, .. }, prefix)) = place.proj.split_last() {
@@ -483,6 +496,121 @@ impl<'p> FnLower<'p> {
         self.place_addr(place, ADDR)?;
         self.load_sized(dst, ADDR, 0, elem_ty);
         Ok(())
+    }
+
+    /// Loads a packed-struct bit-field into `dst` (spec §02). The backing integer
+    /// of the struct (located at `base + prefix`) is loaded whole, then the field
+    /// at `[off, off+width)` is extracted: unsigned fields by `shr off; and mask`,
+    /// signed fields by the `shl (64-off-w); sar (64-w)` sign-extension trick.
+    ///
+    /// v0.21 supports a backing integer up to 64 bits and a field wholly within
+    /// the low 64 bits; a field straddling bit 64 (in a 65..128-bit backing) is
+    /// cleanly refused rather than miscompiled.
+    fn load_packed_field(
+        &mut self,
+        base: k2_mir::LocalId,
+        prefix: &[Proj],
+        pf: k2_types::PackedField,
+        dst: Gpr,
+    ) -> Result<(), CodegenError> {
+        let off = pf.off;
+        let width = pf.width;
+        if width == 0 || width > 64 || off + width > 64 {
+            return Err(self
+                .unsup("packed bit-field load wider than 64 bits or straddling the 64-bit limb"));
+        }
+        // Address of the struct backing integer -> dst; load the whole low limb.
+        let struct_place = Place {
+            base,
+            proj: prefix.to_vec(),
+        };
+        self.place_addr_general(&struct_place, dst)?;
+        self.asm.mov_load_mem(dst, dst, 0);
+        if pf.signed {
+            // Sign-extend: position the field at the top, then arithmetic-shift
+            // back so the high bits replicate the field's sign bit.
+            let top = (64 - off - width) as u8;
+            if top != 0 {
+                self.asm.shl_ri(dst, top);
+            }
+            self.asm.sar_ri(dst, (64 - width) as u8);
+        } else {
+            if off != 0 {
+                self.asm.shr_ri(dst, off as u8);
+            }
+            if width < 64 {
+                // Mask to the field width. A ≤32-bit mask fits the `and_ri` imm32;
+                // a 33..63-bit mask needs a 64-bit immediate via a scratch reg.
+                let mask = (1u128 << width) - 1;
+                self.mask_to(dst, mask);
+            }
+        }
+        Ok(())
+    }
+
+    /// Masks `dst` to the low bits given by `mask` (a contiguous low-bit mask).
+    /// Uses the imm32 `and` for small masks; a 64-bit-immediate `and` via a
+    /// scratch register for wider ones.
+    fn mask_to(&mut self, dst: Gpr, mask: u128) {
+        if mask <= i32::MAX as u128 {
+            self.asm.and_ri(dst, mask as i32);
+        } else {
+            // Load the 64-bit mask into the index scratch, then `and`.
+            self.asm.mov_ri(IDX_SCRATCH, mask as u64 as i64);
+            self.asm.and_rr(dst, IDX_SCRATCH);
+        }
+    }
+
+    /// Stores `src` (the field value, low `width` bits significant) into a packed
+    /// bit-field at `[off, off+width)` of the struct backing integer located at
+    /// `base + prefix`, by read-modify-write. The same 64-bit-backing/non-
+    /// straddling constraint as [`Self::load_packed_field`] applies.
+    fn store_packed_field(
+        &mut self,
+        base: k2_mir::LocalId,
+        prefix: &[Proj],
+        pf: k2_types::PackedField,
+        src: Gpr,
+    ) -> Result<(), CodegenError> {
+        let off = pf.off;
+        let width = pf.width;
+        if width == 0 || width > 64 || off + width > 64 {
+            return Err(self
+                .unsup("packed bit-field store wider than 64 bits or straddling the 64-bit limb"));
+        }
+        let field_mask = if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        let shifted_mask = field_mask << off;
+        // The struct's address -> ADDR (kept across the RMW). `src` must survive,
+        // so it must not be ADDR/IDX_SCRATCH; the caller passes a value reg.
+        let struct_place = Place {
+            base,
+            proj: prefix.to_vec(),
+        };
+        self.place_addr_general(&struct_place, ADDR)?;
+        // value-bits = (src & field_mask) << off  -> src
+        self.mask_to(src, field_mask);
+        if off != 0 {
+            self.asm.shl_ri(src, off as u8);
+        }
+        // old = load [ADDR]; old &= !shifted_mask; old |= src; store.
+        let old = Gpr::Rcx;
+        self.asm.mov_load_mem(old, ADDR, 0);
+        self.mask_to_clear(old, shifted_mask);
+        self.asm.or_rr(old, src);
+        self.asm.mov_store_mem(ADDR, 0, old);
+        Ok(())
+    }
+
+    /// Clears the bits of `dst` covered by `mask` (`dst &= !mask`).
+    fn mask_to_clear(&mut self, dst: Gpr, mask: u128) {
+        let inv = !mask;
+        // `!mask` is wide; load it into a scratch and `and`.
+        self.asm.mov_ri(IDX_SCRATCH, inv as u64 as i64);
+        self.asm.and_rr(dst, IDX_SCRATCH);
     }
 
     /// The type a place's base + a projection prefix yields (no trailing proj).
@@ -688,8 +816,18 @@ impl<'p> FnLower<'p> {
         let mut saw_field = false;
         for proj in projs {
             match proj {
-                Proj::Field { index, ty } => {
+                Proj::Field { index, ty, packed } => {
                     saw_field = true;
+                    if packed.is_some() {
+                        // A packed-struct field is NOT byte-addressable: its value
+                        // lives inside the struct's backing integer and is reached
+                        // by shift+mask, which `place_addr` cannot express. The
+                        // scalar load/store paths intercept a trailing packed field
+                        // before calling `place_addr`, so reaching here means the
+                        // packed field appeared mid-chain (e.g. `&p.field`), which
+                        // the v0.21 native backend does not support.
+                        return Err(self.unsup("address of / through a packed-struct field"));
+                    }
                     let offs = layout::field_offsets(&self.prog.arena, cur_ty);
                     let off = offs.get(*index as usize).copied().unwrap_or(0);
                     if off != 0 {
@@ -852,6 +990,23 @@ impl<'p> FnLower<'p> {
         rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
         let val_ty = self.place_type(place);
+        // A store to a trailing packed-struct bit-field: compute the field value
+        // into a scratch register, then read-modify-write the struct's backing
+        // integer (spec §02). Intercepted before the byte-store paths since a
+        // packed field has no byte address.
+        if let Some((
+            Proj::Field {
+                packed: Some(pf), ..
+            },
+            prefix,
+        )) = place.proj.split_last()
+        {
+            // Evaluate the field value into a value register that survives the
+            // address computation (RAX), then RMW.
+            self.eval_scalar_rvalue_into_rax(rvalue, val_ty)?;
+            self.asm.mov_rr(Gpr::Rdx, Gpr::Rax);
+            return self.store_packed_field(place.base, prefix, *pf, Gpr::Rdx);
+        }
         if frame::is_memory_aggregate(&self.prog.arena, val_ty) {
             // Aggregate store: materialize the rvalue's address, memcpy to dest.
             return self.store_aggregate_rvalue_to_place(place, rvalue, val_ty, rodata);
@@ -1692,6 +1847,27 @@ impl<'p> FnLower<'p> {
         ty: TypeId,
         rodata: &mut RoData,
     ) -> Result<(), CodegenError> {
+        // Float-element `@Vector` lowering is deferred on native in v0.21: a
+        // 32-bit float lane needs a single-precision (`movss`) store, which the
+        // backend models as an 8-byte `movsd` — correct for a scalar f64 but
+        // corrupting for packed f32 lanes. Refuse cleanly (the VM computes float
+        // vectors correctly); integer vectors are fully supported (spec §02).
+        if let Type::Vector { elem, .. } = self.prog.arena.get(ty) {
+            if self.is_float(*elem) {
+                return Err(self.unsup("float-element @Vector on the native backend"));
+            }
+        }
+        // A `packed struct` literal: the struct is a single backing integer.
+        // Zero the home, then for each field OR its `(value & mask) << off` into
+        // the backing integer (spec §02). LSB-first packing matches the VM's
+        // per-field values and the little-endian byte image.
+        if matches!(kind, AggKind::Struct) {
+            if let Type::Struct(id) = self.prog.arena.get(ty) {
+                if self.prog.arena.structs[id.0 as usize].is_packed() {
+                    return self.build_packed_aggregate(home, fields, ty);
+                }
+            }
+        }
         // When the declared type is not layoutable (a `deferred` tuple, or an
         // inferred-length `[_]T` array), compute a synthetic packed layout. For an
         // array every field has the array's element type — a string-const field's
@@ -1743,6 +1919,59 @@ impl<'p> FnLower<'p> {
         Ok(())
     }
 
+    /// Builds a `packed struct` literal into its `home`: accumulate each field's
+    /// `(value & mask) << off` into a backing integer register, then store it to
+    /// the home as one ≤64-bit limb. A backing wider than 64 bits is cleanly
+    /// refused (v0.21 supports the common ≤64-bit packed structs natively).
+    fn build_packed_aggregate(
+        &mut self,
+        home: i32,
+        fields: &[Operand],
+        ty: TypeId,
+    ) -> Result<(), CodegenError> {
+        let size = self.layout(ty).size;
+        if size > 8 {
+            return Err(self.unsup("packed struct literal wider than 64 bits"));
+        }
+        let Type::Struct(id) = self.prog.arena.get(ty) else {
+            return Err(self.unsup("packed aggregate of non-struct"));
+        };
+        let info = self.prog.arena.structs[id.0 as usize].clone();
+        // Accumulate into RDX (kept across each field's value eval in RAX).
+        self.asm.mov_ri(Gpr::Rdx, 0);
+        for (i, f) in fields.iter().enumerate() {
+            let Some(field) = info.fields.get(i) else {
+                continue;
+            };
+            let (Some(off), Some(width)) = (field.bit_offset, field.bit_width) else {
+                continue;
+            };
+            if width == 0 {
+                continue;
+            }
+            // value -> RAX, normalized to the field type.
+            self.eval_scalar_rvalue_into_rax(&Rvalue::Use(f.clone()), field.ty)?;
+            let mask = if width >= 64 {
+                u64::MAX as u128
+            } else {
+                (1u128 << width) - 1
+            };
+            self.mask_to(Gpr::Rax, mask);
+            if off != 0 {
+                self.asm.shl_ri(Gpr::Rax, off as u8);
+            }
+            self.asm.or_rr(Gpr::Rdx, Gpr::Rax);
+        }
+        // Store the backing integer (one limb, width = struct size).
+        match size {
+            1 => self.asm.mov_store8_mem(Gpr::Rbp, home, Gpr::Rdx),
+            2 => self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rdx),
+            4 => self.asm.mov_store32_mem(Gpr::Rbp, home, Gpr::Rdx),
+            _ => self.asm.mov_store_mem(Gpr::Rbp, home, Gpr::Rdx),
+        }
+        Ok(())
+    }
+
     /// The byte offset of each field/element of an aggregate.
     fn aggregate_field_offsets(&self, kind: AggKind, n: usize, ty: TypeId) -> Vec<u64> {
         match kind {
@@ -1781,7 +2010,11 @@ impl<'p> FnLower<'p> {
                 ty
             }
             AggKind::Array => match self.prog.arena.get(ty) {
-                Type::Array { elem, .. } => *elem,
+                // A `@Vector(N, T)` literal lowers as an array aggregate, so each
+                // lane's field type is the vector's element type — typing a bool
+                // lane as 1-byte `bool` (not the whole vector) so its store width
+                // and stride are correct.
+                Type::Array { elem, .. } | Type::Vector { elem, .. } => *elem,
                 _ => ty,
             },
             AggKind::Tuple => {
@@ -4141,8 +4374,13 @@ impl<'p> FnLower<'p> {
                     // 128-bit decimal (u128/i128).
                     self.render_decimal_128(h + foff as i32, signed)
                 } else {
-                    // 64-bit decimal: load the value (sign/zero-extended) into RAX.
+                    // 64-bit decimal: load the value into RAX, then normalize to the
+                    // field's width/signedness. `load_sized` zero-extends a *sub-byte*
+                    // width via `movzx8`, which would drop the sign of a signed
+                    // bit-field (`i4 = -3` would print `253`); `normalize` re-applies
+                    // the signed shift-pair so `i1`/`i4`/`i7` print their true value.
                     self.load_sized(Gpr::Rax, Gpr::Rbp, h + foff as i32, fty);
+                    self.normalize(Gpr::Rax, fty);
                     self.render_decimal_64(signed)
                 }
             }
@@ -4434,7 +4672,11 @@ impl<'p> FnLower<'p> {
             Operand::Const(Const::Int { ty, .. }) => Some(*ty),
             Operand::Const(Const::Float { ty, .. }) => Some(*ty),
             Operand::Const(Const::EnumVal { ty, .. }) => Some(*ty),
-            Operand::Const(Const::Bool(_)) => None,
+            // A bare boolean constant is a 1-byte `bool`. Returning `None` here
+            // (the old behavior) typed a bool-const vector lane as the whole
+            // vector type on the synthetic-layout path, giving it an 8-byte store
+            // and stride so only lane 0 survived — see `build_aggregate`.
+            Operand::Const(Const::Bool(_)) => Some(self.prog.arena.t_bool()),
             _ => None,
         }
     }

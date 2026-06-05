@@ -1246,6 +1246,248 @@ mod exec {
         assert_eq!(assert_native_eq_vm(&prog), 0);
     }
 
+    // =====================================================================
+    //  v0.21 differential corpus: packed structs + bit-fields, align(N),
+    //  @Vector/SIMD. Each asserts native stdout + exit code == the VM's.
+    // =====================================================================
+
+    #[test]
+    fn diff_packed_struct_roundtrip_and_size() {
+        // A packed struct with several bit-fields: build, read each back, mutate
+        // one, re-read, and report @sizeOf/@bitSizeOf. Native == VM (spec §02).
+        let prog = lower(&format!(
+            "const F = packed struct {{ a: u3, b: u5, c: u8 }};\n{}",
+            main_io(
+                "var f: F = .{ .a = 5, .b = 20, .c = 200 }; \
+                 try o.print(\"{d} {d} {d}\\n\", .{ f.a, f.b, f.c }); \
+                 f.b = 3; \
+                 try o.print(\"{d} {d} {d}\\n\", .{ f.a, f.b, f.c }); \
+                 try o.print(\"sz={d} bits={d}\\n\", .{ @sizeOf(F), @bitSizeOf(F) });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_packed_signed_bitfield_sign_extends() {
+        // A signed bit-field round-trips a negative value with sign-extension on
+        // read (the hard acceptance): `i4 = -3` reads back `-3`, native == VM.
+        let prog = lower(&format!(
+            "const F = packed struct {{ x: u4, y: i4, z: u8 }};\n{}",
+            main_io(
+                "var f: F = .{ .x = 9, .y = -3, .z = 200 }; \
+                 try o.print(\"{d} {d} {d}\\n\", .{ f.x, f.y, f.z }); \
+                 f.y = -1; \
+                 try o.print(\"{d}\\n\", .{ f.y });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_align_reports_and_offsets() {
+        // `align(N)` raises a field's alignment, the struct's `@alignOf`, and the
+        // field's `@offsetOf`; the over-aligned field stores/reads native == VM.
+        let prog = lower(&format!(
+            "const S = struct {{ a: u8, b: u32 align(8) }};\n{}",
+            main_io(
+                "var s: S = .{ .a = 1, .b = 7 }; s.b = 42; \
+                 try o.print(\"{d} {d} {d} {d}\\n\", \
+                   .{ @alignOf(S), @sizeOf(S), @offsetOf(S, \"b\"), s.b });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_vector_splat_add_reduce() {
+        // The @Vector acceptance: `@splat` + element-wise `+` + `@reduce(.Add)`.
+        // `3*4 + (1+2+3+4) == 22`, native == VM (spec §02).
+        let prog = lower(&main_io(
+            "const a: @Vector(4, u32) = @splat(3); \
+             const b: @Vector(4, u32) = .{ 1, 2, 3, 4 }; \
+             const c = a + b; \
+             try o.print(\"{d}\\n\", .{ @reduce(.Add, c) });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_vector_mul_minmax_bitwise_index() {
+        // Element-wise `*`, `@reduce(.Min/.Max/.Or/.And/.Xor)`, and lane indexing,
+        // all native == VM.
+        let prog = lower(&main_io(
+            "const a: @Vector(4, i32) = .{ 1, 5, 3, 2 }; \
+             const b: @Vector(4, i32) = .{ 4, 2, 6, 2 }; \
+             const m = a * b; \
+             const x: @Vector(4, u8) = .{ 240, 15, 255, 0 }; \
+             try o.print(\"{d} {d} {d} {d} {d} {d} {d}\\n\", .{ \
+                @reduce(.Add, m), @reduce(.Min, a), @reduce(.Max, a), a[2], \
+                @reduce(.Or, x), @reduce(.And, x), @reduce(.Xor, x) });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn float_vector_native_refuses_cleanly() {
+        // A float-element @Vector is deferred on native (it would need a single-
+        // precision lane store the backend does not model): codegen must REFUSE
+        // cleanly, never miscompile. The VM computes it correctly.
+        let prog = lower(&main_io(
+            "const a: @Vector(4, f32) = @splat(2.5); \
+             const b: @Vector(4, f32) = .{ 1.0, 2.0, 3.0, 4.0 }; \
+             const c = a + b; \
+             const s: f32 = @reduce(.Add, c); \
+             const i: i32 = @intFromFloat(s); \
+             try o.print(\"{d}\\n\", .{ i });",
+        ));
+        // VM computes the correct value (20); native refuses cleanly.
+        let (v_code, v_out, _v_err) = run_vm(&prog);
+        assert_eq!(v_code, 0);
+        assert_eq!(String::from_utf8_lossy(&v_out), "20\n");
+        match crate::compile_program_to_elf(&prog) {
+            Err(crate::CodegenError::Unsupported(_)) => {}
+            Err(crate::CodegenError::NoMain) => panic!("expected Unsupported, got NoMain"),
+            Ok(_) => panic!("expected a clean Unsupported refusal, but codegen succeeded"),
+        }
+    }
+
+    #[test]
+    fn diff_small_packed_struct_by_value_to_value_returning_fn() {
+        // v0.21 regression (BLOCKER): a sub-8-byte aggregate passed BY VALUE to a
+        // VALUE-returning function used to segfault native (exit 139) because the
+        // callee's stack home was sized to the aggregate's exact byte count (1
+        // byte for `packed { a: u3, b: u5 }`) while the prologue stored a full
+        // 8-byte word into it, clobbering the adjacent frame slot. The home is now
+        // padded to 8 bytes so the word store fits — native == VM, no segfault.
+        let prog = lower(&format!(
+            "const F = packed struct {{ a: u3, b: u5 }};\n\
+             fn readA(f: F) u3 {{ return f.a; }}\n{}",
+            main_io(
+                "const f: F = .{ .a = 5, .b = 20 }; const r = readA(f); \
+                 try o.print(\"a={d}\\n\", .{r});"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_small_plain_struct_by_value_to_value_returning_fn() {
+        // The same BLOCKER is not packed-specific: a plain 2-byte
+        // `struct { a: u8, b: u8 }` by value to a `u8`-returning fn crashed too.
+        let prog = lower(&format!(
+            "const F = struct {{ a: u8, b: u8 }};\n\
+             fn readA(f: F) u8 {{ return f.a; }}\n\
+             fn readB(f: F) u8 {{ return f.b; }}\n{}",
+            main_io(
+                "const f: F = .{ .a = 5, .b = 20 }; \
+                 try o.print(\"{d} {d}\\n\", .{ readA(f), readB(f) });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_packed_struct_bitcast_to_integer() {
+        // v0.21 regression (MAJOR): `@bitCast(packed struct) -> backing integer`.
+        // The VM stores a packed struct as per-field values (no backing int), so
+        // its `@bitCast` used to render `<int>` while native produced the real
+        // integer. The VM now packs via the field bit offsets/widths:
+        // 5 | (20 << 3) | (200 << 8) == 51365, native == VM. Also exercise an
+        // arithmetic and equality use of the bitcast result so a wrong "opaque"
+        // value would diverge.
+        let prog = lower(&format!(
+            "const P = packed struct {{ a: u3, b: u5, c: u8 }};\n{}",
+            main_io(
+                "const p: P = .{ .a = 5, .b = 20, .c = 200 }; \
+                 const raw: u16 = @bitCast(p); \
+                 try o.print(\"{d} {d} {}\\n\", .{ raw, raw + 1, raw == 51365 });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_vector_small_index_no_spurious_bounds_trap() {
+        // v0.21 regression (BLOCKER): indexing a `@Vector` whose total size <= 8
+        // bytes used to panic native with a spurious "index out of bounds"
+        // because the bounds check read the vector storage / adjacent stack as the
+        // "length" (a vector has no runtime `.len` field). The MIR now folds a
+        // vector's length to a comptime constant, so the check uses the true lane
+        // count — native == VM across the small-vector shapes the bug hit.
+        let prog = lower(&main_io(
+            "const a: @Vector(2, u32) = .{ 10, 20 }; \
+             const b: @Vector(8, u8) = .{ 1, 2, 3, 4, 5, 6, 7, 8 }; \
+             const c: @Vector(4, u16) = .{ 100, 200, 300, 400 }; \
+             try o.print(\"{d} {d} {d} {d} {d}\\n\", \
+               .{ a[0], a[1], b[7], c[1], c[3] });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_bool_vector_literal_all_lanes_round_trip() {
+        // v0.21 regression (BLOCKER): a bool-vector literal with boolean CONSTANT
+        // lanes (`.{ true, true, ... }`) stored only lane 0 correctly on native
+        // (lanes 1..N read back `false`), because the codegen layout helpers had
+        // no `@Vector` arm and a bool-const lane was typed as the whole vector,
+        // giving it an 8-byte store/stride. Vectors are now laid out like arrays
+        // and bool-const lanes store at the 1-byte stride: `@reduce(.And, ...)`
+        // over an all-true literal is `true` on both backends, and a per-lane
+        // compare against `@splat(true)` matches all lanes.
+        let prog = lower(&main_io(
+            "const a: @Vector(4, bool) = .{ true, true, true, true }; \
+             const b: @Vector(4, bool) = @splat(true); \
+             const eq = a == b; \
+             const all_set: bool = @reduce(.And, a); \
+             const lanes_match: bool = @reduce(.And, eq); \
+             try o.print(\"{} {}\\n\", .{ all_set, lanes_match });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_reduce_bool_vector_formats_as_bool() {
+        // v0.21 regression (MAJOR): `@reduce(.And/.Or/.Xor, @Vector(N, bool))`
+        // declares a `bool` result, but the VM's bitwise fold produced an int
+        // value, so `{}` printed `1`/`0` instead of `true`/`false` while native
+        // (which uses a 1-byte bool temp) printed `true`/`false`. The VM now
+        // carries a `Value::Bool` for a bitwise op on two bools — native == VM.
+        let prog = lower(&main_io(
+            "const t: @Vector(4, bool) = @splat(true); \
+             const f: @Vector(4, bool) = @splat(false); \
+             const x: @Vector(4, bool) = .{ true, false, true, true }; \
+             const r_and: bool = @reduce(.And, t); \
+             const r_or: bool = @reduce(.Or, f); \
+             const r_xor: bool = @reduce(.Xor, x); \
+             try o.print(\"{} {} {}\\n\", .{ r_and, r_or, r_xor });",
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
+    #[test]
+    fn diff_vector_type_alias_layout_math_index() {
+        // v0.21 regression (BLOCKER): aliasing a vector type through a `const`
+        // (`const V = @Vector(N, T); ... a: V`) was broken because `@Vector` was
+        // not in the comptime-fold whitelist, so the alias had no denoted type and
+        // every use (index / arithmetic / `@sizeOf`) diverged or crashed the VM.
+        // `@Vector` is now whitelisted (verified already-fixed in-tree); this test
+        // pins all three manifestations: indexing, `a + @splat`/`@reduce`, and
+        // `@sizeOf`/`@alignOf`, all native == VM through the alias.
+        let prog = lower(&format!(
+            "const V = @Vector(4, i32);\n\
+             const W = @Vector(8, u16);\n{}",
+            main_io(
+                "const a: V = .{ 1, 2, 3, 4 }; \
+                 const b: V = @splat(10); \
+                 const c = a + b; \
+                 try o.print(\"{d} {d} {d} {d}\\n\", \
+                   .{ a[0], @reduce(.Add, c), @sizeOf(W), @alignOf(W) });"
+            )
+        ));
+        assert_eq!(assert_native_eq_vm(&prog), 0);
+    }
+
     #[test]
     fn diff_nested_struct_projected_store() {
         let prog = lower(&format!(

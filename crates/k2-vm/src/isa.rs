@@ -272,6 +272,38 @@ pub enum Instr {
         /// `true` if the target type is a float (drives int<->float casts).
         to_float: bool,
     },
+    /// `@bitCast` of a **packed struct** into its backing integer:
+    /// `dst = OR_i ((a.field[i] & mask(width_i)) << off_i) : to`. The native
+    /// backend stores a packed struct as one little-endian integer, so a bitcast
+    /// to that integer is exactly this LSB-first bit-packing of the per-field
+    /// values; the VM (which stores a packed struct as a `Value::Struct` of
+    /// per-field values) reproduces it here so packed-struct `@bitCast` matches
+    /// native (spec §02). Compiled from a [`super::Rvalue::Cast`] whose *source*
+    /// type is a packed struct (see `compile.rs`).
+    PackStruct {
+        /// Destination register (the backing integer).
+        dst: Reg,
+        /// Source register (the packed-struct `Value::Struct`).
+        a: Reg,
+        /// `(bit_offset, bit_width)` of each field, in declaration order.
+        fields: std::rc::Rc<Vec<(u32, u32)>>,
+        /// The backing-integer representation (width/signedness of the target).
+        to: IntRepr,
+    },
+    /// `@bitCast` of a backing integer into a **packed struct**: the inverse of
+    /// [`Instr::PackStruct`]. `dst.field[i] = extract(a, off_i, width_i)` with
+    /// sign-extension for a signed field, mirroring the native
+    /// `load_packed_field` shift+mask (spec §02). Compiled from a
+    /// [`super::Rvalue::Cast`] whose *target* type is a packed struct.
+    UnpackStruct {
+        /// Destination register (the packed-struct `Value::Struct`).
+        dst: Reg,
+        /// Source register (the backing integer).
+        a: Reg,
+        /// `(bit_offset, bit_width, signed)` and the field's [`IntRepr`] for each
+        /// field, in declaration order.
+        fields: std::rc::Rc<Vec<(u32, u32, IntRepr)>>,
+    },
     /// Unconditional jump to an instruction offset.
     Jump { target: usize },
     /// Branch on a boolean register to one of two instruction offsets.

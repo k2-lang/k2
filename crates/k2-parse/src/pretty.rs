@@ -981,10 +981,16 @@ impl Printer {
     fn container(&mut self, depth: usize, c: &Container) {
         self.open(depth, "container");
         match &c.kind {
-            ContainerKind::Struct { is_extern } => {
+            ContainerKind::Struct {
+                is_extern,
+                is_packed,
+            } => {
                 self.word("struct");
                 if *is_extern {
                     self.flag(":extern");
+                }
+                if *is_packed {
+                    self.flag(":packed");
                 }
                 self.out.push('\n');
             }

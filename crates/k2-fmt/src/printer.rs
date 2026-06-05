@@ -2371,9 +2371,14 @@ fn assign_op_str(op: k2_syntax::AssignOp) -> &'static str {
 /// `enum(u8)`, `union(enum)`, `extern struct`).
 fn container_keyword(kind: &ContainerKind, p: &Printer) -> String {
     match kind {
-        ContainerKind::Struct { is_extern } => {
+        ContainerKind::Struct {
+            is_extern,
+            is_packed,
+        } => {
             if *is_extern {
                 "extern struct".into()
+            } else if *is_packed {
+                "packed struct".into()
             } else {
                 "struct".into()
             }

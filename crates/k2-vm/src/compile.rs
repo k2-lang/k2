@@ -11,8 +11,8 @@
 //! `BlockId`. The second patches every such reference to the recorded offset.
 
 use k2_mir::{
-    AggKind, BuildMode, Const, ConstData, IntrinsicPath, IntrinsicRoot, MirFunction, MirProgram,
-    Operand, Place, Proj, Rvalue, Statement, Terminator,
+    AggKind, BuildMode, CastKind, Const, ConstData, IntrinsicPath, IntrinsicRoot, MirFunction,
+    MirProgram, Operand, Place, Proj, Rvalue, Statement, Terminator,
 };
 use k2_types::{ArrayLen, IntBits, Type, TypeArena, TypeId};
 
@@ -384,6 +384,19 @@ impl<'p> FnCompiler<'p> {
                 });
             }
             Rvalue::Cast { kind, operand, ty } => {
+                // A `@bitCast` involving a packed struct must pack/unpack via the
+                // field bit offsets/widths, because the VM stores a packed struct
+                // as a `Value::Struct` of per-field values (no backing integer),
+                // whereas native stores it as one little-endian integer. Detect
+                // that here (both the source and target types are known) and emit
+                // the dedicated pack/unpack instruction so the VM matches native.
+                if matches!(kind, CastKind::PtrReinterpret) {
+                    let src_ty = self.operand_type(operand);
+                    if let Some(packed) = self.try_packed_bitcast(dst, operand, src_ty, *ty) {
+                        self.emit(packed);
+                        return;
+                    }
+                }
                 let a = self.operand_to_reg(operand, self.op_scratch(0));
                 let (to, to_float) = match self.prog.arena.get(*ty) {
                     Type::Float { .. } => (IntRepr::COMPTIME, true),
@@ -487,6 +500,116 @@ impl<'p> FnCompiler<'p> {
             }
             _ => false,
         }
+    }
+
+    /// The MIR type of an operand: a copy walks its projection chain from the
+    /// source local's declared type; a constant carries its own type. Returns
+    /// `None` for a constant whose type is not recoverable (only used to detect
+    /// a packed-struct `@bitCast`, where the operand is always a typed place).
+    fn operand_type(&self, op: &Operand) -> Option<TypeId> {
+        match op {
+            Operand::Copy(p) => {
+                let mut ty = self.func.locals[p.base.index()].ty;
+                for proj in &p.proj {
+                    ty = match proj {
+                        Proj::Deref => match self.prog.arena.get(ty) {
+                            Type::Pointer { pointee, .. } => *pointee,
+                            _ => ty,
+                        },
+                        Proj::Field { ty: fty, .. } => *fty,
+                        Proj::Index { ty: ety, .. } => *ety,
+                        Proj::SliceMeta { ty: mty, .. } => *mty,
+                        Proj::Payload { ty: pty } => *pty,
+                    };
+                }
+                Some(ty)
+            }
+            Operand::Const(Const::Int { ty, .. })
+            | Operand::Const(Const::Float { ty, .. })
+            | Operand::Const(Const::EnumVal { ty, .. }) => Some(*ty),
+            _ => None,
+        }
+    }
+
+    /// If a `PtrReinterpret` (`@bitCast`) has a **packed struct** as its source or
+    /// target type, build the dedicated pack/unpack instruction so the VM matches
+    /// the native backend's single-backing-integer representation. Returns `None`
+    /// for an ordinary (non-packed) bitcast, which the generic `Cast` path
+    /// handles. A packed↔packed bitcast (rare) is left to the generic path.
+    fn try_packed_bitcast(
+        &mut self,
+        dst: Reg,
+        operand: &Operand,
+        src_ty: Option<TypeId>,
+        dst_ty: TypeId,
+    ) -> Option<Instr> {
+        let src_packed = src_ty.is_some_and(|t| self.is_packed_struct(t));
+        let dst_packed = self.is_packed_struct(dst_ty);
+        if src_packed && !dst_packed {
+            // packed struct -> backing integer: pack the per-field values.
+            let fields = self.packed_field_offsets(src_ty.unwrap());
+            let a = self.operand_to_reg(operand, self.op_scratch(0));
+            return Some(Instr::PackStruct {
+                dst,
+                a,
+                fields: std::rc::Rc::new(fields),
+                to: int_repr_of(&self.prog.arena, dst_ty),
+            });
+        }
+        if dst_packed && !src_packed {
+            // backing integer -> packed struct: extract each field's bits.
+            let fields = self.packed_field_reprs(dst_ty);
+            let a = self.operand_to_reg(operand, self.op_scratch(0));
+            return Some(Instr::UnpackStruct {
+                dst,
+                a,
+                fields: std::rc::Rc::new(fields),
+            });
+        }
+        None
+    }
+
+    /// `true` if `ty` is a `packed struct`.
+    fn is_packed_struct(&self, ty: TypeId) -> bool {
+        if let Type::Struct(id) = self.prog.arena.get(ty) {
+            return self.prog.arena.structs[id.0 as usize].is_packed();
+        }
+        false
+    }
+
+    /// The `(bit_offset, bit_width)` of each packed-struct field, in declaration
+    /// order. A zero-width or unfilled field contributes `(0, 0)` (an all-zero
+    /// mask) so the corresponding field-value slot is simply skipped on pack.
+    fn packed_field_offsets(&self, ty: TypeId) -> Vec<(u32, u32)> {
+        let Type::Struct(id) = self.prog.arena.get(ty) else {
+            return Vec::new();
+        };
+        self.prog.arena.structs[id.0 as usize]
+            .fields
+            .iter()
+            .map(|f| (f.bit_offset.unwrap_or(0), f.bit_width.unwrap_or(0)))
+            .collect()
+    }
+
+    /// The `(bit_offset, bit_width, field_repr)` of each packed-struct field. The
+    /// repr carries the field's signedness/width so unpack can re-repr (and
+    /// sign-extend) each extracted value exactly as the native `load_packed_field`
+    /// shift+mask does.
+    fn packed_field_reprs(&self, ty: TypeId) -> Vec<(u32, u32, IntRepr)> {
+        let Type::Struct(id) = self.prog.arena.get(ty) else {
+            return Vec::new();
+        };
+        self.prog.arena.structs[id.0 as usize]
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.bit_offset.unwrap_or(0),
+                    f.bit_width.unwrap_or(0),
+                    int_repr_of(&self.prog.arena, f.ty),
+                )
+            })
+            .collect()
     }
 
     /// Lowers a list of operands into a fresh window of scratch registers,

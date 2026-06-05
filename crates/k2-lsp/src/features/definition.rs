@@ -59,7 +59,7 @@ fn member_def_span(analysis: &Analysis, member_span: Span) -> Option<Span> {
     let member = typed.members.get(&(member_span.start, member_span.end))?;
     match *member {
         MemberRes::Decl(def_id) => Some(resolved.defs[def_id.index()].span),
-        MemberRes::Field(idx) => {
+        MemberRes::Field(idx) | MemberRes::PackedField(idx, _) => {
             let agg = base_aggregate(analysis, member_span)?;
             field_span(typed, agg, idx)
         }

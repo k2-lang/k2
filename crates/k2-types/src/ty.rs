@@ -147,6 +147,10 @@ pub enum Type {
     Slice { is_const: bool, elem: TypeId },
     /// `[N]T` — array (`[_]T` yields `len == Inferred`).
     Array { len: ArrayLen, elem: TypeId },
+    /// `@Vector(N, T)` — a fixed-length SIMD vector of `N` numeric elements
+    /// (spec §02). `elem` must be an integer/float/bool; `len` is comptime-known.
+    /// Laid out as `N` contiguous elements, alignment a power of two capped at 16.
+    Vector { len: u32, elem: TypeId },
 
     // ---- Nominal aggregates --------------------------------------------
     /// A `struct {...}` type (nominal; identified by its declaring node).
@@ -177,6 +181,26 @@ pub enum Type {
     Error,
 }
 
+/// How a `struct`'s fields are laid out in memory.
+///
+/// [`StructLayout::Auto`] is the default field-ordered layout with natural
+/// per-field alignment and padding. [`StructLayout::Extern`] is the C-ABI
+/// `extern struct` layout (currently identical to `Auto`, but a distinct flag so
+/// FFI-representability checks can require it). [`StructLayout::Packed`] is a
+/// gap-free, least-significant-bit-first bit packing into a single backing
+/// unsigned integer (spec §02): each field occupies exactly its *bit width* and
+/// `@sizeOf`/`@bitSizeOf` reflect the packed total (see
+/// [`reflect::layout_depth`](crate::reflect)).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StructLayout {
+    /// The default: declaration-ordered fields with natural alignment/padding.
+    Auto,
+    /// `extern struct {...}` — the stable C-ABI layout.
+    Extern,
+    /// `packed struct {...}` — LSB-first gap-free bit packing.
+    Packed,
+}
+
 /// One field of a [`StructInfo`].
 #[derive(Clone, Debug)]
 pub struct FieldInfo {
@@ -188,6 +212,16 @@ pub struct FieldInfo {
     pub has_default: bool,
     /// `true` for a `comptime` struct field.
     pub is_comptime: bool,
+    /// An explicit `align(N)` clause on the field (already parsed), evaluated to
+    /// its byte count. Raises (never lowers) the field's alignment and so the
+    /// containing struct's alignment (spec §03). `None` => natural alignment.
+    pub align: Option<u64>,
+    /// For a field of a [`StructLayout::Packed`] struct: the field's first bit's
+    /// offset into the backing integer (LSB-first). `None` for a non-packed
+    /// struct's field. Filled by [`crate::check::Checker::eval_struct`].
+    pub bit_offset: Option<u32>,
+    /// For a packed-struct field: the field's exact bit width. `None` otherwise.
+    pub bit_width: Option<u32>,
     /// Source span of the field.
     pub span: Span,
 }
@@ -215,12 +249,39 @@ pub struct StructInfo {
     pub name: String,
     /// The defining span (used as the nominal identity key and for dumps).
     pub span: Span,
-    /// `true` for an `extern struct`.
-    pub is_extern: bool,
+    /// How the struct's fields are laid out (`Auto`/`Extern`/`Packed`).
+    pub layout: StructLayout,
     /// The fields in declaration (layout) order.
     pub fields: Vec<FieldInfo>,
     /// Nested const/var/fn members, by name.
     pub decls: Vec<MemberDecl>,
+}
+
+/// Maps the parser's `(is_extern, is_packed)` qualifier flags to a
+/// [`StructLayout`]. `packed` wins over `extern` (the parser already forbids
+/// `packed extern struct`, so at most one is set).
+pub fn struct_layout_of(is_extern: bool, is_packed: bool) -> StructLayout {
+    if is_packed {
+        StructLayout::Packed
+    } else if is_extern {
+        StructLayout::Extern
+    } else {
+        StructLayout::Auto
+    }
+}
+
+impl StructInfo {
+    /// `true` for an `extern struct` (the FFI-representable layout). Kept as a
+    /// helper so the ~handful of `is_extern` read sites do not churn after the
+    /// `is_extern: bool` field became the richer [`StructLayout`] enum.
+    pub fn is_extern(&self) -> bool {
+        matches!(self.layout, StructLayout::Extern)
+    }
+
+    /// `true` for a `packed struct` (LSB-first bit packing).
+    pub fn is_packed(&self) -> bool {
+        matches!(self.layout, StructLayout::Packed)
+    }
 }
 
 /// One variant of an [`EnumInfo`].
@@ -353,11 +414,29 @@ pub struct ExternInfo {
     pub varargs: bool,
 }
 
+/// The bit position, width, and signedness of a [`StructLayout::Packed`] field,
+/// resolved once so both backends do an identical shift+mask without re-deriving
+/// the layout. `off`/`width` are bit positions into the backing integer (LSB
+/// first); `signed` drives sign-extension on read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedField {
+    /// The field's first bit's offset into the backing integer (LSB-first).
+    pub off: u32,
+    /// The field's exact bit width.
+    pub width: u32,
+    /// `true` if the field's type is signed (sign-extend on read).
+    pub signed: bool,
+}
+
 /// What a previously-`DeferredMember` occurrence resolved to in the type layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberRes {
     /// A struct field at the given index.
     Field(u32),
+    /// A [`StructLayout::Packed`] struct field: its index plus the bit
+    /// descriptor so the MIR can attach it to `Proj::Field` for shift+mask
+    /// access on both backends.
+    PackedField(u32, PackedField),
     /// A nested member declaration (method/const) of the given definition.
     Decl(DefId),
     /// An enum/union variant at the given index.

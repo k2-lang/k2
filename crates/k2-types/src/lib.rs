@@ -66,7 +66,8 @@ pub use diag::{Diagnostic, Severity};
 pub use dump::{dump_signatures, dump_types};
 pub use ty::{
     ArrayLen, EnumInfo, ErrSetInfo, ErrSetRef, ExternInfo, ExternKind, FieldInfo, FnSig, IntBits,
-    MemberDecl, MemberRes, ParamInfo, StructInfo, Type, TypeId, UnionInfo,
+    MemberDecl, MemberRes, PackedField, ParamInfo, StructInfo, StructLayout, Type, TypeId,
+    UnionInfo,
 };
 
 use k2_resolve::{DefId, Resolved};

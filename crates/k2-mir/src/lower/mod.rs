@@ -1429,6 +1429,18 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                         Some(base_place.project(Proj::Field {
                             index: idx,
                             ty: fty,
+                            packed: None,
+                        }))
+                    }
+                    Some(MemberRes::PackedField(idx, pf)) => {
+                        // A `packed struct` field: carry the bit descriptor so the
+                        // VM/native do a shift+mask at the correct offset/width.
+                        let base_place = self.lower_place_autoderef(base);
+                        let fty = self.type_at(*span);
+                        Some(base_place.project(Proj::Field {
+                            index: idx,
+                            ty: fty,
+                            packed: Some(pf),
                         }))
                     }
                     Some(MemberRes::BuiltinField) => {

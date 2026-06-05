@@ -22,7 +22,7 @@ use k2_resolve::DefId;
 use k2_syntax::{Container, ContainerKind, Expr, Item, Stmt};
 
 use crate::comptime::{Diverge, Env};
-use crate::ty::{FnSig, Type, TypeId};
+use crate::ty::{struct_layout_of, FnSig, Type, TypeId};
 use crate::value::Value;
 
 /// A normalized comptime argument, used as part of an instantiation cache key.
@@ -233,9 +233,10 @@ impl crate::check::Checker<'_> {
     pub(crate) fn eval_container_comptime(&mut self, env: &mut Env, c: &Container) -> TypeId {
         let display = self.current_inst_display();
         match &c.kind {
-            ContainerKind::Struct { is_extern } => {
-                self.eval_struct_comptime(env, c, &display, *is_extern)
-            }
+            ContainerKind::Struct {
+                is_extern,
+                is_packed,
+            } => self.eval_struct_comptime(env, c, &display, *is_extern, *is_packed),
             ContainerKind::Enum { tag } => {
                 self.eval_enum_comptime(env, c, &display, tag.as_deref())
             }
@@ -256,6 +257,7 @@ impl crate::check::Checker<'_> {
         c: &Container,
         display: &str,
         is_extern: bool,
+        is_packed: bool,
     ) -> TypeId {
         let mut fields = Vec::new();
         for m in &c.members {
@@ -266,21 +268,29 @@ impl crate::check::Checker<'_> {
                         .unwrap_or_else(|_| self.arena.t_deferred()),
                     None => self.arena.t_deferred(),
                 };
+                let align = self.eval_field_align(env, f);
                 fields.push(crate::ty::FieldInfo {
                     name: f.name.clone(),
                     ty,
                     has_default: f.default.is_some(),
                     is_comptime: f.is_comptime,
+                    align,
+                    bit_offset: None,
+                    bit_width: None,
                     span: f.span,
                 });
             }
+        }
+        let layout = struct_layout_of(is_extern, is_packed);
+        if layout == crate::ty::StructLayout::Packed {
+            self.fill_packed_offsets(c.span, &mut fields);
         }
         let span = self.fresh_synthetic_span();
         let info = crate::ty::StructInfo {
             def: self.def_of(c.span),
             name: display.to_string(),
             span,
-            is_extern,
+            layout,
             fields,
             decls: Vec::new(),
         };

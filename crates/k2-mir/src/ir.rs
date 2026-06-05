@@ -32,7 +32,7 @@ use std::collections::HashMap;
 
 use k2_resolve::DefId;
 use k2_syntax::{Label, RichDiagnostic, RichSeverity, Span};
-use k2_types::{TypeArena, TypeId};
+use k2_types::{PackedField, TypeArena, TypeId};
 
 // =========================================================================
 //  Identifiers
@@ -612,6 +612,11 @@ pub enum Proj {
         index: u32,
         /// The field's type.
         ty: TypeId,
+        /// For a [`StructLayout::Packed`](k2_types::StructLayout) struct field:
+        /// its bit offset/width/signedness, so both the VM and native backends do
+        /// an identical shift+mask read/write instead of a positional/byte-offset
+        /// access. `None` for an ordinary field.
+        packed: Option<PackedField>,
     },
     /// `s[i]` — index a slice/array by an [`Operand`]. Bounds checks are emitted
     /// as separate [`Statement::Check`]s before the access, never hidden here.

@@ -130,7 +130,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "StructField".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("name", str_t, span()),
                 field("type", type_t, span()),
@@ -143,7 +143,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "EnumField".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![field("name", str_t, span()), field("value", ci_t, span())],
             decls: Vec::new(),
         });
@@ -154,7 +154,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Int".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("signedness", signedness, span()),
                 field("bits", u16_t, span()),
@@ -165,7 +165,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Float".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![field("bits", u16_t, span())],
             decls: Vec::new(),
         });
@@ -174,7 +174,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Struct".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("fields", struct_fields_slice, span()),
                 field("is_tuple", bool_t, span()),
@@ -186,7 +186,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Enum".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("tag_type", type_t, span()),
                 field("fields", enum_fields_slice, span()),
@@ -197,7 +197,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Pointer".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("size", signedness, span()),
                 field("is_const", bool_t, span()),
@@ -209,7 +209,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Child".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![field("child", type_t, span())],
             decls: Vec::new(),
         });
@@ -217,7 +217,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "Type.Array".to_string(),
             span: span(),
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields: vec![
                 field("len", usize_t, span()),
                 field("child", type_t, span()),
@@ -617,7 +617,7 @@ impl crate::check::Checker<'_> {
             def: None,
             name: "struct".to_string(),
             span,
-            is_extern: false,
+            layout: crate::ty::StructLayout::Auto,
             fields,
             decls: Vec::new(),
         });
@@ -747,8 +747,45 @@ impl crate::check::Checker<'_> {
             }),
             Type::Bool => Some(1),
             Type::Float { bits } => Some(*bits as u64),
+            // A `packed struct`'s bit size is its exact field-bit total, NOT the
+            // rounded-up byte size (spec §02): `packed struct { a:u3, b:u3, c:u3 }`
+            // is `@bitSizeOf == 9`, `@sizeOf == 2`.
+            Type::Struct(id) if self.arena.structs[id.0 as usize].is_packed() => {
+                let fields = self.arena.structs[id.0 as usize].fields.clone();
+                packed_struct_size(&self.arena, &fields).map(|(bits, _)| bits)
+            }
             _ => self.layout(tid).map(|l| l.size * 8),
         }
+    }
+
+    /// The byte offset of a named field of a struct type, honoring per-field
+    /// `align(N)` (spec §03). A packed-struct field is bit-addressable and has no
+    /// byte offset, so it is a diagnostic; an unknown field name or non-struct
+    /// type defers.
+    fn field_byte_offset(&mut self, tid: TypeId, fname: &str, span: Span) -> Result<u64, Diverge> {
+        let Type::Struct(id) = self.arena.get(tid).clone() else {
+            return Err(Diverge::NotComptime);
+        };
+        let info = &self.arena.structs[id.0 as usize];
+        if info.is_packed() {
+            self.comptime_error(
+                span,
+                "`@offsetOf` on a packed-struct field is not byte-addressable",
+            );
+            return Err(Diverge::CompileError);
+        }
+        let fields = info.fields.clone();
+        let mut offset = 0u64;
+        for f in &fields {
+            let fl = self.layout_depth(f.ty, 0).ok_or(Diverge::NotComptime)?;
+            let fa = f.align.map(|a| a.max(fl.align)).unwrap_or(fl.align).max(1);
+            offset = round_up(offset, fa);
+            if f.name == fname {
+                return Ok(offset);
+            }
+            offset += fl.size;
+        }
+        Err(Diverge::NotComptime)
     }
 
     /// Layout with a recursion-depth guard so a cyclic struct cannot overflow.
@@ -797,15 +834,40 @@ impl crate::check::Checker<'_> {
                     align: el.align,
                 })
             }
+            Type::Vector { len, elem } => {
+                // `@sizeOf(@Vector(N,T)) = round_up(N * @sizeOf(T), align)`, where
+                // `align = min(16, (N*elem).next_power_of_two())` (the XMM cap).
+                let el = self.layout_depth(elem, depth + 1)?;
+                let raw = el.size.saturating_mul(len as u64);
+                let align = raw.max(1).next_power_of_two().min(16);
+                Some(Layout {
+                    size: round_up(raw, align),
+                    align,
+                })
+            }
             Type::Struct(id) => {
-                let fields = self.arena.structs[id.0 as usize].fields.clone();
+                let info = &self.arena.structs[id.0 as usize];
+                let is_packed = info.is_packed();
+                let fields = info.fields.clone();
+                if is_packed {
+                    // A packed struct is one backing integer: size = the bit total
+                    // rounded to a natural integer width, align = size (unless a
+                    // field raises it). `@bitSizeOf` reports the exact bit total.
+                    let (_bits, size) = packed_struct_size(&self.arena, &fields)?;
+                    let field_align = fields.iter().filter_map(|f| f.align).max();
+                    let align = field_align.map(|a| a.max(size)).unwrap_or(size).max(1);
+                    return Some(Layout { size, align });
+                }
                 let mut offset = 0u64;
                 let mut max_align = 1u64;
                 for f in &fields {
                     let fl = self.layout_depth(f.ty, depth + 1)?;
-                    offset = round_up(offset, fl.align.max(1));
+                    // `align(N)` raises (never lowers) the field's alignment (spec
+                    // §03), so it bumps both the field offset and the struct align.
+                    let fa = f.align.map(|a| a.max(fl.align)).unwrap_or(fl.align).max(1);
+                    offset = round_up(offset, fa);
                     offset += fl.size;
-                    max_align = max_align.max(fl.align);
+                    max_align = max_align.max(fa);
                 }
                 Some(Layout {
                     size: round_up(offset, max_align),
@@ -989,6 +1051,33 @@ impl crate::check::Checker<'_> {
                 let t = self.reify_type(&info, span)?;
                 Ok(Value::Type(t))
             }
+            "@Vector" => {
+                // `@Vector(N, T)` -> the vector type. `N` is a comptime length and
+                // `T` a numeric element type (int/float/bool); anything else is a
+                // diagnostic rather than a malformed type (spec §02).
+                self.arg_at(name, args, 1, 2, span)?;
+                let n_arg = self.arg_at(name, args, 0, 2, span)?;
+                let n = self
+                    .eval_expr(env, n_arg)?
+                    .as_int()
+                    .ok_or(Diverge::NotComptime)?;
+                let len = u32::try_from(n).map_err(|_| {
+                    self.comptime_error(span, "`@Vector` length must fit a u32");
+                    Diverge::CompileError
+                })?;
+                let elem = self.arg_type(env, args, 1)?;
+                if !matches!(
+                    self.arena.get(elem),
+                    Type::Int { .. } | Type::Float { .. } | Type::Bool
+                ) {
+                    self.comptime_error(
+                        span,
+                        "`@Vector` element type must be an integer, float, or bool",
+                    );
+                    return Err(Diverge::CompileError);
+                }
+                Ok(Value::Type(self.arena.vector(len, elem)))
+            }
             "@TypeOf" => {
                 // The *type* of the operand expression. We synth it through the
                 // checker (which may itself be Deferred -> not comptime).
@@ -1010,6 +1099,22 @@ impl crate::check::Checker<'_> {
             "@typeName" => {
                 let t = self.arg_type(env, args, 0)?;
                 Ok(Value::Str(self.arena.fmt(t)))
+            }
+            "@offsetOf" => {
+                // `@offsetOf(T, "field")` -> the field's byte offset (honoring
+                // `align(N)`). A packed-struct field has no byte address, so it is
+                // a clean diagnostic rather than a misleading number (spec §02).
+                self.arg_at(name, args, 1, 2, span)?;
+                let t = self.arg_type(env, args, 0)?;
+                let name_arg = self.arg_at(name, args, 1, 2, span)?;
+                let fname = self.eval_expr(env, name_arg)?;
+                let fname = fname.as_str().ok_or(Diverge::NotComptime)?.to_string();
+                let off = self.field_byte_offset(t, &fname, span)?;
+                let usize_t = self.arena.t_usize();
+                Ok(Value::Int(ComptimeInt {
+                    v: off as i128,
+                    ty: usize_t,
+                }))
             }
             "@sizeOf" | "@alignOf" | "@bitSizeOf" => {
                 // Guard arity first so `@sizeOf()` is a diagnostic, not a silent
@@ -1188,8 +1293,70 @@ fn field(name: &str, ty: TypeId, span: Span) -> FieldInfo {
         ty,
         has_default: false,
         is_comptime: false,
+        align: None,
+        bit_offset: None,
+        bit_width: None,
         span,
     }
+}
+
+/// The exact bit width of a type for **packed-struct field placement** (spec
+/// §02). A bit-addressable type — an integer (its true width), `bool` (1), an
+/// `enum` (its tag's width), or a nested `packed struct` (its total bit width) —
+/// returns `Some(width)`; any other type (pointer/slice/array/`Auto` struct/
+/// float) returns `None`, which the checker turns into a "field not
+/// bit-addressable" diagnostic. This is the authority both the type checker and
+/// the codegen mirror call so packing is byte-identical on both backends.
+pub fn packed_bit_width(arena: &crate::arena::TypeArena, ty: TypeId) -> Option<u64> {
+    packed_bit_width_depth(arena, ty, 0)
+}
+
+/// Depth-guarded recursion behind [`packed_bit_width`] (a nested packed struct
+/// recurses through its fields).
+fn packed_bit_width_depth(arena: &crate::arena::TypeArena, ty: TypeId, depth: u32) -> Option<u64> {
+    if depth > 64 {
+        return None;
+    }
+    match arena.get(ty) {
+        Type::Int { bits, .. } => Some(match bits {
+            IntBits::Fixed(n) => *n as u64,
+            IntBits::Usize | IntBits::Isize => 64,
+        }),
+        Type::Bool => Some(1),
+        Type::Enum(id) => {
+            let tag = arena.enums[id.0 as usize].tag;
+            packed_bit_width_depth(arena, tag, depth + 1)
+        }
+        Type::Struct(id) => {
+            let info = &arena.structs[id.0 as usize];
+            if !info.is_packed() {
+                return None;
+            }
+            // Sum the nested packed struct's field widths.
+            let mut bits = 0u64;
+            for f in &info.fields {
+                bits += packed_bit_width_depth(arena, f.ty, depth + 1)?;
+            }
+            Some(bits)
+        }
+        _ => None,
+    }
+}
+
+/// The total bit width and the resulting byte size of a `packed struct` — the
+/// sum of its fields' bit widths, with the byte size rounded so the backing
+/// integer fits a natural width (`int_byte_size` of the bit total). Returns
+/// `None` if any field is not bit-addressable or the total exceeds 128 bits.
+fn packed_struct_size(arena: &crate::arena::TypeArena, fields: &[FieldInfo]) -> Option<(u64, u64)> {
+    let mut bits = 0u64;
+    for f in fields {
+        bits += packed_bit_width(arena, f.ty)?;
+    }
+    if bits > 128 {
+        return None;
+    }
+    let size = int_byte_size(IntBits::Fixed(bits as u16)).max(if bits == 0 { 0 } else { 1 });
+    Some((bits, size))
 }
 
 /// The byte size of an integer type, rounding sub-byte widths up to a power of

@@ -178,7 +178,9 @@ impl FnBuilder<'_, '_> {
             return;
         }
         match self.member_at(span) {
-            Some(MemberRes::Field(_)) | Some(MemberRes::BuiltinField) => {
+            Some(MemberRes::Field(_))
+            | Some(MemberRes::PackedField(..))
+            | Some(MemberRes::BuiltinField) => {
                 if let Some(p) = self.try_lower_place(&Expr::Field {
                     base: Box::new(base.clone()),
                     field: field.to_string(),
@@ -324,6 +326,16 @@ impl FnBuilder<'_, '_> {
                     ty: usize_ty,
                 }))
             }
+            // A `@Vector(N, T)` is stored inline with NO `{ptr, len}` header, so a
+            // `.len` projection over it would (on native) read the vector storage /
+            // adjacent stack as a bogus length and spuriously trap the bounds
+            // check. Its length is a comptime constant — materialize it directly,
+            // exactly like a known-length array, so the bounds check uses the true
+            // lane count on both backends (spec §02).
+            Type::Vector { len, .. } => Operand::Const(Const::Int {
+                value: *len as i128,
+                ty: usize_ty,
+            }),
             _ => Operand::Copy(place.project(Proj::SliceMeta {
                 which: SliceMeta::Len,
                 ty: usize_ty,
@@ -366,8 +378,16 @@ impl FnBuilder<'_, '_> {
             }
             _ => {
                 let ty = self.type_at(span);
-                let bin = map_binop(op);
+                // Element-wise vector arithmetic/compare (spec §02). A binary op on
+                // two `@Vector(N,T)` (or producing `@Vector(N,bool)` for a compare)
+                // is desugared here into an array aggregate of per-lane scalar ops,
+                // reusing all the existing array machinery on BOTH backends.
                 let lty = self.type_at(lhs.span());
+                if matches!(self.lo.typed.arena.get(lty), Type::Vector { .. }) {
+                    self.lower_vector_binary_into(dst, op, (lhs, rhs), ty, span);
+                    return;
+                }
+                let bin = map_binop(op);
                 let rty = self.type_at(rhs.span());
                 let l = self.lower_operand(lhs, lty);
                 let r = self.lower_operand(rhs, rty);
@@ -375,6 +395,202 @@ impl FnBuilder<'_, '_> {
                 self.assign(dst, rv, span);
             }
         }
+    }
+
+    /// Lowers an element-wise vector binary op into `dst` by building an array
+    /// aggregate whose `i`-th element is the scalar op on lane `i` of each operand
+    /// (spec §02). Vector arithmetic is per-lane WRAPPING (no overflow check), so
+    /// the scalar binary is emitted check-free. The result vector type is `res_ty`
+    /// (the same vector for arithmetic, `@Vector(N, bool)` for a comparison).
+    fn lower_vector_binary_into(
+        &mut self,
+        dst: Place,
+        op: AstBinOp,
+        operands: (&Expr, &Expr),
+        res_ty: TypeId,
+        span: Span,
+    ) {
+        let (lhs, rhs) = operands;
+        let vec_ty = self.type_at(lhs.span());
+        let Type::Vector { len, elem } = self.lo.typed.arena.get(vec_ty) else {
+            return;
+        };
+        let len = *len;
+        let elem = *elem;
+        let res_elem = match self.lo.typed.arena.get(res_ty) {
+            Type::Vector { elem, .. } => *elem,
+            _ => elem,
+        };
+        let bin = map_binop(op);
+        // Materialize both operands into temps so each lane reads a stable place.
+        let lop = self.lower_operand(lhs, vec_ty);
+        let rop = self.lower_operand(rhs, vec_ty);
+        let lt = self.materialize_operand(lop, vec_ty, span);
+        let rt = self.materialize_operand(rop, vec_ty, span);
+        let usize_ty = self.lo.typed.arena.t_usize();
+        let mut fields = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let idx = Operand::Const(Const::Int {
+                value: i as i128,
+                ty: usize_ty,
+            });
+            let li = Operand::Copy(Place::local(lt).project(Proj::Index {
+                index: idx.clone(),
+                ty: elem,
+            }));
+            let ri = Operand::Copy(Place::local(rt).project(Proj::Index {
+                index: idx,
+                ty: elem,
+            }));
+            let lane = self.new_temp(res_elem, span);
+            // Check-free per-lane op (vector arithmetic wraps).
+            self.assign(
+                Place::local(lane),
+                Rvalue::Binary {
+                    op: bin,
+                    lhs: li,
+                    rhs: ri,
+                    ty: res_elem,
+                },
+                span,
+            );
+            fields.push(Operand::local(lane));
+        }
+        self.assign(
+            dst,
+            Rvalue::Aggregate {
+                kind: AggKind::Array,
+                fields,
+                ty: res_ty,
+            },
+            span,
+        );
+    }
+
+    /// Lowers `@reduce(.Op, vec)` into `dst` (spec §02): a left fold of the lanes
+    /// with the operation. `.Add/.Mul/.And/.Or/.Xor` fold with the matching
+    /// [`BinOp`]; `.Min/.Max` fold with a per-step `lt` compare + select branch.
+    fn lower_reduce_into(&mut self, dst: Place, args: &[Expr], elem_res: TypeId, span: Span) {
+        let [op_lit, vec_e] = args else {
+            self.assign(
+                dst,
+                Rvalue::Use(Operand::Const(Const::Undef { ty: elem_res })),
+                span,
+            );
+            return;
+        };
+        let vec_ty = self.type_at(vec_e.span());
+        let Type::Vector { len, elem } = self.lo.typed.arena.get(vec_ty) else {
+            self.assign(
+                dst,
+                Rvalue::Use(Operand::Const(Const::Undef { ty: elem_res })),
+                span,
+            );
+            return;
+        };
+        let len = *len;
+        let elem = *elem;
+        let op_name = match op_lit {
+            Expr::EnumLiteral { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        let vop = self.lower_operand(vec_e, vec_ty);
+        let src = self.materialize_operand(vop, vec_ty, span);
+        let usize_ty = self.lo.typed.arena.t_usize();
+        let lane = |this: &mut Self, i: u32| {
+            let idx = Operand::Const(Const::Int {
+                value: i as i128,
+                ty: usize_ty,
+            });
+            let _ = this;
+            Operand::Copy(Place::local(src).project(Proj::Index {
+                index: idx,
+                ty: elem,
+            }))
+        };
+        if len == 0 {
+            self.assign(
+                dst,
+                Rvalue::Use(Operand::Const(Const::Undef { ty: elem_res })),
+                span,
+            );
+            return;
+        }
+        // The accumulator starts at lane 0.
+        let acc = self.new_temp(elem, span);
+        let l0 = lane(self, 0);
+        self.assign(Place::local(acc), Rvalue::Use(l0), span);
+        let fold_op = match op_name.as_str() {
+            "Add" => Some(BinOp::Add),
+            "Mul" => Some(BinOp::Mul),
+            "And" => Some(BinOp::BitAnd),
+            "Or" => Some(BinOp::BitOr),
+            "Xor" => Some(BinOp::BitXor),
+            _ => None,
+        };
+        for i in 1..len {
+            let li = lane(self, i);
+            if let Some(bin) = fold_op {
+                let next = self.new_temp(elem, span);
+                self.assign(
+                    Place::local(next),
+                    Rvalue::Binary {
+                        op: bin,
+                        lhs: Operand::local(acc),
+                        rhs: li,
+                        ty: elem,
+                    },
+                    span,
+                );
+                self.assign(Place::local(acc), Rvalue::Use(Operand::local(next)), span);
+            } else if op_name == "Min" || op_name == "Max" {
+                // acc = (lane < acc) == want_min ? lane : acc.
+                let bool_ty = self.lo.typed.arena.t_bool();
+                let cond = self.new_temp(bool_ty, span);
+                self.assign(
+                    Place::local(cond),
+                    Rvalue::Binary {
+                        op: BinOp::Lt,
+                        lhs: li.clone(),
+                        rhs: Operand::local(acc),
+                        ty: bool_ty,
+                    },
+                    span,
+                );
+                let take = self.new_block();
+                let join = self.new_block();
+                // For Min: take `lane` when lane < acc. For Max: take `lane` when
+                // !(lane < acc) i.e. lane >= acc.
+                let (then_bb, else_bb) = if op_name == "Min" {
+                    (take, join)
+                } else {
+                    (join, take)
+                };
+                self.set_term(Terminator::Branch {
+                    cond: Operand::local(cond),
+                    then_bb,
+                    else_bb,
+                });
+                self.cur = take;
+                self.assign(Place::local(acc), Rvalue::Use(li), span);
+                self.set_term(Terminator::Goto(join));
+                self.cur = join;
+            }
+        }
+        self.assign(dst, Rvalue::Use(Operand::local(acc)), span);
+    }
+
+    /// Copies an operand into a fresh temp local of `ty` and returns it, so a
+    /// per-lane index projection reads a stable addressable place.
+    fn materialize_operand(&mut self, op: Operand, ty: TypeId, span: Span) -> LocalId {
+        if let Operand::Copy(p) = &op {
+            if p.proj.is_empty() {
+                return p.base;
+            }
+        }
+        let tmp = self.new_temp(ty, span);
+        self.assign(Place::local(tmp), Rvalue::Use(op), span);
+        tmp
     }
 
     /// The effective type to drive an `&operand` (`AddrOf`) lowering. The checker
@@ -1332,6 +1548,31 @@ impl FnBuilder<'_, '_> {
     fn lower_builtin_into(&mut self, dst: Place, name: &str, args: &[Expr], span: Span) {
         let ty = self.type_at(span);
         match name {
+            // `@splat(v)`: broadcast a scalar across every lane of the expected
+            // vector. Desugars to an array aggregate of N copies (spec §02).
+            "@splat" => {
+                if let (Type::Vector { len, elem }, [v]) = (self.lo.typed.arena.get(ty), args) {
+                    let len = *len;
+                    let elem = *elem;
+                    let op = self.lower_operand(v, elem);
+                    let src = self.materialize_operand(op, elem, span);
+                    let fields = (0..len).map(|_| Operand::local(src)).collect();
+                    self.assign(
+                        dst,
+                        Rvalue::Aggregate {
+                            kind: AggKind::Array,
+                            fields,
+                            ty,
+                        },
+                        span,
+                    );
+                } else {
+                    self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
+                }
+            }
+            // `@reduce(.Op, vec)`: fold the lanes with the op into a scalar (spec
+            // §02). Desugars to a left fold of per-lane scalar ops.
+            "@reduce" => self.lower_reduce_into(dst, args, ty, span),
             "@as" => {
                 // @as(T, e): widening cast.
                 if let [_, e] = args {
@@ -1570,7 +1811,13 @@ impl FnBuilder<'_, '_> {
                 );
             }
             k2_syntax::InitBody::Tuple(elems) => {
-                let is_array = matches!(self.lo.typed.arena.get(agg_ty), Type::Array { .. });
+                // A `@Vector(N,T)` literal lowers like an array aggregate (the VM
+                // represents both as `Value::Array`; native lays both out
+                // contiguously), so a vector init reuses the array path.
+                let is_array = matches!(
+                    self.lo.typed.arena.get(agg_ty),
+                    Type::Array { .. } | Type::Vector { .. }
+                );
                 let elem_ty = self.array_elem(agg_ty);
                 let mut ops = Vec::with_capacity(elems.len());
                 for e in elems {
@@ -1598,10 +1845,12 @@ impl FnBuilder<'_, '_> {
         }
     }
 
-    /// The element type of an array/slice type (best effort).
+    /// The element type of an array/slice/vector type (best effort).
     pub(super) fn array_elem(&self, ty: TypeId) -> TypeId {
         match self.lo.typed.arena.get(ty) {
-            Type::Array { elem, .. } | Type::Slice { elem, .. } => *elem,
+            Type::Array { elem, .. } | Type::Slice { elem, .. } | Type::Vector { elem, .. } => {
+                *elem
+            }
             _ => ty,
         }
     }
@@ -1908,7 +2157,9 @@ impl FnBuilder<'_, '_> {
                 // this value; otherwise keep climbing collecting names.
                 let resolved_value = matches!(
                     self.member_at(*span),
-                    Some(MemberRes::Field(_)) | Some(MemberRes::BuiltinField)
+                    Some(MemberRes::Field(_))
+                        | Some(MemberRes::PackedField(..))
+                        | Some(MemberRes::BuiltinField)
                 );
                 if resolved_value {
                     // A concrete sub-value: materialize it as the root operand.

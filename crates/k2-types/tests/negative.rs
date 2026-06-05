@@ -797,3 +797,56 @@ fn numeric_mismatch_suggests_as_cast() {
         Some("convert explicitly with `@as(i32, …)` if a cast is intended")
     );
 }
+
+// =========================================================================
+//  v0.21: packed-struct / align(N) / @Vector negatives.
+// =========================================================================
+
+#[test]
+fn align_non_power_of_two_rejected() {
+    let t = check("const S = struct { a: u8, b: u32 align(3) };\n");
+    assert!(has_error(&t, "`align(3)` must be a positive power of two"));
+}
+
+#[test]
+fn packed_pointer_field_rejected() {
+    let t = check("const F = packed struct { a: *u8 };\n");
+    assert!(has_error(
+        &t,
+        "packed-struct field `a` must be an integer, bool, enum, or nested packed-struct type"
+    ));
+}
+
+#[test]
+fn packed_struct_over_128_bits_rejected() {
+    // 200 bits of bit-fields exceeds the 128-bit backing cap.
+    let t = check("const F = packed struct { a: u100, b: u100 };\n");
+    assert!(t.errors().any(|d| d.message.contains("128 bits")));
+}
+
+#[test]
+fn reduce_on_scalar_rejected() {
+    let t = check("fn f() void { const x: u32 = 5; const y = @reduce(.Add, x); _ = y; }\n");
+    assert!(t
+        .errors()
+        .any(|d| d.message.contains("@reduce` expects a `@Vector")));
+}
+
+#[test]
+fn runtime_vector_length_rejected() {
+    let t = check("fn f(n: u32) void { var z: @Vector(n, u32) = undefined; _ = z; }\n");
+    assert!(t.errors().any(|d| d
+        .message
+        .contains("`@Vector` length must be comptime-known")));
+}
+
+#[test]
+fn vector_mismatched_operand_rejected() {
+    let t = check(
+        "fn f() void { \
+            const a: @Vector(4, u32) = @splat(1); \
+            const b: @Vector(2, u32) = @splat(2); \
+            const c = a + b; _ = c; }\n",
+    );
+    assert!(t.errors().any(|d| d.message.contains("same vector type")));
+}

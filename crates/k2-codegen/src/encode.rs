@@ -1023,6 +1023,17 @@ impl Asm {
         self.byte(imm);
     }
 
+    /// `sar dst, imm8`: `REX.W C1 /7 ib` — arithmetic (sign-propagating) right-
+    /// shift by a constant. Used by the packed-struct bit-field sign-extension
+    /// trick (`shl (64-off-w); sar (64-w)`).
+    pub fn sar_ri(&mut self, dst: Gpr, imm: u8) {
+        self.mark(ITag::Other);
+        self.rex(true, false, false, dst.is_ext());
+        self.byte(0xC1);
+        self.modrm_rr_op(7, dst);
+        self.byte(imm);
+    }
+
     /// `sub rsp, imm32`: `REX.W 81 /5 id` (allocate stack frame).
     pub fn sub_rsp_imm(&mut self, imm: i32) {
         self.mark(ITag::Other);

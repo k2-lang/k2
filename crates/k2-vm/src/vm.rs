@@ -667,6 +667,18 @@ impl<'p> Vm<'p> {
                 self.set_cur(dst, v);
                 Ok(Flow::Next)
             }
+            Instr::PackStruct { dst, a, fields, to } => {
+                let av = self.get(a);
+                let v = self.pack_struct(&av, &fields, to)?;
+                self.set_cur(dst, v);
+                Ok(Flow::Next)
+            }
+            Instr::UnpackStruct { dst, a, fields } => {
+                let av = self.get(a);
+                let v = self.unpack_struct(&av, &fields);
+                self.set_cur(dst, v);
+                Ok(Flow::Next)
+            }
             Instr::Jump { target } => {
                 self.sched.cur_frames_mut().last_mut().unwrap().pc = target;
                 Ok(Flow::Jumped)
@@ -957,6 +969,14 @@ impl<'p> Vm<'p> {
                     Value::int(x.wrapping_rem(y), repr)
                 }
             }
+            // Bitwise `&`/`|`/`^` on two `bool` operands (e.g. the `@reduce(.And/
+            // .Or/.Xor, @Vector(N,bool))` fold) yields a `bool`, not an int — the
+            // native backend stores the fold's result in a 1-byte bool temp and so
+            // prints `true`/`false`. Carry a `Value::Bool` here so the VM formats
+            // it identically; mixed/int operands keep the integer bitwise result.
+            BinOp::BitAnd if both_bool(a, b) => Value::Bool((x & y) != 0),
+            BinOp::BitOr if both_bool(a, b) => Value::Bool((x | y) != 0),
+            BinOp::BitXor if both_bool(a, b) => Value::Bool((x ^ y) != 0),
             BinOp::BitAnd => Value::int(x & y, repr),
             BinOp::BitOr => Value::int(x | y, repr),
             BinOp::BitXor => Value::int(x ^ y, repr),
@@ -1067,6 +1087,53 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+    }
+
+    /// Packs a packed-struct `Value::Struct` into its backing integer
+    /// (`@bitCast(packed) -> int`). Each field's value is masked to its bit width
+    /// and OR'd in at its LSB-first bit offset, mirroring the native backend's
+    /// single little-endian backing integer (spec §02). A field whose width is 0
+    /// (a zero-width filler) contributes nothing.
+    fn pack_struct(&self, a: &Value, fields: &[(u32, u32)], to: IntRepr) -> Result<Value, Halt> {
+        let Value::Struct(vals) = a else {
+            return Err(self.internal("@bitCast of a non-struct as a packed struct"));
+        };
+        let mut acc: u128 = 0;
+        for (i, &(off, width)) in fields.iter().enumerate() {
+            if width == 0 {
+                continue;
+            }
+            let fv = vals.get(i).and_then(|v| v.as_i128()).unwrap_or(0);
+            let mask: u128 = if width >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << width) - 1
+            };
+            acc |= ((fv as u128) & mask) << off;
+        }
+        Ok(Value::int(acc as i128, to))
+    }
+
+    /// Unpacks a backing integer into a packed-struct `Value::Struct`
+    /// (`@bitCast(int) -> packed`). Each field is extracted by shifting down to
+    /// its bit offset and re-repr'ing through its [`IntRepr`], which masks to the
+    /// field width and sign-extends a signed field — exactly the native
+    /// `load_packed_field` shift+mask (spec §02).
+    fn unpack_struct(&self, a: &Value, fields: &[(u32, u32, IntRepr)]) -> Value {
+        let bits = a.as_i128().unwrap_or(0) as u128;
+        let out: Vec<Value> = fields
+            .iter()
+            .map(|&(off, width, repr)| {
+                if width == 0 {
+                    return Value::int(0, repr);
+                }
+                let raw = (bits >> off) as i128;
+                // `Value::int` masks to `repr.width` and sign-extends, so the
+                // extracted field carries the same value native loads.
+                Value::int(raw, repr)
+            })
+            .collect();
+        Value::Struct(std::rc::Rc::new(out))
     }
 
     // ---- projections ---------------------------------------------------
@@ -3375,6 +3442,13 @@ fn shift_amount(y: i128, repr: IntRepr) -> u32 {
         repr.width as u32
     };
     ((y.rem_euclid(w as i128)) as u32) % w
+}
+
+/// `true` if both operands are `Value::Bool` — the condition under which a
+/// bitwise `&`/`|`/`^` is a boolean op (`@reduce(.And/.Or/.Xor)` over a bool
+/// vector) and must yield a `bool` result, matching the native backend.
+fn both_bool(a: &Value, b: &Value) -> bool {
+    matches!(a, Value::Bool(_)) && matches!(b, Value::Bool(_))
 }
 
 /// The [`IntRepr`] to compare two operands under. A relational op's instruction

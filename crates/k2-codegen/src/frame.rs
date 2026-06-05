@@ -69,17 +69,46 @@ impl FramePlan {
 /// union. Pointer-niche optionals (`?*T`) are scalar pointers.
 pub fn is_memory_aggregate(arena: &TypeArena, ty: TypeId) -> bool {
     match arena.get(ty) {
-        Type::Struct(_) | Type::Array { .. } | Type::Slice { .. } | Type::ErrorUnion { .. } => true,
+        // A `@Vector(N, T)` is stored inline in the frame (like a small array),
+        // not in a scalar register, so it needs a stack home for its literal /
+        // per-lane SIMD lowering. (It is given a layout now, so without this arm
+        // it would no longer be classified MEMORY and its aggregate literal could
+        // not be lowered.)
+        Type::Struct(_)
+        | Type::Array { .. }
+        | Type::Slice { .. }
+        | Type::ErrorUnion { .. }
+        | Type::Vector { .. } => true,
         Type::Optional(inner) => !matches!(arena.get(*inner), Type::Pointer { .. }),
         _ => false,
     }
 }
 
+/// Rounds a memory-aggregate home's *size* up to at least 8 bytes, leaving the
+/// alignment untouched. The parameter-passing prologue stores each incoming
+/// aggregate word with a full 8-byte `mov_store_mem` (and the caller reads it
+/// back with an 8-byte `mov_load`), so a sub-8-byte aggregate (e.g. a packed
+/// `struct { a: u3, b: u5 }` of size 1, or a plain `struct { a: u8, b: u8 }` of
+/// size 2) whose home was sized to its exact byte count would have those 8-byte
+/// stores spill 6–7 bytes into the *adjacent* frame slot, corrupting frame
+/// bookkeeping and faulting a value-returning callee on return (SIGSEGV). The
+/// aggregate's true byte size still drives `@sizeOf`/memcpy/field offsets; this
+/// only pads the *reserved stack home* so the word-granular param store/load can
+/// never overflow it. The pad is invisible to layout because it is local to the
+/// frame planner — nothing reads `size` back out of the home.
+fn pad_aggregate_home(l: Layout) -> Layout {
+    Layout {
+        size: l.size.max(8),
+        align: l.align,
+    }
+}
+
 /// The memory size/alignment to reserve for a local's home. Aggregates and wide
 /// (>8-byte) integers use their natural layout; a narrow spilled scalar uses 8/8.
+/// A sub-8-byte aggregate home is padded to 8 bytes (see [`pad_aggregate_home`]).
 fn home_layout(arena: &TypeArena, ty: TypeId) -> Layout {
     if is_memory_aggregate(arena, ty) {
-        return layout::layout_of(arena, ty).unwrap_or(Layout::WORD);
+        return pad_aggregate_home(layout::layout_of(arena, ty).unwrap_or(Layout::WORD));
     }
     if let Some(l) = layout::layout_of(arena, ty) {
         if l.size > 8 {
@@ -116,16 +145,20 @@ pub fn plan(
             continue; // lives in a register
         }
         // Size the home: an explicit (size, align) override (a `deferred` tuple)
-        // wins; else the override type's layout; else the declared type's.
+        // wins; else the override type's layout; else the declared type's. Every
+        // aggregate home is padded to at least 8 bytes so the word-granular
+        // param store/load can never overflow it (see `pad_aggregate_home`).
         let l = if let Some((sz, al)) = home_size[i] {
-            Layout {
+            // A `home_size` override is only recorded for an aggregate home
+            // (a deferred tuple/array literal), so pad it like any aggregate.
+            pad_aggregate_home(Layout {
                 size: sz,
                 align: al,
-            }
+            })
         } else {
             let size_ty = home_ty[i].unwrap_or(local.ty);
             if is_memory_aggregate(arena, size_ty) {
-                layout::layout_of(arena, size_ty).unwrap_or(Layout::WORD)
+                pad_aggregate_home(layout::layout_of(arena, size_ty).unwrap_or(Layout::WORD))
             } else {
                 home_layout(arena, local.ty)
             }

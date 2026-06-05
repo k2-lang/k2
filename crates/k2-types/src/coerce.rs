@@ -268,7 +268,7 @@ impl crate::check::Checker<'_> {
                 self.record(span, expected);
                 expected
             }
-            Type::Array { elem, .. } | Type::Slice { elem, .. } => {
+            Type::Array { elem, .. } | Type::Slice { elem, .. } | Type::Vector { elem, .. } => {
                 if let InitBody::Tuple(elems) = body {
                     for el in elems {
                         self.check(el, elem);
@@ -313,7 +313,9 @@ impl crate::check::Checker<'_> {
     /// The element type of an array/slice/array-pointer base, used by indexing.
     pub(crate) fn indexable_elem(&self, base: TypeId) -> Option<TypeId> {
         match self.arena.get(base).clone() {
-            Type::Array { elem, .. } | Type::Slice { elem, .. } => Some(elem),
+            Type::Array { elem, .. } | Type::Slice { elem, .. } | Type::Vector { elem, .. } => {
+                Some(elem)
+            }
             Type::Pointer { pointee, .. } => match self.arena.get(pointee) {
                 Type::Array { elem, .. } => Some(*elem),
                 _ => None,

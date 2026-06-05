@@ -561,3 +561,72 @@ fn inferred_tag_enum_layout_is_minimal() {
     let t = check_clean(src);
     assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(1));
 }
+
+// =========================================================================
+//  v0.21: packed-struct / align(N) / @Vector layout facts.
+// =========================================================================
+
+#[test]
+fn packed_struct_size_and_bits() {
+    // packed struct { a:u3, b:u5 } -> 8 bits -> 1 byte.
+    let src = "const F = packed struct { a: u3, b: u5 };\n\
+        fn f() void { var z: [@sizeOf(F)]u8 = undefined; _ = z; }\n";
+    let t = check_clean(src);
+    assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(1));
+
+    // packed struct { a:u3, b:u3, c:u3 } -> 9 bits -> 2 bytes; bitSize == 9.
+    let src2 = "const F = packed struct { a: u3, b: u3, c: u3 };\n\
+        fn f() void { var z: [@sizeOf(F)]u8 = undefined; _ = z; \
+                      var w: [@bitSizeOf(F)]u8 = undefined; _ = w; }\n";
+    let t2 = check_clean(src2);
+    assert_eq!(z_len(&t2, src2), k2_types::ArrayLen::Known(2));
+    let wty = read_type(&t2, src2, "w");
+    match t2.arena.get(wty) {
+        Type::Array { len, .. } => assert_eq!(*len, k2_types::ArrayLen::Known(9)),
+        other => panic!("expected [9]u8 for @bitSizeOf, got {other:?}"),
+    }
+}
+
+#[test]
+fn packed_struct_byte_fields_size() {
+    // packed struct { a:u8, b:u16, c:u8 } -> 32 bits -> 4 bytes.
+    let src = "const F = packed struct { a: u8, b: u16, c: u8 };\n\
+        fn f() void { var z: [@sizeOf(F)]u8 = undefined; _ = z; }\n";
+    let t = check_clean(src);
+    assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(4));
+}
+
+#[test]
+fn align_raises_struct_size() {
+    // struct { a:u8, b:u32 align(8) } -> b at offset 8, size rounds to 16.
+    let src = "const S = struct { a: u8, b: u32 align(8) };\n\
+        fn f() void { var z: [@sizeOf(S)]u8 = undefined; _ = z; }\n";
+    let t = check_clean(src);
+    assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(16));
+}
+
+#[test]
+fn align_raises_alignof_and_offsetof() {
+    let src = "const S = struct { a: u8, b: u32 align(8) };\n\
+        fn f() void { var z: [@alignOf(S)]u8 = undefined; _ = z; \
+                      var w: [@offsetOf(S, \"b\")]u8 = undefined; _ = w; }\n";
+    let t = check_clean(src);
+    assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(8));
+    let wty = read_type(&t, src, "w");
+    match t.arena.get(wty) {
+        Type::Array { len, .. } => assert_eq!(*len, k2_types::ArrayLen::Known(8)),
+        other => panic!("expected [8]u8 for @offsetOf, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_size_and_align() {
+    // @sizeOf(@Vector(4, u32)) == 16; @alignOf == 16.
+    let src = "fn f() void { var z: [@sizeOf(@Vector(4, u32))]u8 = undefined; _ = z; }\n";
+    let t = check_clean(src);
+    assert_eq!(z_len(&t, src), k2_types::ArrayLen::Known(16));
+
+    let src2 = "fn f() void { var z: [@alignOf(@Vector(4, u32))]u8 = undefined; _ = z; }\n";
+    let t2 = check_clean(src2);
+    assert_eq!(z_len(&t2, src2), k2_types::ArrayLen::Known(16));
+}

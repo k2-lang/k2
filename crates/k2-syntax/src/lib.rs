@@ -549,8 +549,10 @@ pub struct Container {
 /// The kind of a container, with its kind-specific data.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContainerKind {
-    /// `struct {...}` / `extern struct {...}`.
-    Struct { is_extern: bool },
+    /// `struct {...}` / `extern struct {...}` / `packed struct {...}`. At most
+    /// one of `is_extern`/`is_packed` is set (a `packed extern struct` is a
+    /// parse error).
+    Struct { is_extern: bool, is_packed: bool },
     /// `enum {...}` / `enum(TagType) {...}`.
     Enum { tag: Option<Box<Expr>> },
     /// `union {...}` / `union(enum) {...}` / `union(TagType) {...}`.

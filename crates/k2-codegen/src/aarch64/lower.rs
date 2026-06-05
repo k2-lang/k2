@@ -798,7 +798,10 @@ impl<'p> Aarch64FnLower<'p> {
                 ty
             }
             AggKind::Array => match self.prog.arena.get(ty) {
-                Type::Array { elem, .. } => *elem,
+                // A `@Vector(N, T)` literal lowers as an array aggregate, so each
+                // lane's field type is the vector's element type (mirrors the x86
+                // backend so a bool-vector literal stores 1-byte lanes).
+                Type::Array { elem, .. } | Type::Vector { elem, .. } => *elem,
                 _ => ty,
             },
         }
@@ -1169,7 +1172,12 @@ impl<'p> Aarch64FnLower<'p> {
                     self.asm.load(dst, dst, 0, MemSize::X);
                     cur_ty = self.pointee_ty(cur_ty);
                 }
-                Proj::Field { index, ty } => {
+                Proj::Field { index, ty, packed } => {
+                    // The aarch64 cross-backend does not yet implement packed
+                    // bit-field shift+mask access; refuse cleanly (spec §02).
+                    if packed.is_some() {
+                        return Err(self.unsup("packed-struct field access (aarch64)"));
+                    }
                     let off = self.field_offset(cur_ty, *index as usize);
                     if off != 0 {
                         self.asm.add_imm_pos(dst, dst, off as u32);

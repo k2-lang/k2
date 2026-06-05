@@ -330,6 +330,30 @@ impl crate::check::Checker<'_> {
                 self.comptime_eval_type(&call)
                     .unwrap_or_else(|| self.arena.t_deferred())
             }
+            // `@Vector(N, T)` in type position. `N` must be comptime-known; a
+            // non-comptime length is a diagnostic (spec §02), not a silent defer.
+            "@Vector" => {
+                for a in args {
+                    let _ = self.synth(a);
+                }
+                if let Some(n_arg) = args.first() {
+                    if self
+                        .comptime_eval_value(n_arg)
+                        .and_then(|v| v.as_int())
+                        .is_none()
+                    {
+                        self.error(_span, "`@Vector` length must be comptime-known");
+                        return self.arena.t_error();
+                    }
+                }
+                let call = Expr::Builtin {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                    span: _span,
+                };
+                self.comptime_eval_type(&call)
+                    .unwrap_or_else(|| self.arena.t_deferred())
+            }
             "@import" | "@hasField" => {
                 for a in args {
                     let _ = self.synth(a);
