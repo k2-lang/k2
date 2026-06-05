@@ -4149,3 +4149,104 @@ fn pkg_registry_name_override_collision_is_reported() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// =========================================================================
+//  LSP v0.26 features over real stdio (`k2c lsp --stdio`)
+// =========================================================================
+
+#[test]
+fn lsp_references_session_over_stdio() {
+    // Drive the real `k2c lsp --stdio` process with a framed
+    // initialize → initialized → didOpen → references → shutdown → exit session
+    // and assert a 3-element `Location[]` comes back framed on stdout. This
+    // exercises the actual stdio path required by HARD ACCEPTANCE, and confirms
+    // the initialize result now advertises the new capabilities.
+    let uri = "file:///cli_refs.k2";
+    let doc =
+        "const x: i32 = 1;\\npub fn main() void {\\n    const y = x;\\n    const z = x;\\n}\\n";
+    let mut session = String::new();
+    session.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ));
+    session.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    ));
+    session.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"k2","version":1,"text":"{doc}"}}}}}}"#
+    )));
+    // References on the `x` use at line 2, char 14.
+    session.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":2,"character":14}},"context":{{"includeDeclaration":true}}}}}}"#
+    )));
+    session.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#,
+    ));
+    session.push_str(&lsp_frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let (ok, stdout, _stderr) = run_with_stdin(&["lsp"], session.as_bytes());
+    assert!(ok, "clean exit after shutdown/exit");
+    assert!(
+        stdout.contains("referencesProvider"),
+        "initialize advertises the references capability: {stdout}"
+    );
+    // The references response (id 2) carries a 3-element Location array — find its
+    // response body and count its `"uri"` occurrences (one per Location).
+    let resp = stdout
+        .split("Content-Length:")
+        .find(|chunk| chunk.contains("\"id\":2"))
+        .expect("a response for the references request");
+    let uri_count = resp.matches("\"uri\"").count();
+    assert_eq!(uri_count, 3, "3 Locations in the references reply: {resp}");
+}
+
+#[test]
+fn lsp_semantic_tokens_and_signature_help_over_stdio() {
+    // A second stdio session exercising semanticTokens/full and signatureHelp
+    // through the real binary: a non-empty token data array and the right active
+    // parameter must come back framed.
+    let uri = "file:///cli_sem.k2";
+    let doc = "pub fn add(a: i32, b: i32) i32 { return a; }\\npub fn main() void {\\n    const r = add(1, 2);\\n}\\n";
+    let mut s = String::new();
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ));
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    ));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"k2","version":1,"text":"{doc}"}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/semanticTokens/full","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    )));
+    // signatureHelp with the cursor on the second argument (`2`).
+    s.push_str(&lsp_frame(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/signatureHelp","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":2,"character":21}}}}}}"#
+    )));
+    s.push_str(&lsp_frame(
+        r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#,
+    ));
+    s.push_str(&lsp_frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let (ok, stdout, _stderr) = run_with_stdin(&["lsp"], s.as_bytes());
+    assert!(ok, "clean exit");
+    // semanticTokens response (id 2) has a non-empty `data` array.
+    let sem = stdout
+        .split("Content-Length:")
+        .find(|c| c.contains("\"id\":2"))
+        .expect("semanticTokens response");
+    assert!(sem.contains("\"data\""), "data array present: {sem}");
+    assert!(
+        sem.contains("\"data\":[") && !sem.contains("\"data\":[]"),
+        "non-empty token data: {sem}"
+    );
+    // signatureHelp response (id 3) has activeParameter 1.
+    let sig = stdout
+        .split("Content-Length:")
+        .find(|c| c.contains("\"id\":3"))
+        .expect("signatureHelp response");
+    assert!(
+        sig.contains("\"activeParameter\":1"),
+        "active param 1: {sig}"
+    );
+}

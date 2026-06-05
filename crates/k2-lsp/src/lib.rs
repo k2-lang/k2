@@ -22,8 +22,23 @@
 //! * [`analysis`] / [`document`] — the in-memory document store and the cached
 //!   per-document parse+resolve+check bundle.
 //! * [`server`] — the synchronous dispatch loop, lifecycle, and document sync.
-//! * [`features`] — the diagnostics/hover/definition/completion/formatting
-//!   providers, each driven by the front-end side tables.
+//! * [`features`] — the providers: diagnostics, hover, definition, completion,
+//!   formatting, references, rename (+ prepareRename), signatureHelp, inlayHint,
+//!   semanticTokens (full), and codeAction — each driven by the front-end side
+//!   tables (the resolver Uses/Def tables, the type checker's per-occurrence types
+//!   and function signatures, and the lexer's token kinds + trivia).
+//! * [`workspace`] — the cross-file module-graph layer.
+//!
+//! ## Cross-file boundary (v0.26)
+//!
+//! Within-file, all eleven features are exhaustive and exact. **Cross-file** is
+//! scoped — per the milestone's documented boundary — to **definition** and
+//! **references** over a *path import* (`@import("./b.k2")`): a `b.foo` access
+//! jumps to (and lists uses of) the imported file's top-level item, computed in
+//! each file's own [`position::PositionMap`] (no merged-buffer re-keying).
+//! signatureHelp, inlayHint, semanticTokens, codeAction, and rename remain
+//! within-file; cross-file *rename* of a `pub` symbol is a known limitation.
+//! Named-module imports (`std`) stay opaque, exactly as `definition` already does.
 //!
 //! ## Never panics
 //!
@@ -40,6 +55,7 @@ pub mod position;
 pub mod protocol;
 pub mod rpc;
 pub mod server;
+pub mod workspace;
 
 use std::io::{self, BufReader, BufWriter};
 

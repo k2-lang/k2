@@ -33,6 +33,14 @@ impl Document {
         self.analysis.as_ref().expect("analysis just computed")
     }
 
+    /// The already-computed analysis, if one is cached, without recomputing. Used
+    /// by the cross-file workspace layer, which holds an immutable store borrow and
+    /// so cannot trigger the lazy `&mut` recompute. Callers ensure the analysis is
+    /// warmed via [`Document::analysis`] first.
+    pub fn cached_analysis(&self) -> Option<&Analysis> {
+        self.analysis.as_ref()
+    }
+
     /// Invalidates the cached analysis (called on every edit).
     fn invalidate(&mut self) {
         self.analysis = None;
@@ -106,6 +114,16 @@ impl DocumentStore {
     /// A mutable document by URI, if open (so callers can compute its analysis).
     pub fn get_mut(&mut self, uri: &str) -> Option<&mut Document> {
         self.docs.get_mut(uri)
+    }
+
+    /// Snapshots every open document as `(uri, text)` pairs, for the cross-file
+    /// workspace layer (which parses/resolves other buffers without mutating the
+    /// store). Cloned so the caller holds no borrow on the store.
+    pub fn iter_texts(&self) -> Vec<(String, String)> {
+        self.docs
+            .iter()
+            .map(|(uri, doc)| (uri.clone(), doc.text.clone()))
+            .collect()
     }
 }
 
