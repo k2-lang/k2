@@ -35,6 +35,36 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **`k2c doc` documentation generator + doc-tests (v0.28).** A new `doc`
+  subcommand extracts the `///` doc comments attached to public declarations
+  (`pub fn`/`pub const`/`pub var`, and `pub` `struct`/`enum`/`union` types with
+  their `pub` fields/members) and renders a **self-contained, dependency-free**
+  HTML site — an index page plus per-module pages, with anchors and intra-doc
+  cross-links — driven entirely by pure-`std` string building (no external CSS/JS,
+  inline stylesheet, all content HTML-escaped). Each item emits its **signature
+  pulled from the type checker** (`fn` params `name: type` + return type;
+  struct/enum/union fields with types; const/var types — e.g. the resolved
+  `error{Empty,NotANumber,OutOfMemory,Overflow}!*u32`), with parameter *names* from
+  the AST, falling back to the AST type expressions only when a file fails to
+  type-check (so the generator never panics on any parseable input). The
+  doc-comment Markdown (headings, code spans/blocks, lists, links) renders to HTML
+  through a small, total CommonMark subset; a `[x](javascript:…)` link is
+  neutralized. `--format=html|md|both` adds a Markdown site; a directory argument
+  documents every `*.k2` with a linking top-level index.
+
+  **Doc-tests:** fenced ```` ```k2 ```` blocks in doc comments are extracted,
+  compiled, and run as real `test` blocks via the existing VM harness under
+  `Debug` (safety checks + the leak-checking allocator stay live), so an example
+  that traps, mis-asserts, leaks, or lets an error escape **FAILS**; a
+  `compile_fail` example passes iff it does not compile (a non-compiling example is
+  reported as a doc-test *failure*, never a crash); `no_run` compiles without
+  executing; `ignore`/foreign-language fences are skipped. Each example compiles in
+  the context of its file (leading `const … = @import(…)` imports are hoisted to
+  file scope) so it can reference the file's items. Wired as `k2c doc --test`
+  (embeds pass/fail badges into the HTML and gates the exit code) and
+  `k2c test --doc <file>` (run only the doc examples); both exit nonzero on any
+  doc-test failure.
+
 - **DWARF v5 debug info in the native x86-64 backend (v0.27).** `k2c
   build-native -g` / `run-native -g` (default ON in `--debug`, OFF in
   `--release-*`; `--no-debug-info` opts out) emit a real ELF **section-header

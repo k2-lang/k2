@@ -38,6 +38,7 @@
 //! source contained one or more parse errors.
 
 mod build_cmd;
+mod doc;
 mod imports;
 mod lock;
 mod multi;
@@ -112,6 +113,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "build" => build_cmd::cmd_build(rest),
         "update" => build_cmd::cmd_update(rest),
         "test" => test_cmd::cmd_test(rest),
+        "doc" => doc::cmd_doc(rest),
         "bench" => cmd_bench(rest),
         "lsp" => cmd_lsp(rest),
         "help" | "--help" | "-h" => {
@@ -2515,6 +2517,14 @@ fn print_usage() {
          \x20       --update           Re-resolve deps from scratch, ignoring deps.lock.\n\
          \x20   update               Re-resolve deps (offline) and rewrite deps.lock; no compile.\n\
          \x20   lsp                  Run the language server over stdio (LSP / JSON-RPC).\n\
+         \x20   doc <file|dir> -o <dir>  Generate documentation (HTML site + optional Markdown) for\n\
+         \x20                          the PUBLIC items of a file/project, with their type-checker\n\
+         \x20                          signatures + rendered `///` doc comments.\n\
+         \x20       --format=html|md|both  Output format (default html).\n\
+         \x20       --test             Also compile + run the fenced doc examples; nonzero on any\n\
+         \x20                          doc-test failure.\n\
+         \x20       --no-run           Treat every doc example as compile-only.\n\
+         \x20   test --doc <file>    Compile + run only the fenced doc examples of a file.\n\
          \x20   help                 Show this help.\n\
          \x20   version              Print the version.\n\
          \n\

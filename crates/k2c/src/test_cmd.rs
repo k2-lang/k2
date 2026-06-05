@@ -74,16 +74,33 @@ struct TestArgs {
     seed: u64,
     /// Fuzz iterations per target.
     fuzz_runs: usize,
+    /// Run only the fenced doc examples (the `--doc` flag), via the doc-test core.
+    doc: bool,
 }
 
 /// The `test` subcommand entry point.
 pub fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
     let parsed = parse_args(args)?;
+    if parsed.doc {
+        return run_doc_tests(&parsed);
+    }
     let p = Path::new(&parsed.path);
     if parsed.path != "-" && p.is_dir() {
         return run_directory(&parsed);
     }
     run_one_source(&parsed)
+}
+
+/// `k2c test --doc <file>`: compile + run ONLY the fenced doc examples of the
+/// file's doc comments, reusing the doc-test core (no HTML output). The exit code
+/// is nonzero iff any runnable/compile-fail example failed.
+fn run_doc_tests(parsed: &TestArgs) -> Result<ExitCode, String> {
+    let (source, label) = crate::read_source(&parsed.path)?;
+    let mut model = crate::doc::build_doc_model(&source, &label)
+        .map_err(|reason| format!("cannot document {label}: {reason}"))?;
+    Ok(crate::doc::doctest::run_doctests(
+        &mut model, &source, false,
+    ))
 }
 
 /// Parses the `test` flags into a [`TestArgs`].
@@ -97,6 +114,7 @@ fn parse_args(args: &[String]) -> Result<TestArgs, String> {
     let mut fuzz = false;
     let mut seed: u64 = RunOpts::default().seed;
     let mut fuzz_runs: usize = RunOpts::default().fuzz_runs;
+    let mut doc = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -149,6 +167,7 @@ fn parse_args(args: &[String]) -> Result<TestArgs, String> {
             "--verbose" => verbose = true,
             "--coverage" => coverage = CoverageSel::Both,
             "--fuzz" => fuzz = true,
+            "--doc" => doc = true,
             "--release-fast" => mode = BuildMode::ReleaseFast,
             "--release-safe" => mode = BuildMode::ReleaseSafe,
             "--debug" => mode = BuildMode::Debug,
@@ -183,6 +202,7 @@ fn parse_args(args: &[String]) -> Result<TestArgs, String> {
         fuzz,
         seed,
         fuzz_runs,
+        doc,
     })
 }
 
@@ -337,6 +357,7 @@ fn run_directory(parsed: &TestArgs) -> Result<ExitCode, String> {
             fuzz: parsed.fuzz,
             seed: parsed.seed,
             fuzz_runs: parsed.fuzz_runs,
+            doc: parsed.doc,
         };
         match run_one_source(&sub)? {
             ExitCode::SUCCESS => {}

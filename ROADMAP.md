@@ -242,7 +242,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | v0.25 | Package manager: deps, lockfile, semver, offline-reproducible | tooling |
 | v0.26 | LSP completeness: references/rename/signature-help/semantic-tokens | tooling |
 | v0.27 | Debug info: DWARF in the native backend; gdb-debuggable | tooling |
-| v0.28 | Doc generator (`k2c doc`) + doc-tests | tooling |
+| v0.28 | Doc generator (`k2c doc`) + doc-tests ✅ | tooling |
 | v0.29 | Self-hosting groundwork: a k2-written front-end, run by the toolchain | self-host |
 | v0.30 | 1.0 readiness: conformance suite, stability pass, full integration | maturity |
 

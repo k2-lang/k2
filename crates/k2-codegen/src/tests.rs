@@ -2464,9 +2464,15 @@ mod exec {
                 "allocators",
                 include_str!("../../../examples/allocators.k2"),
             ),
+            // Recursive Fibonacci exercises call-heavy native==VM + the optimizer.
+            // The differential runs every corpus program through the VM in Debug
+            // mode too (with safety checks, so slower than ReleaseFast); fib(20) is
+            // a deliberately modest depth so the Debug-mode VM run stays well under
+            // the VM's wall-clock backstop even on a slow/loaded box. The bench
+            // keeps the heavier fib(26) for its speedup magnitude (ReleaseFast only).
             (
                 "fib_rec",
-                include_str!("../../k2c/bench/bench_fib_rec_native.k2"),
+                "fn fib(n: u32) u32 {\n    if (n < 2) return n;\n    return fib(n - 1) + fib(n - 2);\n}\npub fn main(sys: *System) !void {\n    const out = sys.io.stdout();\n    try out.print(\"fib(20) = {d}\\n\", .{fib(20)});\n}\n",
             ),
             (
                 "loop_sum",
