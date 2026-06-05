@@ -136,6 +136,24 @@ pub struct Checker<'a> {
     /// bodies are checked exactly once (spec §07.4: per-instantiation soundness),
     /// not per use site.
     pub(crate) rechecked_insts: HashSet<TypeId>,
+    /// Per-instantiation member resolutions, keyed by `(enclosing instantiated
+    /// struct TypeId, member occurrence span)`. The plain [`members`] table is
+    /// keyed by span ALONE, so it cannot distinguish a member resolved differently
+    /// across two instantiations of the same generic — e.g. `Context.lessThan`
+    /// inside `Sorter(T, Asc)` vs `Sorter(T, Desc)`, where `Context` is a comptime
+    /// TYPE param dispatched through a member. While re-checking an instantiation's
+    /// method bodies (see [`crate::generic::Checker::recheck_instantiated_methods`])
+    /// the current struct type is pushed onto [`inst_member_ctx`], and every member
+    /// resolution recorded there is ALSO stored here under that struct type, so the
+    /// MIR lowerer can recover the per-instantiation target (the span-keyed table
+    /// holds whichever instantiation ran last, which is order-dependent garbage for
+    /// the multi-context case).
+    pub(crate) inst_members: HashMap<(TypeId, (u32, u32)), MemberRes>,
+    /// The stack of enclosing instantiated struct types currently being
+    /// re-type-checked, innermost last. Non-empty exactly while inside
+    /// `recheck_instantiated_methods`; its top is the key under which member
+    /// resolutions are mirrored into [`inst_members`].
+    pub(crate) inst_member_ctx: Vec<TypeId>,
     /// The C-interop linkage recorded for each `extern`/`export` function during
     /// checking (v0.19), moved into [`Typed::extern_fns`] at the end of [`run`].
     pub(crate) extern_fns: HashMap<DefId, crate::ty::ExternInfo>,
@@ -173,6 +191,8 @@ impl<'a> Checker<'a> {
             type_valued_spans: HashMap::new(),
             cond_depth: 0,
             rechecked_insts: HashSet::new(),
+            inst_members: HashMap::new(),
+            inst_member_ctx: Vec::new(),
             extern_fns: HashMap::new(),
         }
     }
@@ -217,6 +237,7 @@ impl<'a> Checker<'a> {
             arena: self.arena,
             types: self.types,
             members: self.members,
+            inst_members: self.inst_members,
             binding_types: self.binding_types,
             type_valued_spans: self.type_valued_spans,
             comptime_span_ints: self.comptime_span_ints,
@@ -276,8 +297,38 @@ impl<'a> Checker<'a> {
     }
 
     /// Records the resolved member of a previously-deferred occurrence.
+    ///
+    /// A method-body span is SHARED across every instantiation of a generic and
+    /// the generic's own static (`T = type`) body check. The static check resolves
+    /// a member on a still-comptime type param (`Hctx.hash`, where `Hctx: type`) to
+    /// [`MemberRes::Deferred`], while an instantiation (`Hctx = SomeCtx`) resolves
+    /// the SAME span to a concrete [`MemberRes::Decl`]. Whichever check runs LAST
+    /// would otherwise win, making member resolution depend on declaration order
+    /// (a generic defined after its first use site would have its concrete member
+    /// clobbered back to `Deferred` by the later static check — which the MIR then
+    /// mis-lowers to an `@TypeParam` builtin intrinsic). To make this
+    /// order-independent, a concrete resolution is NEVER downgraded to `Deferred`:
+    /// once a span resolves to a real target, that target stands.
     pub(crate) fn record_member(&mut self, span: Span, res: MemberRes) {
-        self.members.insert((span.start, span.end), res);
+        let key = (span.start, span.end);
+        // Mirror a per-instantiation resolution under the enclosing instantiated
+        // struct type, so the MIR can recover the right target for THIS
+        // instantiation even when a sibling one resolves the same span elsewhere.
+        if let Some(&struct_ty) = self.inst_member_ctx.last() {
+            if res != MemberRes::Deferred {
+                self.inst_members.insert((struct_ty, key), res);
+            }
+        }
+        if res == MemberRes::Deferred {
+            if let Some(prev) = self.members.get(&key) {
+                if *prev != MemberRes::Deferred {
+                    // Keep the already-resolved concrete target (an instantiation
+                    // recorded it); do not clobber it with a deferred placeholder.
+                    return;
+                }
+            }
+        }
+        self.members.insert(key, res);
     }
 
     /// Enters one level of recursion; returns `false` past the cap.

@@ -86,6 +86,14 @@ pub struct Typed {
     /// The resolved member/field/variant for each previously-`DeferredMember`
     /// position, keyed by the member occurrence span.
     pub members: HashMap<(u32, u32), MemberRes>,
+    /// Per-instantiation member resolutions, keyed by `(enclosing instantiated
+    /// struct TypeId, member occurrence span)`. The MIR lowerer consults this
+    /// FIRST when lowering a method body it knows belongs to a specific generic
+    /// instantiation, so a comptime-type-param member dispatch (`Context.lessThan`
+    /// inside `Sorter(T, Asc)` vs `Sorter(T, Desc)`) resolves to the correct,
+    /// instantiation-specific target instead of whichever instantiation the
+    /// span-keyed [`members`] table happened to record last.
+    pub inst_members: HashMap<(TypeId, (u32, u32)), MemberRes>,
     /// The type bound to each value definition (const/var/param/local/capture),
     /// and the [`Type::Fn`] type of each `fn`/method definition.
     pub binding_types: HashMap<DefId, TypeId>,

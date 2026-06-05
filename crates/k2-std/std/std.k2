@@ -134,6 +134,76 @@ pub const heap = struct {
             return @allocHandle(self.id);
         }
     };
+
+    /// A bump / stack allocator: a linear-bump region over a caller buffer where
+    /// `free` is a no-op and allocation fails with `OutOfMemory` once the buffer is
+    /// exhausted. It is realized by the `FixedBufferAllocator` (the VM's kind-3
+    /// bump allocator), so `StackAllocator` is a clarifying ALIAS — use it when the
+    /// "bump cursor over a fixed region" intent is what you want to communicate.
+    pub const StackAllocator = FixedBufferAllocator;
+
+    /// An allocator WRAPPER that tallies allocation activity while forwarding every
+    /// request to an inner `Allocator`. It exposes the same method surface
+    /// (`alloc`/`free`/`realloc`/`create`/`destroy`) the `Allocator` capability
+    /// does, so it is duck-typed-conformant: pass it to any container that takes
+    /// its allocator by `anytype` (exactly how `ArrayList` uses its `alloc`). The
+    /// counters (`n_alloc`/`n_free`/`bytes`) are live and queryable at any time —
+    /// the canonical "how much did this phase allocate?" instrument. Because the
+    /// `Allocator` handle is opaque, conformance is by method surface, not by
+    /// producing a new handle the VM dispatches through.
+    pub const CountingAllocator = struct {
+        const Self = @This();
+        /// The wrapped allocator every request forwards to.
+        inner: Allocator,
+        /// The number of successful `alloc`/`create`/`realloc` calls.
+        n_alloc: usize,
+        /// The number of `free`/`destroy` calls.
+        n_free: usize,
+        /// The total element count handed out across `alloc`/`realloc` (a cheap
+        /// proxy for bytes when `T` is `u8`, and an element tally otherwise).
+        bytes: usize,
+
+        /// Wrap `inner`, with all counters at zero.
+        pub fn init(inner: Allocator) Self {
+            return Self{ .inner = inner, .n_alloc = 0, .n_free = 0, .bytes = 0 };
+        }
+
+        /// Allocate `n` elements of `T`, tallying one alloc and `n` units.
+        pub fn alloc(self: *Self, comptime T: type, n: usize) ![]T {
+            const s = try self.inner.alloc(T, n);
+            self.n_alloc += 1;
+            self.bytes += n;
+            return s;
+        }
+
+        /// Grow/shrink `slice` to `n` elements, tallying it as one alloc of `n`.
+        pub fn realloc(self: *Self, slice: anytype, n: usize) !@TypeOf(slice) {
+            const s = try self.inner.realloc(slice, n);
+            self.n_alloc += 1;
+            self.bytes += n;
+            return s;
+        }
+
+        /// Free `slice`, tallying one free.
+        pub fn free(self: *Self, slice: anytype) void {
+            self.n_free += 1;
+            self.inner.free(slice);
+        }
+
+        /// Allocate a single `T`, tallying one alloc of one unit.
+        pub fn create(self: *Self, comptime T: type) !*T {
+            const p = try self.inner.create(T);
+            self.n_alloc += 1;
+            self.bytes += 1;
+            return p;
+        }
+
+        /// Destroy a single-item pointer, tallying one free.
+        pub fn destroy(self: *Self, ptr: anytype) void {
+            self.n_free += 1;
+            self.inner.destroy(ptr);
+        }
+    };
 };
 
 // =========================================================================
@@ -205,6 +275,892 @@ pub fn ArrayList(comptime T: type) type {
         }
     };
 }
+
+// =========================================================================
+//  HashMap — the canonical unordered map (open addressing + tombstones)
+// =========================================================================
+//
+// `HashMap(K, V, Context)` is an allocator-taking, dynamically-growing hash map.
+// It uses OPEN ADDRESSING with LINEAR PROBING and TOMBSTONE deletion over three
+// parallel heap slices (`keys`/`vals`/`state`), so there is no per-entry node
+// allocation and no fn-pointer-of-node — every lookup is index math the VM and
+// native backend handle cleanly. Capacity is always a power of two, so the slot
+// index is a cheap `hash & (cap-1)` mask; the table grows (doubling) and rehashes
+// when the used+tombstone load reaches 75%, which also reclaims tombstones.
+//
+// HASH/EQ ARE A COMPTIME CONTEXT TYPE, not a derived-from-`K` trait: `Context` is
+// a `struct` exposing `pub fn hash(K) u64` and `pub fn eql(K, K) bool`, invoked
+// from inside the map's own methods. This is the only function-dispatch shape the
+// language supports for passing behavior into a generic container (a function
+// *value* cannot be passed). `IntContext` (multiplicative/Fibonacci hash) and
+// `StrContext` (FNV-1a folded to 32 bits) are bundled, with the thin wrappers
+// `IntHashMap`/`StringHashMap`/`AutoHashMap` binding the right one.
+//
+// OWNERSHIP: the map owns ONLY its three slices and frees them with its stored
+// allocator on `deinit`. For `[]const u8` keys/values the BYTES are borrowed —
+// the caller owns and frees them; the map stores the slice headers.
+pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The keys, one per slot; meaningful only where `state[i] == 1` (USED).
+        keys: []K,
+        /// The values, parallel to `keys`.
+        vals: []V,
+        /// Per-slot occupancy: `0` = EMPTY, `1` = USED, `2` = TOMB (a deleted
+        /// slot that still has to be probed past). Inline integer literals are
+        /// used everywhere instead of named constants — a struct-body typed
+        /// `const EMPTY: u8 = 0;` is currently mis-resolved as a TYPE, so the
+        /// three states are written as the literals `0`/`1`/`2` throughout.
+        state: []u8,
+        /// The number of live (USED) entries — what `count()` returns.
+        live: usize,
+        /// Used + tombstones: the occupancy that drives growth. Grows reset it.
+        upt: usize,
+        /// The allocator the three slices are owned through.
+        alloc: Allocator,
+
+        /// One live key/value pair, yielded by the iterator.
+        pub const Entry = struct {
+            /// The entry's key.
+            key: K,
+            /// The entry's value.
+            value: V,
+        };
+
+        /// The result of `getOrPut`: a pointer to the slot's value (so the caller
+        /// can read or overwrite it in place) plus whether the key already existed.
+        pub const GetOrPutResult = struct {
+            /// A pointer into `vals[]`, valid until the next insert that grows.
+            value_ptr: *V,
+            /// `true` if the key was already present (the value is the old one).
+            found_existing: bool,
+        };
+
+        /// A forward iterator over the live entries, in arbitrary (slot) order.
+        /// Construct with `map.iterator()` and drive with `while (it.next()) |e|`.
+        pub const Iterator = struct {
+            /// The map being walked.
+            map: *Self,
+            /// The next slot index to examine.
+            idx: usize,
+
+            /// The next live entry, or `null` once every slot has been visited.
+            pub fn next(self: *Iterator) ?Entry {
+                while (self.idx < self.map.state.len) {
+                    const i = self.idx;
+                    self.idx += 1;
+                    if (self.map.state[i] == 1) {
+                        return Entry{ .key = self.map.keys[i], .value = self.map.vals[i] };
+                    }
+                }
+                return null;
+            }
+        };
+
+        /// An empty map bound to `alloc`. No storage is allocated until the first
+        /// `put` — an empty map is free.
+        pub fn init(alloc: Allocator) Self {
+            return Self{
+                .keys = &.{},
+                .vals = &.{},
+                .state = &.{},
+                .live = 0,
+                .upt = 0,
+                .alloc = alloc,
+            };
+        }
+
+        /// Release the three backing slices with the map's own allocator. Borrowed
+        /// key/value bytes (for `[]const u8`) are the caller's to free.
+        pub fn deinit(self: *Self) void {
+            if (self.state.len != 0) {
+                self.alloc.free(self.keys);
+                self.alloc.free(self.vals);
+                self.alloc.free(self.state);
+            }
+        }
+
+        /// Locate the slot for `key`. On return `found.*` is `true` and the result
+        /// is the existing slot iff the key is present; otherwise the result is the
+        /// first reusable slot for insertion — the first TOMBSTONE seen while
+        /// probing, or the first EMPTY slot. Remembering the first tombstone keeps
+        /// reinsertion O(1) and bounds probe length under deletion churn.
+        fn findSlot(self: *Self, key: K, found: *bool) usize {
+            const m = self.state.len - 1;
+            const start: usize = @as(usize, @intCast(Context.hash(key))) & m;
+            var i: usize = start;
+            var first_tomb: usize = 0;
+            var have_tomb: bool = false;
+            while (true) {
+                const st = self.state[i];
+                if (st == 0) {
+                    found.* = false;
+                    if (have_tomb) return first_tomb;
+                    return i;
+                }
+                if (st == 1) {
+                    if (Context.eql(self.keys[i], key)) {
+                        found.* = true;
+                        return i;
+                    }
+                } else {
+                    // A tombstone: a candidate insertion slot, but keep probing in
+                    // case the key itself lives further along the run.
+                    if (not have_tomb) {
+                        have_tomb = true;
+                        first_tomb = i;
+                    }
+                }
+                i = (i + 1) & m;
+                if (i == start) {
+                    // Wrapped the whole table without an empty slot (degenerate:
+                    // table full of used+tomb). Fall back to the first tombstone.
+                    found.* = false;
+                    if (have_tomb) return first_tomb;
+                    return i;
+                }
+            }
+        }
+
+        /// Allocate a fresh table (double the capacity, floor 8), zero its state,
+        /// and rehash only the USED slots — which drops every tombstone and resets
+        /// `upt` to the live count, restoring short probe runs. The old storage is
+        /// freed afterward.
+        fn grow(self: *Self) !void {
+            const new_cap: usize = if (self.state.len == 0) 8 else self.state.len * 2;
+            const new_keys = try self.alloc.alloc(K, new_cap);
+            const new_vals = try self.alloc.alloc(V, new_cap);
+            const new_state = try self.alloc.alloc(u8, new_cap);
+            var j: usize = 0;
+            while (j < new_cap) : (j += 1) {
+                new_state[j] = 0;
+            }
+            const old_keys = self.keys;
+            const old_vals = self.vals;
+            const old_state = self.state;
+            const old_len = old_state.len;
+            // Re-point to the fresh table, then rehash the live entries into it.
+            self.keys = new_keys;
+            self.vals = new_vals;
+            self.state = new_state;
+            self.live = 0;
+            self.upt = 0;
+            var k: usize = 0;
+            while (k < old_len) : (k += 1) {
+                if (old_state[k] == 1) {
+                    var f: bool = false;
+                    const slot = self.findSlot(old_keys[k], &f);
+                    self.keys[slot] = old_keys[k];
+                    self.vals[slot] = old_vals[k];
+                    self.state[slot] = 1;
+                    self.live += 1;
+                    self.upt += 1;
+                }
+            }
+            if (old_len != 0) {
+                self.alloc.free(old_keys);
+                self.alloc.free(old_vals);
+                self.alloc.free(old_state);
+            }
+        }
+
+        /// Insert or update `key -> value`, growing first if the next insert would
+        /// push the used+tombstone load to/over 75% (`(upt+1)*4 >= cap*3`). A
+        /// present key is overwritten in place; a fresh key takes the first empty
+        /// or tombstone slot.
+        pub fn put(self: *Self, key: K, value: V) !void {
+            if ((self.upt + 1) * 4 >= self.state.len * 3) {
+                try self.grow();
+            }
+            var f: bool = false;
+            const slot = self.findSlot(key, &f);
+            if (f) {
+                self.vals[slot] = value;
+                return;
+            }
+            // Filling an EMPTY slot raises used+tombstones; reusing a TOMB does not.
+            if (self.state[slot] == 0) {
+                self.upt += 1;
+            }
+            self.state[slot] = 1;
+            self.keys[slot] = key;
+            self.vals[slot] = value;
+            self.live += 1;
+        }
+
+        /// The value mapped to `key`, or `null` if absent.
+        pub fn get(self: *Self, key: K) ?V {
+            if (self.state.len == 0) return null;
+            var f: bool = false;
+            const slot = self.findSlot(key, &f);
+            if (f) return self.vals[slot];
+            return null;
+        }
+
+        /// The address of value slot `slot`. Isolated in its own method ON PURPOSE:
+        /// taking `&self.vals[slot]` in a method body that ALSO stored into another
+        /// field of `*self` first currently mis-lowers the interior pointer, so
+        /// `getOrPut`/`getPtr` route every `&self.vals[i]` through this clean helper
+        /// (whose body does nothing but take the address). The returned pointer is
+        /// valid until the next insert that grows the table.
+        fn valuePtr(self: *Self, slot: usize) *V {
+            return &self.vals[slot];
+        }
+
+        /// A pointer to the value mapped to `key`, or `null` if absent. The pointer
+        /// is valid until the next insert that triggers a grow (which moves storage).
+        pub fn getPtr(self: *Self, key: K) ?*V {
+            if (self.state.len == 0) return null;
+            var f: bool = false;
+            const slot = self.findSlot(key, &f);
+            if (f) return self.valuePtr(slot);
+            return null;
+        }
+
+        /// Find `key`, inserting a slot for it if absent. Returns a pointer to the
+        /// (new or existing) value plus whether it already existed — the canonical
+        /// "increment a counter, defaulting to one" primitive. A newly created slot
+        /// holds an UNDEFINED value the caller must initialize through `value_ptr`.
+        pub fn getOrPut(self: *Self, key: K) !GetOrPutResult {
+            if ((self.upt + 1) * 4 >= self.state.len * 3) {
+                try self.grow();
+            }
+            var f: bool = false;
+            const slot = self.findSlot(key, &f);
+            if (f) {
+                return GetOrPutResult{ .value_ptr = self.valuePtr(slot), .found_existing = true };
+            }
+            if (self.state[slot] == 0) {
+                self.upt += 1;
+            }
+            self.state[slot] = 1;
+            self.keys[slot] = key;
+            self.live += 1;
+            return GetOrPutResult{ .value_ptr = self.valuePtr(slot), .found_existing = false };
+        }
+
+        /// `true` if `key` is present.
+        pub fn contains(self: *Self, key: K) bool {
+            if (self.state.len == 0) return false;
+            var f: bool = false;
+            _ = self.findSlot(key, &f);
+            return f;
+        }
+
+        /// Remove `key`, returning `true` if it was present. The slot becomes a
+        /// TOMBSTONE (probing past it still works); a later `put` of any key may
+        /// reuse it.
+        pub fn remove(self: *Self, key: K) bool {
+            if (self.state.len == 0) return false;
+            var f: bool = false;
+            const slot = self.findSlot(key, &f);
+            if (not f) return false;
+            self.state[slot] = 2;
+            self.live -= 1;
+            return true;
+        }
+
+        /// The number of live entries.
+        pub fn count(self: *Self) usize {
+            return self.live;
+        }
+
+        /// A forward iterator over the live entries (arbitrary order).
+        pub fn iterator(self: *Self) Iterator {
+            return Iterator{ .map = self, .idx = 0 };
+        }
+    };
+}
+
+/// The hash/eq `Context` FACTORY for INTEGER keys of type `K` (any width that
+/// coerces to `u64`). `IntContext(K)` yields a `struct` with concrete-typed
+/// `hash`/`eql` — a factory rather than a single `anytype` struct because a
+/// context method must take the CONCRETE key type to monomorphize correctly
+/// (an `anytype` context method mis-infers its return type inside a generic).
+///
+/// The hash is a Fibonacci/Knuth multiplicative mix written to be OVERFLOW-FREE
+/// in safe builds: each 32-bit half of the key is multiplied by the golden-ratio
+/// constant and masked back to 32 bits before the products can exceed `u64`, so
+/// it never traps. The two halves are XOR-folded so high bits of wide keys matter.
+pub fn IntContext(comptime K: type) type {
+    return struct {
+        /// Hash an integer key to a 64-bit value (low 32 bits carry the entropy
+        /// used by the power-of-two slot mask).
+        pub fn hash(k: K) u64 {
+            const m: u64 = 0xFFFFFFFF;
+            const knuth: u64 = 2654435761;
+            const w: u64 = @intCast(k);
+            const lo: u64 = w & m;
+            const hi: u64 = (w >> 32) & m;
+            return ((lo * knuth) & m) ^ ((hi * knuth) & m);
+        }
+
+        /// Integer key equality.
+        pub fn eql(a: K, b: K) bool {
+            return a == b;
+        }
+    };
+}
+
+/// The hash/eq `Context` for `[]const u8` (string / byte-slice) keys. The hash is
+/// FNV-1a folded into 32 bits at every step so the running product never exceeds
+/// `u64` (overflow-free in safe builds); `eql` is a length-then-byte compare,
+/// identical to `mem.eql(u8, a, b)`.
+pub const StrContext = struct {
+    /// FNV-1a over the bytes, masked to 32 bits each step.
+    pub fn hash(s: []const u8) u64 {
+        var h: u64 = 2166136261;
+        const prime: u64 = 16777619;
+        const m: u64 = 0xFFFFFFFF;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            h = h ^ @as(u64, s[i]);
+            h = (h * prime) & m;
+        }
+        return h;
+    }
+
+    /// Byte-slice key equality.
+    pub fn eql(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        var i: usize = 0;
+        while (i < a.len) : (i += 1) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+};
+
+/// `HashMap` specialized to integer keys with the bundled `IntContext(K)`.
+pub fn IntHashMap(comptime K: type, comptime V: type) type {
+    return HashMap(K, V, IntContext(K));
+}
+
+/// `HashMap` specialized to `[]const u8` (string) keys with the bundled
+/// `StrContext`. The classic word-count / interning map.
+pub fn StringHashMap(comptime V: type) type {
+    return HashMap([]const u8, V, StrContext);
+}
+
+/// The convenience map for INTEGER keys — `AutoHashMap(K, V)` binds the bundled
+/// `IntContext(K)`, so it is exactly `IntHashMap(K, V)`.
+///
+/// LIMITATION (documented): the spec's fully-automatic key dispatch — selecting
+/// `StrContext` for a `[]const u8` key, `IntContext` otherwise, at comptime —
+/// would require folding `mem.eql(@typeName(K), "[]const u8")` to a comptime
+/// `bool` inside a type-returning branch. That comptime fold is not yet performed
+/// (both `type`-valued branches are then checked and fail to unify), so the auto
+/// form covers the integer case here and STRING keys use `StringHashMap(V)`
+/// directly. Both rest on the same `HashMap(K, V, Context)` core.
+pub fn AutoHashMap(comptime K: type, comptime V: type) type {
+    return HashMap(K, V, IntContext(K));
+}
+
+// =========================================================================
+//  sort — in-place comparison sorting (introsort-lite) + search
+// =========================================================================
+//
+// `Sorter(T, Context)` sorts a `[]T` IN PLACE with no allocation. The algorithm
+// is quicksort (median-of-three-ish `arr[mid]` pivot, Hoare partition) with an
+// insertion-sort cutoff for short ranges (`< 16`), plus a standalone stable
+// insertion sort, `isSorted`, and `binarySearch`.
+//
+// As with `HashMap`, the ORDER is a comptime `Context` type exposing
+// `pub fn lessThan(a: T, b: T) bool`, invoked from inside the engine's methods —
+// the spec's `sort(T, slice, ctx, lessThan)` fn-value signature is not expressible
+// (a function cannot be passed by value), so the surface is `Sorter(T, Asc).sort(s)`.
+// `asc(T)`/`desc(T)` build ascending/descending contexts for any ordered scalar.
+pub const sort = struct {
+    /// An ascending-order context for any scalar `T` supporting `<` (the default
+    /// comparison order). `sort.asc(i32)` is the `Context` for `Sorter`.
+    pub fn asc(comptime T: type) type {
+        return struct {
+            /// `a` precedes `b` iff `a < b` — ascending order.
+            pub fn lessThan(a: T, b: T) bool {
+                return a < b;
+            }
+        };
+    }
+
+    /// A descending-order context for any scalar `T` supporting `>`. Sorting with
+    /// `sort.desc(T)` orders largest-first.
+    pub fn desc(comptime T: type) type {
+        return struct {
+            /// `a` precedes `b` iff `a > b` — descending order.
+            pub fn lessThan(a: T, b: T) bool {
+                return a > b;
+            }
+        };
+    }
+
+    /// The in-place sort/search engine over `[]T`, ordered by `Context.lessThan`.
+    pub fn Sorter(comptime T: type, comptime Context: type) type {
+        return struct {
+            /// Stable insertion sort of the inclusive range `arr[lo..=hi]`. O(n^2)
+            /// in the worst case but optimal on short or nearly-sorted ranges,
+            /// which is exactly where quicksort hands off.
+            fn insertionRange(arr: []T, lo: usize, hi: usize) void {
+                var i: usize = lo + 1;
+                while (i <= hi) : (i += 1) {
+                    const key = arr[i];
+                    var j: usize = i;
+                    while (j > lo and Context.lessThan(key, arr[j - 1])) : (j -= 1) {
+                        arr[j] = arr[j - 1];
+                    }
+                    arr[j] = key;
+                }
+            }
+
+            /// Quicksort the inclusive range `arr[lo..=hi]`, falling back to
+            /// insertion sort below the cutoff. The Hoare partition meets in the
+            /// middle, then recurses on `[lo..=j]` and `[j+1..=hi]`.
+            fn quick(arr: []T, lo: usize, hi: usize) void {
+                if (hi <= lo) return;
+                if (hi - lo < 16) {
+                    insertionRange(arr, lo, hi);
+                    return;
+                }
+                const mid = lo + (hi - lo) / 2;
+                const pivot = arr[mid];
+                var i: usize = lo;
+                var j: usize = hi;
+                while (true) {
+                    while (Context.lessThan(arr[i], pivot)) : (i += 1) {}
+                    while (Context.lessThan(pivot, arr[j])) : (j -= 1) {}
+                    if (i >= j) {
+                        if (j > lo) quick(arr, lo, j);
+                        if (j + 1 <= hi) quick(arr, j + 1, hi);
+                        return;
+                    }
+                    const tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                    i += 1;
+                    j -= 1;
+                }
+            }
+
+            /// Sort `arr` in place in ascending `Context` order. O(n log n) expected.
+            pub fn sort(arr: []T) void {
+                if (arr.len < 2) return;
+                quick(arr, 0, arr.len - 1);
+            }
+
+            /// A stable insertion sort of the whole slice (O(n^2); use for small or
+            /// nearly-sorted inputs where a stable order matters).
+            pub fn insertionSort(arr: []T) void {
+                if (arr.len < 2) return;
+                insertionRange(arr, 0, arr.len - 1);
+            }
+
+            /// `true` if `arr` is already in non-decreasing `Context` order.
+            pub fn isSorted(arr: []const T) bool {
+                var i: usize = 1;
+                while (i < arr.len) : (i += 1) {
+                    if (Context.lessThan(arr[i], arr[i - 1])) return false;
+                }
+                return true;
+            }
+
+            /// Binary search a slice ALREADY SORTED in `Context` order; returns the
+            /// index of a matching element, or `null` if absent. "Match" means
+            /// neither `a < b` nor `b < a` under the comparator.
+            pub fn binarySearch(arr: []const T, target: T) ?usize {
+                var lo: usize = 0;
+                var hi: usize = arr.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (Context.lessThan(arr[mid], target)) {
+                        lo = mid + 1;
+                    } else if (Context.lessThan(target, arr[mid])) {
+                        hi = mid;
+                    } else {
+                        return mid;
+                    }
+                }
+                return null;
+            }
+        };
+    }
+};
+
+// =========================================================================
+//  ascii — single-byte classification and case
+// =========================================================================
+
+/// Pure, single-byte ASCII classification and case folding. Every function is a
+/// total function on a `u8`; non-ASCII bytes (>= 0x80) classify as "not" and are
+/// returned unchanged by the case folders.
+pub const ascii = struct {
+    /// `true` for `'0'..='9'`.
+    pub fn isDigit(c: u8) bool {
+        return c >= '0' and c <= '9';
+    }
+
+    /// `true` for `'a'..='z'` or `'A'..='Z'`.
+    pub fn isAlpha(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+    }
+
+    /// `true` for a letter or a digit.
+    pub fn isAlphanumeric(c: u8) bool {
+        return isAlpha(c) or isDigit(c);
+    }
+
+    /// `true` for space, tab, newline, carriage return, vertical tab, or form feed.
+    pub fn isWhitespace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12;
+    }
+
+    /// Lowercase an ASCII letter; any other byte is returned unchanged.
+    pub fn toLower(c: u8) u8 {
+        if (c >= 'A' and c <= 'Z') return c + 32;
+        return c;
+    }
+
+    /// Uppercase an ASCII letter; any other byte is returned unchanged.
+    pub fn toUpper(c: u8) u8 {
+        if (c >= 'a' and c <= 'z') return c - 32;
+        return c;
+    }
+};
+
+// =========================================================================
+//  unicode — UTF-8 decode / validate / encode / count
+// =========================================================================
+
+/// The result of decoding one UTF-8 sequence: the codepoint, the number of bytes
+/// it occupied, and whether the decode succeeded. On failure `cp`/`len` are zero
+/// and `ok` is `false`.
+pub const Utf8DecodeResult = struct {
+    /// The decoded Unicode scalar value (valid only when `ok`).
+    cp: u32,
+    /// The number of bytes the sequence occupied (valid only when `ok`).
+    len: usize,
+    /// `true` iff a well-formed sequence was decoded.
+    ok: bool,
+};
+
+/// UTF-8 utilities over `[]const u8`. Decoding rejects truncation, bad lead/
+/// continuation bytes, and out-of-range codepoints; encoding writes into a
+/// caller-owned `*[4]u8` (a pointer-to-array out-parameter, because a slice over a
+/// stack array does not write back through the call boundary).
+pub const unicode = struct {
+    /// The byte length a lead byte announces: 1 (ASCII), 2, 3, or 4, or `0` for a
+    /// byte that cannot start a sequence (a continuation byte or an invalid lead).
+    pub fn utf8Len(first: u8) usize {
+        if (first < 0x80) return 1;
+        if ((first & 0xE0) == 0xC0) return 2;
+        if ((first & 0xF0) == 0xE0) return 3;
+        if ((first & 0xF8) == 0xF0) return 4;
+        return 0;
+    }
+
+    /// Decode the sequence beginning at `s[i]`. Rejects an out-of-range index, an
+    /// invalid lead byte, truncation (the sequence runs past `s.len`), a bad
+    /// continuation byte (`(b & 0xC0) != 0x80`), an OVERLONG encoding (a codepoint
+    /// encoded in more bytes than its minimum form), a UTF-16 SURROGATE
+    /// (U+D800..U+DFFF, not a valid Unicode scalar value), and a codepoint above
+    /// U+10FFFF.
+    pub fn utf8DecodeAt(s: []const u8, i: usize) Utf8DecodeResult {
+        if (i >= s.len) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        const b0 = s[i];
+        const n = utf8Len(b0);
+        if (n == 0 or i + n > s.len) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        if (n == 1) return Utf8DecodeResult{ .cp = @as(u32, b0), .len = 1, .ok = true };
+        var cp: u32 = undefined;
+        if (n == 2) {
+            cp = @as(u32, b0 & 0x1F);
+        } else if (n == 3) {
+            cp = @as(u32, b0 & 0x0F);
+        } else {
+            cp = @as(u32, b0 & 0x07);
+        }
+        var k: usize = 1;
+        while (k < n) : (k += 1) {
+            const bx = s[i + k];
+            if ((bx & 0xC0) != 0x80) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+            cp = (cp << 6) | @as(u32, bx & 0x3F);
+        }
+        // Reject overlong forms: each length has a minimum codepoint, below which
+        // the sequence is an over-long encoding of a value that fits in fewer
+        // bytes (a classic security smuggling vector, e.g. an overlong `/`).
+        if (n == 2 and cp < 0x80) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        if (n == 3 and cp < 0x800) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        if (n == 4 and cp < 0x10000) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        // Reject UTF-16 surrogates: U+D800..U+DFFF are not Unicode scalar values.
+        if (cp >= 0xD800 and cp <= 0xDFFF) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        if (cp > 0x10FFFF) return Utf8DecodeResult{ .cp = 0, .len = 0, .ok = false };
+        return Utf8DecodeResult{ .cp = cp, .len = n, .ok = true };
+    }
+
+    /// `true` iff `s` is entirely well-formed UTF-8.
+    pub fn utf8Validate(s: []const u8) bool {
+        var i: usize = 0;
+        while (i < s.len) {
+            const r = utf8DecodeAt(s, i);
+            if (not r.ok) return false;
+            i += r.len;
+        }
+        return true;
+    }
+
+    /// The number of codepoints in `s`, or `null` if `s` is not valid UTF-8.
+    pub fn utf8CountCodepoints(s: []const u8) ?usize {
+        var i: usize = 0;
+        var n: usize = 0;
+        while (i < s.len) {
+            const r = utf8DecodeAt(s, i);
+            if (not r.ok) return null;
+            i += r.len;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Encode codepoint `cp` into `out`, returning the number of bytes written (1
+    /// to 4), or `0` if `cp` is above U+10FFFF. `out` is a pointer-to-array so the
+    /// bytes are visible to the caller (a `[]u8` over a stack array would not be).
+    pub fn utf8Encode(cp: u32, out: *[4]u8) usize {
+        // A UTF-16 surrogate is not a valid Unicode scalar value and must not be
+        // encoded (it would round-trip through the decoder as ill-formed).
+        if (cp >= 0xD800 and cp <= 0xDFFF) return 0;
+        if (cp < 0x80) {
+            out[0] = @intCast(cp);
+            return 1;
+        }
+        if (cp < 0x800) {
+            out[0] = @intCast(0xC0 | (cp >> 6));
+            out[1] = @intCast(0x80 | (cp & 0x3F));
+            return 2;
+        }
+        if (cp < 0x10000) {
+            out[0] = @intCast(0xE0 | (cp >> 12));
+            out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+            out[2] = @intCast(0x80 | (cp & 0x3F));
+            return 3;
+        }
+        if (cp <= 0x10FFFF) {
+            out[0] = @intCast(0xF0 | (cp >> 18));
+            out[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+            out[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+            out[3] = @intCast(0x80 | (cp & 0x3F));
+            return 4;
+        }
+        return 0;
+    }
+};
+
+// =========================================================================
+//  math — common numeric helpers + a fixed-width big integer
+// =========================================================================
+
+/// Pure numeric helpers. Each is a total function on concrete or comptime-`T`
+/// scalars (no allocator, no `Context` — none passes a function value). The
+/// width-specific forms (`absI64`) sit beside comptime-generic ones (`min`/`max`/
+/// `clamp`) so both a concrete and a generic call site are served.
+pub const math = struct {
+    /// The lesser of `a` and `b`.
+    pub fn min(comptime T: type, a: T, b: T) T {
+        return if (a < b) a else b;
+    }
+
+    /// The greater of `a` and `b`.
+    pub fn max(comptime T: type, a: T, b: T) T {
+        return if (a > b) a else b;
+    }
+
+    /// `x` clamped into `[lo, hi]` (assumes `lo <= hi`).
+    pub fn clamp(comptime T: type, x: T, lo: T, hi: T) T {
+        if (x < lo) return lo;
+        if (x > hi) return hi;
+        return x;
+    }
+
+    /// The absolute value of a signed 64-bit integer.
+    pub fn absI64(x: i64) i64 {
+        return if (x < 0) -x else x;
+    }
+
+    /// The greatest common divisor of `a` and `b` (Euclid's algorithm). `gcd(0,0)`
+    /// is `0`.
+    pub fn gcd(a: u64, b: u64) u64 {
+        var x = a;
+        var y = b;
+        while (y != 0) {
+            const t = x % y;
+            x = y;
+            y = t;
+        }
+        return x;
+    }
+
+    /// The least common multiple of `a` and `b`; `0` if either is `0`. Computed as
+    /// `a / gcd * b` to keep the intermediate small.
+    pub fn lcm(a: u64, b: u64) u64 {
+        if (a == 0 or b == 0) return 0;
+        return (a / gcd(a, b)) * b;
+    }
+
+    /// `base` raised to `exp`, by binary exponentiation (square-and-multiply).
+    /// `pow(x, 0)` is `1`.
+    pub fn powU64(base: u64, exp: u64) u64 {
+        var result: u64 = 1;
+        var b = base;
+        var e = exp;
+        while (e != 0) {
+            if (e & 1 == 1) result = result * b;
+            e = e >> 1;
+            if (e != 0) b = b * b;
+        }
+        return result;
+    }
+};
+
+/// A fixed-width 256-bit unsigned big integer: eight little-endian 32-bit limbs.
+/// Beyond `u128`, with `add`/`sub`/`mul`/`cmp`/`toDecimal`. Every limb operation
+/// is done in `u64` and masked back to 32 bits so no intermediate can overflow a
+/// `u64` (and thus never traps in a safe build). This is the fixed-precision form;
+/// arbitrary precision would back the limbs with a heap slice.
+pub const Big = struct {
+    const Self = @This();
+
+    /// The eight little-endian 32-bit limbs (`limbs[0]` is least significant).
+    limbs: [8]u32,
+
+    /// The big integer `0`.
+    pub fn zero() Self {
+        return Self{ .limbs = [8]u32{ 0, 0, 0, 0, 0, 0, 0, 0 } };
+    }
+
+    /// The big integer equal to a `u64` (occupies the low two limbs).
+    pub fn fromU64(v: u64) Self {
+        var b = zero();
+        const m: u64 = 0xFFFFFFFF;
+        b.limbs[0] = @intCast(v & m);
+        b.limbs[1] = @intCast((v >> 32) & m);
+        return b;
+    }
+
+    /// `a + b`, wrapping (mod 2^256) on overflow past the top limb.
+    pub fn add(a: Self, b: Self) Self {
+        var r = zero();
+        const m: u64 = 0xFFFFFFFF;
+        var carry: u64 = 0;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const s: u64 = @as(u64, a.limbs[i]) + @as(u64, b.limbs[i]) + carry;
+            r.limbs[i] = @intCast(s & m);
+            carry = s >> 32;
+        }
+        return r;
+    }
+
+    /// `a - b`, wrapping (mod 2^256) if `b > a`.
+    pub fn sub(a: Self, b: Self) Self {
+        var r = zero();
+        const m: u64 = 0xFFFFFFFF;
+        const base: u64 = 0x100000000;
+        var borrow: u64 = 0;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const ai: u64 = @as(u64, a.limbs[i]);
+            const bi: u64 = @as(u64, b.limbs[i]) + borrow;
+            if (ai >= bi) {
+                r.limbs[i] = @intCast((ai - bi) & m);
+                borrow = 0;
+            } else {
+                r.limbs[i] = @intCast((ai + base - bi) & m);
+                borrow = 1;
+            }
+        }
+        return r;
+    }
+
+    /// `a * b`, schoolbook, truncated to 256 bits. Each partial product is a
+    /// `u32 * u32` in `u64` plus carries, masked to 32 bits per limb.
+    pub fn mul(a: Self, b: Self) Self {
+        var r = zero();
+        const m: u64 = 0xFFFFFFFF;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            var carry: u64 = 0;
+            var j: usize = 0;
+            while (i + j < 8) : (j += 1) {
+                const idx = i + j;
+                const cur: u64 = @as(u64, r.limbs[idx]) +
+                    @as(u64, a.limbs[i]) * @as(u64, b.limbs[j]) + carry;
+                r.limbs[idx] = @intCast(cur & m);
+                carry = cur >> 32;
+            }
+        }
+        return r;
+    }
+
+    /// `-1` if `a < b`, `0` if equal, `1` if `a > b` (compares from the top limb).
+    pub fn cmp(a: Self, b: Self) i32 {
+        var i: usize = 8;
+        while (i > 0) {
+            i -= 1;
+            if (a.limbs[i] < b.limbs[i]) return -1;
+            if (a.limbs[i] > b.limbs[i]) return 1;
+        }
+        return 0;
+    }
+
+    /// `true` if the value is zero.
+    pub fn isZero(a: Self) bool {
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            if (a.limbs[i] != 0) return false;
+        }
+        return true;
+    }
+
+    /// Divide `a` in place by a small `u32` divisor, returning the remainder. Used
+    /// by `toDecimal` to peel off base-10 digits.
+    fn divSmall(a: *Self, d: u32) u32 {
+        const m: u64 = 0xFFFFFFFF;
+        var rem: u64 = 0;
+        var i: usize = 8;
+        while (i > 0) {
+            i -= 1;
+            const cur: u64 = (rem << 32) | @as(u64, a.limbs[i]);
+            a.limbs[i] = @intCast((cur / @as(u64, d)) & m);
+            rem = cur % @as(u64, d);
+        }
+        return @intCast(rem);
+    }
+
+    /// Render the value as a base-10 string into the caller's `buf`, returning the
+    /// written prefix. `buf` must be large enough (80 bytes covers 256 bits). The
+    /// digits are produced least-significant-first by repeated `divSmall(10)`,
+    /// then reversed in place.
+    pub fn toDecimal(a: Self, buf: []u8) []u8 {
+        var tmp = a;
+        if (isZero(tmp)) {
+            buf[0] = '0';
+            return buf[0..1];
+        }
+        var n: usize = 0;
+        while (not isZero(tmp)) {
+            const dig = divSmall(&tmp, 10);
+            buf[n] = @intCast(@as(u32, '0') + dig);
+            n += 1;
+        }
+        var i: usize = 0;
+        var j: usize = n - 1;
+        while (i < j) {
+            const t = buf[i];
+            buf[i] = buf[j];
+            buf[j] = t;
+            i += 1;
+            j -= 1;
+        }
+        return buf[0..n];
+    }
+};
 
 // =========================================================================
 //  testing — assertions + a leak-detecting testing allocator

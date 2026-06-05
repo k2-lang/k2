@@ -347,6 +347,11 @@ impl crate::check::Checker<'_> {
         }
 
         self.self_stack.push(struct_ty);
+        // Mirror every member resolution recorded while walking these bodies under
+        // THIS instantiation's struct type, so a comptime-type-param member call
+        // (`Context.lessThan`) keeps a per-instantiation target the MIR can recover
+        // (the span-keyed table is shared across instantiations — last writer wins).
+        self.inst_member_ctx.push(struct_ty);
         for m in &c.members {
             if let k2_syntax::Member::Decl(Item::Fn {
                 params, ret, body, ..
@@ -371,6 +376,7 @@ impl crate::check::Checker<'_> {
                 self.pop_fn_frame();
             }
         }
+        self.inst_member_ctx.pop();
         self.self_stack.pop();
 
         // Restore every overwritten binding so the shared DefIds are unchanged

@@ -960,8 +960,33 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             .unwrap_or_else(|| self.type_at(span))
     }
 
-    /// The member resolution recorded at `span`, if any.
+    /// The enclosing instantiated struct type of the function currently being
+    /// lowered, if it is a generic method (its [`InstId`] is keyed by a single
+    /// `Type(struct_ty)` argument). Used to recover per-instantiation member
+    /// resolutions so a comptime-type-param member dispatch resolves to the right
+    /// target for THIS instantiation, not whichever one ran last in the checker.
+    fn current_inst_struct_ty(&self) -> Option<TypeId> {
+        match self.func.inst.args.as_slice() {
+            [InstArgKey::Type(t)] => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// The member resolution recorded at `span`, if any. When the current function
+    /// is a generic-method instantiation, an instantiation-specific resolution
+    /// (keyed by `(struct_ty, span)`) takes precedence over the span-only table —
+    /// the latter is shared across instantiations and holds only the last writer.
     fn member_at(&self, span: Span) -> Option<MemberRes> {
+        if let Some(struct_ty) = self.current_inst_struct_ty() {
+            if let Some(res) = self
+                .lo
+                .typed
+                .inst_members
+                .get(&(struct_ty, (span.start, span.end)))
+            {
+                return Some(*res);
+            }
+        }
         self.lo.typed.members.get(&(span.start, span.end)).copied()
     }
 

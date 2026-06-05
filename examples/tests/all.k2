@@ -24,3 +24,91 @@ test "mirror flag is a comptime-known bool" {
     const flag = support.mirror_to_stderr;
     try std.testing.expect(flag == true or flag == false);
 }
+
+// --- std v0.22 containers / algorithms, under the leak-checking allocator -----
+//
+// NOTE: these `test` blocks all compile into ONE runner, so every HashMap they
+// instantiate coexists in a single compilation. A generic container's NESTED
+// `Iterator`/`Entry` types (which capture the outer `K`/`V`) do not yet
+// monomorphize cleanly across TWO different key types in one compilation, so the
+// map tests here use a SINGLE key type (`[]const u8`). The integer-keyed map's
+// stress/resize/remove path is covered standalone by the `cli.rs` run-tests
+// (`run_std_hashmap_stress_resize_remove_iterate`), where it is the only map.
+
+test "StringHashMap counts words, removes, and iterates (leak-clean)" {
+    const alloc = std.testing.allocator;
+    var map = std.StringHashMap(usize).init(alloc);
+    defer map.deinit();
+    const words = [_][]const u8{ "a", "b", "a", "c", "b", "a" };
+    var i: usize = 0;
+    while (i < words.len) : (i += 1) {
+        const cur = map.get(words[i]) orelse 0;
+        try map.put(words[i], cur + 1);
+    }
+    try std.testing.expectEqual(@as(usize, 3), map.get("a").?);
+    try std.testing.expectEqual(@as(usize, 3), map.count());
+    try std.testing.expect(map.remove("c"));
+    try std.testing.expect(not map.contains("c"));
+    try std.testing.expectEqual(@as(usize, 2), map.count());
+    var total: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |e| total += e.value;
+    try std.testing.expectEqual(@as(usize, 5), total);
+}
+
+test "StringHashMap getOrPut increments in place across a resize" {
+    const alloc = std.testing.allocator;
+    var map = std.StringHashMap(usize).init(alloc);
+    defer map.deinit();
+    const keys = [_][]const u8{ "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9" };
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var i: usize = 0;
+        while (i < keys.len) : (i += 1) {
+            const r = try map.getOrPut(keys[i]);
+            if (r.found_existing) {
+                r.value_ptr.* += 1;
+            } else {
+                r.value_ptr.* = 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10), map.count());
+    try std.testing.expectEqual(@as(usize, 3), map.get("k7").?);
+}
+
+test "sort orders ascending and descending and binary-searches" {
+    var xs = [_]i32{ 5, 1, 4, 2, 8, 0, 9, 3, 7, 6 };
+    std.sort.Sorter(i32, std.sort.asc(i32)).sort(&xs);
+    try std.testing.expect(std.sort.Sorter(i32, std.sort.asc(i32)).isSorted(&xs));
+    try std.testing.expectEqual(@as(i32, 0), xs[0]);
+    try std.testing.expectEqual(@as(i32, 9), xs[9]);
+    try std.testing.expect(std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&xs, 7) != null);
+    try std.testing.expect(std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&xs, 42) == null);
+    std.sort.Sorter(i32, std.sort.desc(i32)).sort(&xs);
+    try std.testing.expectEqual(@as(i32, 9), xs[0]);
+    try std.testing.expectEqual(@as(i32, 0), xs[9]);
+}
+
+test "unicode decodes and validates UTF-8" {
+    const euro = [_]u8{ 0xE2, 0x82, 0xAC };
+    try std.testing.expectEqual(@as(usize, 1), std.unicode.utf8CountCodepoints(&euro).?);
+    const r = std.unicode.utf8DecodeAt(&euro, 0);
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqual(@as(u32, 0x20AC), r.cp);
+    const lone = [_]u8{0x80};
+    try std.testing.expect(not std.unicode.utf8Validate(&lone));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), std.unicode.utf8Encode(0x20AC, &buf));
+    try std.testing.expectEqual(@as(u8, 0xE2), buf[0]);
+}
+
+test "math helpers and bignum compute correct values" {
+    try std.testing.expectEqual(@as(i64, 7), std.math.absI64(-7));
+    try std.testing.expectEqual(@as(u64, 12), std.math.gcd(48, 36));
+    try std.testing.expectEqual(@as(u64, 1024), std.math.powU64(2, 10));
+    try std.testing.expectEqual(@as(i64, 10), std.math.clamp(i64, 12, 0, 10));
+    const c = std.Big.add(std.Big.fromU64(4294967301), std.Big.fromU64(4294967303));
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, "8589934604", c.toDecimal(&buf));
+}

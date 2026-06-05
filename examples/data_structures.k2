@@ -1,0 +1,110 @@
+// data_structures.k2 — the v0.22 standard-library containers and algorithms.
+//
+// A guided tour of the data structures k2's `std` ships, all written in k2 and
+// reached through `@import("std")`. Like every other example, this one allocates
+// only through an explicit `Allocator` capability, frees with `defer`, and prints
+// only through the `io` capability — the containers add nothing ambient.
+//
+// It demonstrates:
+//
+//   * std.IntHashMap     — a growable, allocator-taking hash map (open addressing,
+//                          tombstone deletion, dynamic resize) with iteration,
+//   * std.sort           — an in-place introsort over a slice, with a comptime
+//                          comparator context (ascending and descending),
+//   * std.unicode        — UTF-8 decode / validate / count over real byte runs,
+//   * std.math + std.Big — numeric helpers and a fixed-width big integer.
+//
+// Run it:
+//   k2 run examples/data_structures.k2
+//
+// NOTE: a generic container reached with AGGREGATE elements (a `[]const u8` key)
+// or a generic-helper body indexing a still-generic slice is the existing
+// native-backend refusal — these run on the VM (`k2c run`), the semantic
+// reference, exactly as the other generic-container examples do.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // The program-wide allocator: a leak-checking GPA, torn down at shutdown.
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected at shutdown");
+    }
+    const alloc = gpa.allocator();
+
+    // --- std.IntHashMap: insert past several resizes, read back, remove --------
+    // The map owns its three parallel slices (keys/vals/state) and frees them on
+    // deinit. Inserting 256 keys forces the table to grow several times (it starts
+    // at capacity 8 and doubles at a 75% load factor); every key still reads back.
+    var map = std.IntHashMap(u32, u64).init(alloc);
+    defer map.deinit();
+
+    var i: u32 = 0;
+    while (i < 256) : (i += 1) {
+        try map.put(i, @as(u64, i) * @as(u64, i));
+    }
+    // Remove the multiples of three (each leaves a tombstone the next insert may
+    // reuse), then read a survivor and a removed key back.
+    var removed: usize = 0;
+    i = 0;
+    while (i < 256) : (i += 1) {
+        if (i % 3 == 0) {
+            if (map.remove(i)) removed += 1;
+        }
+    }
+    // Sum the live values by iterating — the iterator yields each live entry once.
+    var live_sum: u64 = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| live_sum += entry.value;
+
+    const has9: u32 = if (map.contains(9)) 1 else 0; // 9 % 3 == 0 → removed
+    const has10: u32 = if (map.contains(10)) 1 else 0; // survives
+    try out.print("map: count={d} removed={d} has9={d} has10={d} get10={d} live_sum={d}\n", .{ map.count(), removed, has9, has10, map.get(10).?, live_sum });
+
+    // --- std.sort: in-place sort with a comptime comparator context -----------
+    // The order is a comptime `Context` type exposing `lessThan`; `sort.asc(T)` and
+    // `sort.desc(T)` build them. Both orders coexist correctly in one program.
+    var xs = [_]i32{ 42, -7, 13, 0, 99, -1, 13, 8, 25, -100, 7, 64, 13, 2 };
+    std.sort.Sorter(i32, std.sort.asc(i32)).sort(&xs);
+    const sorted: u32 = if (std.sort.Sorter(i32, std.sort.asc(i32)).isSorted(&xs)) 1 else 0;
+    const at13 = std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&xs, 13);
+    const found13: u32 = if (at13 != null) 1 else 0;
+    const asc_min = xs[0];
+    const asc_max = xs[xs.len - 1];
+    std.sort.Sorter(i32, std.sort.desc(i32)).sort(&xs);
+    try out.print("sort: asc_min={d} asc_max={d} isSorted={d} found13={d} desc_first={d}\n", .{ asc_min, asc_max, sorted, found13, xs[0] });
+
+    // --- std.unicode: decode / validate / count over real UTF-8 ---------------
+    // "café" is 5 bytes / 4 codepoints (é = U+00E9, two bytes); the euro sign
+    // U+20AC is one 3-byte codepoint; a lone continuation byte is invalid.
+    const cafe = [_]u8{ 0x63, 0x61, 0x66, 0xC3, 0xA9 };
+    const euro = [_]u8{ 0xE2, 0x82, 0xAC };
+    const lone = [_]u8{0x80};
+    const euro_cp = std.unicode.utf8DecodeAt(&euro, 0);
+    const lone_ok: u32 = if (std.unicode.utf8Validate(&lone)) 1 else 0;
+    try out.print("unicode: cafe_len={d} euro_cp={d} euro_bytes={d} lone_valid={d}\n", .{ std.unicode.utf8CountCodepoints(&cafe).?, euro_cp.cp, euro_cp.len, lone_ok });
+
+    // --- std.math + std.Big: helpers and a fixed-width big integer ------------
+    // The bignum holds eight little-endian u32 limbs (256-bit), so a product that
+    // overflows u64 is exact: 12345678901 * 98765432109 has 21 decimal digits.
+    const product = std.Big.mul(std.Big.fromU64(12345678901), std.Big.fromU64(98765432109));
+    var digits: [80]u8 = undefined;
+    try out.print("math: gcd={d} pow={d} clamp={d} bigmul={s}\n", .{ std.math.gcd(252, 105), std.math.powU64(2, 16), std.math.clamp(i64, 500, 0, 255), product.toDecimal(&digits) });
+}
+
+// A unit test exercising the same containers under the leak-checking testing
+// allocator: a forgotten `free`/`deinit` fails the test deterministically.
+test "hashmap insert/get/remove is leak-clean" {
+    const alloc = std.testing.allocator;
+    var map = std.IntHashMap(u32, u64).init(alloc);
+    defer map.deinit();
+    var i: u32 = 0;
+    while (i < 64) : (i += 1) try map.put(i, @as(u64, i) + 1);
+    try std.testing.expectEqual(@as(u64, 43), map.get(42).?);
+    try std.testing.expect(map.remove(42));
+    try std.testing.expect(not map.contains(42));
+    try std.testing.expectEqual(@as(usize, 63), map.count());
+}

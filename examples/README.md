@@ -62,6 +62,7 @@ through it.
 | [`errors.k2`](errors.k2) | `error` sets, `try`, `catch`, `errdefer`, `\|\|` | Failures are values; cleanup and propagation are visible. |
 | [`comptime_reflection.k2`](comptime_reflection.k2) | `@typeInfo`, `inline for`, `@field`, `@compileError` | Generate a struct printer and a serializer at compile time. |
 | [`concurrency.k2`](concurrency.k2) | `Executor`/`Task` spawn-join, `Channel(T)`, `Mutex`, `atomic`, `event.Loop`/`await` | Deterministic cooperative concurrency: capabilities passed, never global. |
+| [`data_structures.k2`](data_structures.k2) | `std.IntHashMap`, `std.sort`, `std.unicode`, `std.math`/`std.Big` | The stdlib containers and algorithms: a resizing hash map, an in-place sort, UTF-8, and a big integer. |
 | [`build.k2`](build.k2) | `*Build`, artifacts, options, steps | A realistic build description, written in k2 itself. |
 
 ---

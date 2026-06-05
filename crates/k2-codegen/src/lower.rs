@@ -851,6 +851,23 @@ impl<'p> FnLower<'p> {
                     // A bare/local slice (an array view `a[1..3]`, a direct
                     // `alloc(u32,n)` result) keeps its natural element stride — never
                     // shared generically. Arrays always use their natural layout.
+                    // A bare/local slice whose ELEMENT type is still `deferred`
+                    // (an un-monomorphized generic helper param like `quick`'s
+                    // `arr: []T` lowered with `T` unresolved) has no known element
+                    // stride: `layout(deferred)` falls back to the 8-byte WORD,
+                    // which silently mis-strides a smaller scalar (an `i32` array,
+                    // stride 4). Refuse cleanly so the program runs on the VM rather
+                    // than producing wrong results. (The FIELD-reached slice case
+                    // below is the deliberate, correct generic-container word-stride
+                    // path and is left untouched.)
+                    if is_slice
+                        && !saw_field
+                        && matches!(self.prog.arena.get(*ty), Type::Deferred | Type::AnyType)
+                    {
+                        return Err(
+                            self.unsup("slice index with an unresolved (generic) element type")
+                        );
+                    }
                     let stride = if is_slice && saw_field {
                         self.field_slice_stride(*ty)
                     } else {

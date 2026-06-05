@@ -1,0 +1,886 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var gpa
+        (call
+          (field init
+            (field GeneralPurposeAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident sys)
+        )
+      )
+      (defer
+        (block
+          (const leaked
+            (call
+              (field deinit
+                (ident gpa)
+              )
+            )
+          )
+          (if
+            (cond
+              (ident leaked)
+            )
+            (then
+              (block
+                (expr
+                  (builtin @panic
+                    (str "\"memory leak detected at shutdown\"")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const alloc
+        (call
+          (field allocator
+            (ident gpa)
+          )
+        )
+      )
+      (var map
+        (call
+          (field init
+            (call
+              (field IntHashMap
+                (ident std)
+              )
+              (ident u32)
+              (ident u64)
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident map)
+            )
+          )
+        )
+      )
+      (var i
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 256)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field put
+                    (ident map)
+                  )
+                  (ident i)
+                  (binary mul
+                    (builtin @as
+                      (ident u64)
+                      (ident i)
+                    )
+                    (builtin @as
+                      (ident u64)
+                      (ident i)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var removed
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (assign =
+        (ident i)
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 256)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (if
+              (cond
+                (binary eq
+                  (binary rem
+                    (ident i)
+                    (int 3)
+                  )
+                  (int 0)
+                )
+              )
+              (then
+                (block
+                  (if
+                    (cond
+                      (call
+                        (field remove
+                          (ident map)
+                        )
+                        (ident i)
+                      )
+                    )
+                    (then
+                      (block
+                        (assign +=
+                          (ident removed)
+                          (int 1)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var live_sum
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (var it
+        (call
+          (field iterator
+            (ident map)
+          )
+        )
+      )
+      (while
+        (cond
+          (call
+            (field next
+              (ident it)
+            )
+          )
+        )
+        (capture entry)
+        (body
+          (block
+            (assign +=
+              (ident live_sum)
+              (field value
+                (ident entry)
+              )
+            )
+          )
+        )
+      )
+      (const has9
+        (ty
+          (ident u32)
+        )
+        (if
+          (cond
+            (call
+              (field contains
+                (ident map)
+              )
+              (int 9)
+            )
+          )
+          (then
+            (int 1)
+          )
+          (else
+            (int 0)
+          )
+        )
+      )
+      (const has10
+        (ty
+          (ident u32)
+        )
+        (if
+          (cond
+            (call
+              (field contains
+                (ident map)
+              )
+              (int 10)
+            )
+          )
+          (then
+            (int 1)
+          )
+          (else
+            (int 0)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"map: count={d} removed={d} has9={d} has10={d} get10={d} live_sum={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field count
+                    (ident map)
+                  )
+                )
+                (ident removed)
+                (ident has9)
+                (ident has10)
+                (unwrap
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (int 10)
+                  )
+                )
+                (ident live_sum)
+              )
+            )
+          )
+        )
+      )
+      (var xs
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident i32)
+            )
+          )
+          (tuple
+            (int 42)
+            (unary neg
+              (int 7)
+            )
+            (int 13)
+            (int 0)
+            (int 99)
+            (unary neg
+              (int 1)
+            )
+            (int 13)
+            (int 8)
+            (int 25)
+            (unary neg
+              (int 100)
+            )
+            (int 7)
+            (int 64)
+            (int 13)
+            (int 2)
+          )
+        )
+      )
+      (expr
+        (call
+          (field sort
+            (call
+              (field Sorter
+                (field sort
+                  (ident std)
+                )
+              )
+              (ident i32)
+              (call
+                (field asc
+                  (field sort
+                    (ident std)
+                  )
+                )
+                (ident i32)
+              )
+            )
+          )
+          (unary addrof
+            (ident xs)
+          )
+        )
+      )
+      (const sorted
+        (ty
+          (ident u32)
+        )
+        (if
+          (cond
+            (call
+              (field isSorted
+                (call
+                  (field Sorter
+                    (field sort
+                      (ident std)
+                    )
+                  )
+                  (ident i32)
+                  (call
+                    (field asc
+                      (field sort
+                        (ident std)
+                      )
+                    )
+                    (ident i32)
+                  )
+                )
+              )
+              (unary addrof
+                (ident xs)
+              )
+            )
+          )
+          (then
+            (int 1)
+          )
+          (else
+            (int 0)
+          )
+        )
+      )
+      (const at13
+        (call
+          (field binarySearch
+            (call
+              (field Sorter
+                (field sort
+                  (ident std)
+                )
+              )
+              (ident i32)
+              (call
+                (field asc
+                  (field sort
+                    (ident std)
+                  )
+                )
+                (ident i32)
+              )
+            )
+          )
+          (unary addrof
+            (ident xs)
+          )
+          (int 13)
+        )
+      )
+      (const found13
+        (ty
+          (ident u32)
+        )
+        (if
+          (cond
+            (binary ne
+              (ident at13)
+              (null)
+            )
+          )
+          (then
+            (int 1)
+          )
+          (else
+            (int 0)
+          )
+        )
+      )
+      (const asc_min
+        (index
+          (ident xs)
+          (int 0)
+        )
+      )
+      (const asc_max
+        (index
+          (ident xs)
+          (binary sub
+            (field len
+              (ident xs)
+            )
+            (int 1)
+          )
+        )
+      )
+      (expr
+        (call
+          (field sort
+            (call
+              (field Sorter
+                (field sort
+                  (ident std)
+                )
+              )
+              (ident i32)
+              (call
+                (field desc
+                  (field sort
+                    (ident std)
+                  )
+                )
+                (ident i32)
+              )
+            )
+          )
+          (unary addrof
+            (ident xs)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sort: asc_min={d} asc_max={d} isSorted={d} found13={d} desc_first={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident asc_min)
+                (ident asc_max)
+                (ident sorted)
+                (ident found13)
+                (index
+                  (ident xs)
+                  (int 0)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const cafe
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident u8)
+            )
+          )
+          (tuple
+            (int 0x63)
+            (int 0x61)
+            (int 0x66)
+            (int 0xC3)
+            (int 0xA9)
+          )
+        )
+      )
+      (const euro
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident u8)
+            )
+          )
+          (tuple
+            (int 0xE2)
+            (int 0x82)
+            (int 0xAC)
+          )
+        )
+      )
+      (const lone
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident u8)
+            )
+          )
+          (tuple
+            (int 0x80)
+          )
+        )
+      )
+      (const euro_cp
+        (call
+          (field utf8DecodeAt
+            (field unicode
+              (ident std)
+            )
+          )
+          (unary addrof
+            (ident euro)
+          )
+          (int 0)
+        )
+      )
+      (const lone_ok
+        (ty
+          (ident u32)
+        )
+        (if
+          (cond
+            (call
+              (field utf8Validate
+                (field unicode
+                  (ident std)
+                )
+              )
+              (unary addrof
+                (ident lone)
+              )
+            )
+          )
+          (then
+            (int 1)
+          )
+          (else
+            (int 0)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"unicode: cafe_len={d} euro_cp={d} euro_bytes={d} lone_valid={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (unwrap
+                  (call
+                    (field utf8CountCodepoints
+                      (field unicode
+                        (ident std)
+                      )
+                    )
+                    (unary addrof
+                      (ident cafe)
+                    )
+                  )
+                )
+                (field cp
+                  (ident euro_cp)
+                )
+                (field len
+                  (ident euro_cp)
+                )
+                (ident lone_ok)
+              )
+            )
+          )
+        )
+      )
+      (const product
+        (call
+          (field mul
+            (field Big
+              (ident std)
+            )
+          )
+          (call
+            (field fromU64
+              (field Big
+                (ident std)
+              )
+            )
+            (int 12345678901)
+          )
+          (call
+            (field fromU64
+              (field Big
+                (ident std)
+              )
+            )
+            (int 98765432109)
+          )
+        )
+      )
+      (var digits
+        (ty
+          (array-type
+            (len
+              (int 80)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"math: gcd={d} pow={d} clamp={d} bigmul={s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field gcd
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 252)
+                  (int 105)
+                )
+                (call
+                  (field powU64
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 2)
+                  (int 16)
+                )
+                (call
+                  (field clamp
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (ident i64)
+                  (int 500)
+                  (int 0)
+                  (int 255)
+                )
+                (call
+                  (field toDecimal
+                    (ident product)
+                  )
+                  (unary addrof
+                    (ident digits)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"hashmap insert/get/remove is leak-clean\""
+    (block
+      (const alloc
+        (field allocator
+          (field testing
+            (ident std)
+          )
+        )
+      )
+      (var map
+        (call
+          (field init
+            (call
+              (field IntHashMap
+                (ident std)
+              )
+              (ident u32)
+              (ident u64)
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident map)
+            )
+          )
+        )
+      )
+      (var i
+        (ty
+          (ident u32)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (int 64)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field put
+                    (ident map)
+                  )
+                  (ident i)
+                  (binary add
+                    (builtin @as
+                      (ident u64)
+                      (ident i)
+                    )
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 43)
+            )
+            (unwrap
+              (call
+                (field get
+                  (ident map)
+                )
+                (int 42)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expect
+              (field testing
+                (ident std)
+              )
+            )
+            (call
+              (field remove
+                (ident map)
+              )
+              (int 42)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expect
+              (field testing
+                (ident std)
+              )
+            )
+            (unary not
+              (call
+                (field contains
+                  (ident map)
+                )
+                (int 42)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 63)
+            )
+            (call
+              (field count
+                (ident map)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

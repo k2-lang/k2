@@ -12,6 +12,55 @@ is being designed in the open and nothing is stable yet.
 
 ### Added
 
+- **Stdlib data structures (v0.22).** The bundled `std` (written in k2, in
+  `crates/k2-std/std/std.k2`) gains a family of containers, algorithms, and
+  allocators, each exercised by a running program (VM is the semantic reference;
+  native where it compiles, else cleanly refused):
+  - **`std.HashMap(K, V, Context)`** — a generic, allocator-taking hash map using
+    OPEN ADDRESSING with linear probing, tombstone deletion, and dynamic RESIZE at
+    a 75% used+tombstone load factor (power-of-two capacity, cheap mask indexing).
+    `put`/`get`/`getPtr`/`getOrPut`/`contains`/`remove`/`count`/`iterator` with a
+    nested `Entry`/`Iterator`/`GetOrPutResult`. Hash/eq are a comptime `Context`
+    type (a function value cannot be passed): `IntContext(K)` (overflow-free
+    Fibonacci/Knuth multiplicative hash) and `StrContext` (FNV-1a folded to 32
+    bits). `IntHashMap`/`StringHashMap`/`AutoHashMap` are the thin wrappers.
+    Verified: 1000 inserts across several grows, full readback, update, remove-
+    evens + tombstone reinsertion, iterate — all correct and leak-clean.
+  - **`std.sort`** — `Sorter(T, Ctx).sort(slice)` sorts in place (introsort-lite:
+    Hoare quicksort with an insertion-sort cutoff at n<16), plus `insertionSort`,
+    `isSorted`, and `binarySearch`. Order is a comptime `Ctx` with `lessThan`;
+    `sort.asc(T)`/`sort.desc(T)` build them. Ascending AND descending in one
+    program is correct.
+  - **`std.unicode`** — UTF-8 `utf8Len`/`utf8DecodeAt`/`utf8Validate`/
+    `utf8CountCodepoints`/`utf8Encode` (out-buffer `*[4]u8`), correct on ASCII,
+    2/3/4-byte sequences, and rejected invalid/truncated input. Plus `std.ascii`
+    single-byte classification/case.
+  - **`std.math` + `std.Big`** — `min`/`max`/`clamp`/`absI64`/`gcd`/`lcm`/`powU64`
+    (all overflow-free), and a fixed-width 256-bit big integer (`add`/`sub`/`mul`/
+    `cmp`/`toDecimal`) over eight little-endian u32 limbs.
+  - **New allocators** — a `CountingAllocator` wrapper that tallies alloc/free/
+    bytes while forwarding to an inner `Allocator` (the inner GPA still leak-checks
+    clean), and a `StackAllocator` (bump-over-a-buffer alias of the
+    `FixedBufferAllocator`).
+- **Compiler fixes enabling the above (all minimal, all behind the existing
+  green suite):**
+  - **Per-instantiation member resolution** (`k2-types`): a generic method body's
+    member dispatch on a comptime-TYPE param (`Context.lessThan` inside
+    `Sorter(T, Asc)` vs `Sorter(T, Desc)`) is now recorded under the enclosing
+    instantiated struct type, and the MIR keys private sibling-helper calls
+    (`sort` → `quick` → `insertionRange`) by that same instantiation — so two
+    contexts in one program no longer collapse to a single (last-checked) target.
+    Member resolution is also order-independent (a concrete target is never
+    downgraded to `Deferred` by a later static check).
+  - **Heap-backed byte-slice formatting** (`k2-vm`): a `[]const u8`/`[]u8` built at
+    run time (e.g. `Big.toDecimal`'s digit run, a `buf[0..n]` view) now renders
+    correctly under `{s}`/`{}` — the format path materializes a byte slice's heap
+    bytes before the (heap-blind) format engine runs.
+  - **Native clean-refusal of unresolved-element slice indexing** (`k2-codegen`): a
+    bare slice whose element type is still `deferred` (an un-monomorphized generic
+    helper param) is refused with the standard "run it on the VM" note instead of
+    mis-striding at the word size and producing wrong results.
+
 - **Rich diagnostics & error-return traces (v0.20).** Every phase can now attach a
   *primary labelled span* plus zero-or-more *secondary labelled spans*, *notes*,
   and a *help/suggestion* to a diagnostic, and the driver renders them in a

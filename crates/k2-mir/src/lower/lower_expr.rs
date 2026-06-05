@@ -1240,7 +1240,26 @@ impl FnBuilder<'_, '_> {
                 if !self.lo.fn_items.contains_key(&def) {
                     return None;
                 }
-                let inst = InstId::plain(def);
+                // A bare sibling call inside a generic method (`quick(arr, ...)`
+                // from `Sorter(T, Ctx).sort`) must inherit the SAME instantiation
+                // key, so the sibling is monomorphized per `(T, Ctx)` and its body
+                // resolves `Ctx.method` for THIS instantiation. Otherwise it lowers
+                // once (`InstId::plain`) and every instantiation shares one copy —
+                // collapsing distinct comptime-type-param dispatch to a single
+                // (last-checked) target. Keyed only when `def` is a sibling method
+                // of the current instantiated struct.
+                let inst = if let Some(struct_ty) = self.current_inst_struct_ty() {
+                    if self.is_sibling_method(struct_ty, def) {
+                        InstId {
+                            fn_def: def,
+                            args: vec![InstArgKey::Type(struct_ty)],
+                        }
+                    } else {
+                        InstId::plain(def)
+                    }
+                } else {
+                    InstId::plain(def)
+                };
                 let fid = self.lo.enqueue(inst);
                 Some((fid, Vec::new(), 0))
             }
@@ -1288,6 +1307,19 @@ impl FnBuilder<'_, '_> {
             }
             _ => None,
         }
+    }
+
+    /// `true` if `method_def` is a member declaration of the instantiated struct
+    /// `struct_ty` — i.e. a sibling method reachable by a bare name from inside
+    /// another method of the same generic instantiation.
+    fn is_sibling_method(&self, struct_ty: TypeId, method_def: DefId) -> bool {
+        if let Type::Struct(sid) = self.lo.typed.arena.get(struct_ty) {
+            return self.lo.typed.arena.structs[sid.0 as usize]
+                .decls
+                .iter()
+                .any(|d| d.def == method_def);
+        }
+        false
     }
 
     /// `true` if a method's defining struct is an instantiated generic (so it

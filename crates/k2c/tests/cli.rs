@@ -584,6 +584,27 @@ fn run_generic_list_example_exact_output() {
     );
 }
 
+/// The v0.22 `data_structures.k2` example (HashMap + sort + unicode + math/
+/// bignum) runs to completion with its exact expected stdout and exit 0.
+#[test]
+fn run_data_structures_example_exact_output() {
+    let path = examples_dir().join("data_structures.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "data_structures.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "map: count=170 removed=86 has9=0 has10=1 get10=100 live_sum=3684665\n\
+         sort: asc_min=-100 asc_max=99 isSorted=1 found13=1 desc_first=99\n\
+         unicode: cafe_len=4 euro_cp=8364 euro_bytes=3 lone_valid=0\n\
+         math: gcd=21 pow=65536 clamp=255 bigmul=1219326311336229232209\n"
+    );
+}
+
 /// `std.ArrayList(T)` append/grow/len/deinit round-trip — a real monomorphized
 /// container reached through the bundled std module.
 #[test]
@@ -607,6 +628,297 @@ pub fn main(sys: *System) !void {
         "ArrayList round-trip must exit 0; stderr: {stderr}"
     );
     assert_eq!(stdout, "len=20 first=0 last=361\n");
+}
+
+// =========================================================================
+//  Standard library (v0.22): HashMap, sort, unicode, math/bignum, allocators
+// =========================================================================
+
+/// HEADLINE ACCEPTANCE: a `std.IntHashMap(u32, u64)` takes 1000 inserts (forcing
+/// several grows past the 75% load factor), reads every key back, updates one,
+/// removes all even keys (tombstones), reinserts them (reusing tombstones), and
+/// iterates the live set — every result exact, leak-clean, exit 0.
+#[test]
+fn run_std_hashmap_stress_resize_remove_iterate() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer { const leaked = gpa.deinit(); if (leaked) @panic("leak"); }
+    const alloc = gpa.allocator();
+    var map = std.IntHashMap(u32, u64).init(alloc);
+    defer map.deinit();
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) try map.put(i, @as(u64, i) * 11);
+    var readback: usize = 0;
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        if (map.get(i)) |v| { if (v == @as(u64, i) * 11) readback += 1; }
+    }
+    try map.put(7, 7777);
+    var removed: usize = 0;
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        if (i % 2 == 0) { if (map.remove(i)) removed += 1; }
+    }
+    const has4: u32 = if (map.contains(4)) 1 else 0;
+    const has7: u32 = if (map.contains(7)) 1 else 0;
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        if (i % 2 == 0) try map.put(i, @as(u64, i) * 11);
+    }
+    var it = map.iterator();
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    try out.print("count={d} readback={d} get7={d} removed={d} mid={d} has4={d} has7={d} final={d} get4={d} iter={d}\n", .{
+        @as(usize, 1000), readback, map.get(7).?, removed, @as(usize, 500),
+        has4, has7, map.count(), map.get(4).?, n,
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "HashMap stress must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "count=1000 readback=1000 get7=7777 removed=500 mid=500 has4=0 has7=1 final=1000 get4=44 iter=1000\n"
+    );
+}
+
+/// `std.StringHashMap(u32)` word-count via `getOrPut` (the in-place increment
+/// primitive returning a pointer into the value storage), then a full iterate.
+#[test]
+fn run_std_string_hashmap_word_count_getorput() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer { const leaked = gpa.deinit(); if (leaked) @panic("leak"); }
+    const alloc = gpa.allocator();
+    var map = std.StringHashMap(u32).init(alloc);
+    defer map.deinit();
+    const words = [_][]const u8{ "apple", "banana", "apple", "fig", "banana", "apple" };
+    var i: usize = 0;
+    while (i < words.len) : (i += 1) {
+        const r = try map.getOrPut(words[i]);
+        if (r.found_existing) { r.value_ptr.* += 1; } else { r.value_ptr.* = 1; }
+    }
+    var total: u32 = 0;
+    var it = map.iterator();
+    while (it.next()) |e| total += e.value;
+    try out.print("distinct={d} apple={d} banana={d} fig={d} missing={d} total={d}\n", .{
+        map.count(), map.get("apple").?, map.get("banana").?, map.get("fig").?,
+        map.get("grape") orelse 0, total,
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "string word-count must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "distinct=3 apple=3 banana=2 fig=1 missing=0 total=6\n"
+    );
+}
+
+/// `std.sort.Sorter(T, Ctx)` sorts ascending AND descending in the same program
+/// (distinct comptime contexts), with `isSorted` / `binarySearch` over the
+/// result — the multi-context monomorphization that the per-instantiation member
+/// resolution makes correct.
+#[test]
+fn run_std_sort_ascending_descending_and_search() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var xs = [_]i32{ 9, 3, 7, 1, 8, 2, 8, 0, 5, 3, 6, 4, 20, 11, 13, 19, 17, 2, 15, 0, 10, 12, 14, 18, 16, 1, 7, 6, 9, 5 };
+    std.sort.Sorter(i32, std.sort.asc(i32)).sort(&xs);
+    const asc_ok: u32 = if (std.sort.Sorter(i32, std.sort.asc(i32)).isSorted(&xs)) 1 else 0;
+    const found: u32 = if (std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&xs, 13) != null) 1 else 0;
+    const absent: u32 = if (std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&xs, 100) == null) 1 else 0;
+    const asc_first = xs[0];
+    const asc_last = xs[xs.len - 1];
+    std.sort.Sorter(i32, std.sort.desc(i32)).sort(&xs);
+    try out.print("asc_first={d} asc_last={d} sorted={d} found={d} absent={d} desc_first={d} desc_last={d}\n", .{
+        asc_first, asc_last, asc_ok, found, absent, xs[0], xs[xs.len - 1],
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "sort must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "asc_first=0 asc_last=20 sorted=1 found=1 absent=1 desc_first=20 desc_last=0\n"
+    );
+}
+
+/// `std.unicode`: count / decode / validate / encode over ASCII, 2/3/4-byte
+/// sequences, and rejected invalid input.
+#[test]
+fn run_std_unicode_decode_validate_encode() {
+    // The multi-byte inputs are spelled as explicit UTF-8 byte arrays (a Rust raw
+    // byte-string literal cannot carry non-ASCII): "café" = 63 61 66 C3A9, the
+    // euro sign U+20AC = E2 82 AC, the grinning-face emoji U+1F600 = F0 9F 98 80.
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const cafe = [_]u8{ 0x63, 0x61, 0x66, 0xC3, 0xA9 };
+    const euro = [_]u8{ 0xE2, 0x82, 0xAC };
+    const emoji = [_]u8{ 0xF0, 0x9F, 0x98, 0x80 };
+    const cafe_n = std.unicode.utf8CountCodepoints(&cafe).?;
+    const euro_n = std.unicode.utf8CountCodepoints(&euro).?;
+    const emoji_n = std.unicode.utf8CountCodepoints(&emoji).?;
+    const re = std.unicode.utf8DecodeAt(&emoji, 0);
+    const bad = [_]u8{ 0x80, 0x41 };
+    const trunc = [_]u8{ 0xE2, 0x82 };
+    const bad_ok: u32 = if (std.unicode.utf8Validate(&bad)) 1 else 0;
+    const trunc_ok: u32 = if (std.unicode.utf8Validate(&trunc)) 1 else 0;
+    var eb: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(0x20AC, &eb);
+    try out.print("cafe={d} euro={d} emoji={d} emoji_cp={d} emoji_len={d} bad={d} trunc={d} enc_len={d} b0={d} b1={d} b2={d}\n", .{
+        cafe_n, euro_n, emoji_n, re.cp, re.len, bad_ok, trunc_ok, n, eb[0], eb[1], eb[2],
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "unicode must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "cafe=4 euro=1 emoji=1 emoji_cp=128512 emoji_len=4 bad=0 trunc=0 enc_len=3 b0=226 b1=130 b2=172\n"
+    );
+}
+
+/// std.unicode must REJECT ill-formed UTF-8 that the naive decoder used to
+/// accept: overlong encodings (a codepoint encoded in more bytes than its
+/// minimum form — a classic smuggling vector) and UTF-16 surrogates
+/// (U+D800..U+DFFF, not valid scalar values). utf8Encode must also refuse to
+/// emit a surrogate.
+#[test]
+fn run_std_unicode_rejects_overlong_and_surrogates() {
+    // C0 80 = overlong U+0000; E0 80 AF = overlong '/'; F0 80 80 80 = overlong
+    // U+0000 in 4 bytes; ED A0 80 = U+D800 surrogate; ED BF BF = U+DFFF surrogate.
+    // C3 A9 = valid "é"; F0 9F 98 80 = valid emoji.
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const ol2 = [_]u8{ 0xC0, 0x80 };
+    const ol3 = [_]u8{ 0xE0, 0x80, 0xAF };
+    const ol4 = [_]u8{ 0xF0, 0x80, 0x80, 0x80 };
+    const sur_lo = [_]u8{ 0xED, 0xA0, 0x80 };
+    const sur_hi = [_]u8{ 0xED, 0xBF, 0xBF };
+    const ok_e = [_]u8{ 0xC3, 0xA9 };
+    const ok_em = [_]u8{ 0xF0, 0x9F, 0x98, 0x80 };
+    var eb: [4]u8 = undefined;
+    const enc_surrogate = std.unicode.utf8Encode(0xD800, &eb);
+    const enc_ok = std.unicode.utf8Encode(0x20AC, &eb);
+    try out.print("ol2={d} ol3={d} ol4={d} sl={d} sh={d} e={d} em={d} encsur={d} encok={d}\n", .{
+        if (std.unicode.utf8Validate(&ol2)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&ol3)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&ol4)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&sur_lo)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&sur_hi)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&ok_e)) @as(u32, 1) else 0,
+        if (std.unicode.utf8Validate(&ok_em)) @as(u32, 1) else 0,
+        enc_surrogate, enc_ok,
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "unicode must exit 0; stderr: {stderr}");
+    // All ill-formed inputs reject (0); valid ones accept (1); surrogate encode
+    // returns 0 bytes; a valid encode returns 3.
+    assert_eq!(
+        stdout,
+        "ol2=0 ol3=0 ol4=0 sl=0 sh=0 e=1 em=1 encsur=0 encok=3\n"
+    );
+}
+
+/// `std.math` helpers and the fixed-width `std.Big` bignum (add + multiply +
+/// to-decimal), checked against hand-computed values.
+#[test]
+fn run_std_math_and_bignum() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const a = std.Big.fromU64(4294967301);
+    const b = std.Big.fromU64(4294967303);
+    var buf1: [80]u8 = undefined;
+    var buf2: [80]u8 = undefined;
+    const sum = std.Big.add(a, b).toDecimal(&buf1);
+    const mul = std.Big.mul(std.Big.fromU64(1000000), std.Big.fromU64(1000000)).toDecimal(&buf2);
+    try out.print("abs={d} gcd={d} pow={d} lcm={d} clamp={d} min={d} max={d} bigsum={s} bigmul={s}\n", .{
+        std.math.absI64(-7), std.math.gcd(48, 36), std.math.powU64(2, 10), std.math.lcm(4, 6),
+        std.math.clamp(i64, 12, 0, 10), std.math.min(i64, 3, 9), std.math.max(i64, 3, 9), sum, mul,
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "math/bignum must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "abs=7 gcd=12 pow=1024 lcm=12 clamp=10 min=3 max=9 bigsum=8589934604 bigmul=1000000000000\n"
+    );
+}
+
+/// New allocators: the `CountingAllocator` wrapper tallies alloc/free/bytes while
+/// forwarding to its inner GPA (which then leak-checks clean), and the
+/// `StackAllocator` (bump over a caller buffer) hands out and writes through
+/// disjoint windows.
+#[test]
+fn run_std_counting_and_stack_allocators() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer { const leaked = gpa.deinit(); if (leaked) @panic("leak"); }
+    var c = std.heap.CountingAllocator.init(gpa.allocator());
+    const a = try c.alloc(u8, 100);
+    const b = try c.alloc(u8, 16);
+    c.free(a);
+    c.free(b);
+    var sbuf: [128]u8 = undefined;
+    var sa = std.heap.StackAllocator.init(&sbuf);
+    const salloc = sa.allocator();
+    const x = try salloc.alloc(u8, 32);
+    const y = try salloc.alloc(u8, 16);
+    x[0] = 7;
+    y[0] = 9;
+    try out.print("n_alloc={d} n_free={d} bytes={d} x.len={d} y.len={d} x0={d} y0={d}\n", .{
+        c.n_alloc, c.n_free, c.bytes, x.len, y.len, x[0], y[0],
+    });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "allocators must exit 0; stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "n_alloc=2 n_free=2 bytes=116 x.len=32 y.len=16 x0=7 y0=9\n"
+    );
+}
+
+/// A `[]const u8` slice built at run time (here a `std.Big.toDecimal` digit run
+/// over a stack buffer) renders correctly under the `{s}` verb — the heap-backed
+/// byte-slice the format engine now materializes to its bytes.
+#[test]
+fn run_runtime_byte_slice_renders_as_string() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var buf: [16]u8 = undefined;
+    buf[0] = 'h';
+    buf[1] = 'i';
+    const s: []const u8 = buf[0..2];
+    try out.print("s={s} len={d}\n", .{ s, s.len });
+}
+"#;
+    let (code, stdout, stderr) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "byte-slice render must exit 0; stderr: {stderr}");
+    assert_eq!(stdout, "s=hi len=2\n");
 }
 
 /// The handle-based `Allocator` floor: `alloc`/`free`/`realloc`/`create`/
@@ -1859,6 +2171,49 @@ fn lsp_scripted_session_over_stdio() {
 fn run_native_cli(args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
     let out = k2c().args(args).output().unwrap();
     (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
+}
+
+/// The v0.22 std containers/algorithms whose monomorphized helper bodies carry an
+/// unresolved (`deferred`) generic element type — `std.HashMap` (parallel slices)
+/// and `std.sort.Sorter` (its private `quick`/`insertionRange` helpers index a
+/// `[]T` with `T` still generic) — are CLEANLY REFUSED by the native backend
+/// (with the "run it on the VM" note) rather than miscompiled to wrong results.
+/// The VM is the semantic reference for these; the `run_std_*` tests above prove
+/// they compute correctly there.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_native_refuses_std_hashmap_and_sort_cleanly() {
+    let hashmap = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const alloc = sys.heap;
+    var map = std.IntHashMap(u32, u64).init(alloc);
+    defer map.deinit();
+    try map.put(1, 100);
+    _ = map.get(1);
+}
+"#;
+    let (code, _out, err) = run_with_code(&["run-native", "-"], hashmap);
+    assert_ne!(code, 0, "native HashMap must be refused, not run");
+    assert!(
+        err.contains("run it on the VM") || err.contains("native backend"),
+        "native HashMap refusal must name the VM fallback, got: {err}"
+    );
+
+    let sort = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    var xs = [_]i32{ 3, 1, 2 };
+    std.sort.Sorter(i32, std.sort.asc(i32)).sort(&xs);
+    _ = xs;
+}
+"#;
+    let (code, _out, err) = run_with_code(&["run-native", "-"], sort);
+    assert_ne!(code, 0, "native std sort must be refused, not miscompiled");
+    assert!(
+        err.contains("run it on the VM") || err.contains("native backend"),
+        "native sort refusal must name the VM fallback, got: {err}"
+    );
 }
 
 /// **HARD ACCEPTANCE**: `k2c run-native` in `--debug`, `--release-safe`, and

@@ -1641,6 +1641,48 @@ impl<'p> Vm<'p> {
             .map(IntrinsicOutcome::Value)
     }
 
+    /// Materializes any heap-backed byte-`Slice` format argument into a `Str` so
+    /// the (heap-blind) format engine renders it correctly under `{s}`/`{}`.
+    ///
+    /// A `[]const u8` / `[]u8` built at runtime (e.g. `buf[0..n]`, a container's
+    /// owned bytes, `Big.toDecimal`'s digit slice) reaches the formatter as a
+    /// fat `Value::Slice { ptr, len }` whose bytes live in the managed heap; the
+    /// pure `fmt::format_into` cannot read them. This walks the argument tuple
+    /// and, for each slice whose elements are all 8-bit integers (exactly a byte
+    /// slice), reads those bytes here — where the heap IS reachable — and swaps
+    /// in an owned `Value::Str`. Non-byte slices and every other value are left
+    /// untouched, so this only ever fixes the previously-`<int>` byte-slice case.
+    fn materialize_str_slice_args(&self, args: &mut [Value]) {
+        for a in args.iter_mut() {
+            if let Value::Slice { ptr, len } = a {
+                let (ptr, len) = (*ptr, *len);
+                let mut bytes = Vec::with_capacity(len);
+                let mut all_u8 = true;
+                for i in 0..len {
+                    match self.heap.load_index(ptr, i) {
+                        // A byte element is either an explicit `u8` (width 8) or a
+                        // still-untyped integer literal (width 0, the comptime_int a
+                        // `buf[i] = 104` store leaves) whose value fits in a byte. A
+                        // wider element (width 16/32/64) is NOT a byte slice and is
+                        // left as-is, so only true byte runs become strings.
+                        Ok(Value::Int { v, repr })
+                            if repr.width == 8 || (repr.width == 0 && (0..=255).contains(&v)) =>
+                        {
+                            bytes.push(v as u8)
+                        }
+                        _ => {
+                            all_u8 = false;
+                            break;
+                        }
+                    }
+                }
+                if all_u8 {
+                    *a = Value::Str(Rc::new(bytes));
+                }
+            }
+        }
+    }
+
     /// Reads a `[]const u8` argument as a Rust `String`, from either a `Str`
     /// literal value or a heap-backed `Slice` (e.g. `b.fmt(...)`'s `@bufPrint`
     /// result). A non-string value yields the empty string.
@@ -2969,11 +3011,12 @@ impl<'p> Vm<'p> {
             Some(Value::Str(b)) => b.clone(),
             _ => Rc::new(Vec::new()),
         };
-        let arg_values: Vec<Value> = match args.get(2) {
+        let mut arg_values: Vec<Value> = match args.get(2) {
             Some(Value::Struct(fields)) | Some(Value::Array(fields)) => fields.as_ref().clone(),
             Some(other) => vec![other.clone()],
             None => Vec::new(),
         };
+        self.materialize_str_slice_args(&mut arg_values);
         let mut scratch = Vec::new();
         format_into(&mut scratch, &fmt_bytes, &arg_values).map_err(|e| {
             Halt::Panic(PanicInfo {
@@ -3036,11 +3079,12 @@ impl<'p> Vm<'p> {
             _ => Rc::new(Vec::new()),
         };
         // The argument tuple is the second operand (a struct/array of values).
-        let arg_values: Vec<Value> = match args.get(1) {
+        let mut arg_values: Vec<Value> = match args.get(1) {
             Some(Value::Struct(fields)) | Some(Value::Array(fields)) => fields.as_ref().clone(),
             Some(other) => vec![other.clone()],
             None => Vec::new(),
         };
+        self.materialize_str_slice_args(&mut arg_values);
         let mut buf = Vec::new();
         format_into(&mut buf, &fmt_bytes, &arg_values).map_err(|e| {
             Halt::Panic(PanicInfo {

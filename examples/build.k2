@@ -61,6 +61,7 @@ pub fn build(b: *Build) void {
         "generic_list",
         "errors",
         "comptime_reflection",
+        "data_structures",
     };
 
     // A `run` step that builds and runs ONE chosen example:
