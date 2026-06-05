@@ -310,6 +310,34 @@ pub enum IntrinsicId {
     /// `listener.close()` / `stream.close()` / `@netClose(handle)` -> void.
     NetClose,
 
+    // ---- The v0.24 test-runner floor (assertions + fuzzing) -------------
+    //
+    // These back `std.testing`'s assertion helpers and `std.testing.fuzz`. They
+    // are pure RECORDERS / deterministic generators with no I/O: a `@testFail*`
+    // stashes a human "expected X, found Y" message on the VM (read by the test
+    // runner when the assertion's error escapes), and a `@fuzz*` draws from a
+    // fixed-seed splitmix64 stream (reproducible). All are no-ops / zero-cost
+    // outside test mode and stripped in ReleaseFast.
+    /// `@testFail(kind, a, b)` -> void. Records a generic failure "kind failed"
+    /// (with the two integer operands available for length-style messages).
+    TestFail,
+    /// `@testFailEq(a, b)` -> void. Records "expectEqual failed: expected <a>,
+    /// found <b>", formatting both operands with the VM value formatter.
+    TestFailEq,
+    /// `@testFailSlice(a, b)` -> void. Records a slice-comparison failure: a
+    /// "lengths differ: N vs M" message when the lengths differ, else "slices differ
+    /// at index I: expected X, found Y" naming the first differing element. Both
+    /// operands are slices; the VM scans them. This is what makes
+    /// `expectEqualSlices` report the actual divergence instead of the misleading
+    /// "expected N, found N" (the two lengths) on an equal-length mismatch.
+    TestFailSlice,
+    /// `@testFailErr(expected, found)` -> void. Records the error-mismatch message.
+    TestFailErr,
+    /// `@fuzzSeed(seed)` -> void. Seeds the fuzz PRNG (per-iteration in the runner).
+    FuzzSeed,
+    /// `@fuzzNextU64()` -> a `u64` draw from the fuzz PRNG (the caller narrows).
+    FuzzNextU64,
+
     /// An intrinsic the VM does not implement (e.g. a `std.testing.*` member
     /// reached outside the `run` path). Dispatch yields a clean panic naming it.
     Unsupported(String),
@@ -569,6 +597,16 @@ pub struct CompiledFn {
     /// The error-return-trace sites referenced by [`Instr::ReturnErr`] in this
     /// function's `code`. Empty in ReleaseFast (the trace machinery is stripped).
     pub trace_sites: Vec<TraceSite>,
+    /// A `(line, col)` side-table, parallel to `code`: entry `i` is the 1-based
+    /// source position the instruction at `code[i]` lowered from. A statement with
+    /// no meaningful span (a storage/note marker, or a synthesized control edge)
+    /// inherits the last seen position, so every instruction maps to *some* user
+    /// line. This drives two off-hot-path features: LINE/FUNCTION COVERAGE (the VM
+    /// records `lines[pc]` per executed instruction under a flag) and TRAP SPAN
+    /// reporting (a clean panic reads `lines[pc]` for a caret). It is built once at
+    /// compile time and never consulted on the normal run path, so the hot loop
+    /// pays nothing.
+    pub lines: Vec<(u32, u32)>,
 }
 
 /// One error-return-trace site: the source location of a `try` that re-throws.

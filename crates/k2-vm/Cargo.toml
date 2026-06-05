@@ -16,6 +16,10 @@ path = "src/lib.rs"
 [dependencies]
 k2-mir = { path = "../k2-mir" }
 k2-types = { path = "../k2-types" }
+# The `Span` type (source line/col) used by the v0.24 test runner's failure spans
+# and the coverage line table. `k2-mir` already re-exports it transitively; this is
+# the direct, explicit path import (std-only, offline).
+k2-syntax = { path = "../k2-syntax" }
 
 # The integration tests lower k2 source strings to MIR before executing them, so
 # they need the front-end crates. The concurrency tests additionally inject the

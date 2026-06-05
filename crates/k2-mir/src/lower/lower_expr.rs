@@ -1773,7 +1773,12 @@ impl FnBuilder<'_, '_> {
             | "@osArgCount" | "@osArg" | "@osArgs" | "@osGetpid" | "@osExit"
             | "@timeWallReal" | "@timeMonoReal" | "@timeSleepReal"
             | "@netListen" | "@netAccept" | "@netConnect" | "@netSend" | "@netRecv"
-            | "@netLocalPort" | "@netClose" => {
+            | "@netLocalPort" | "@netClose"
+            // The v0.24 test-runner floor: `@testFail*` record the assertion
+            // message on the VM (read by the runner when the error escapes), and
+            // `@fuzz*` draw from the deterministic fuzz PRNG. See the VM dispatcher.
+            | "@testFail" | "@testFailEq" | "@testFailSlice" | "@testFailErr"
+            | "@fuzzSeed" | "@fuzzNextU64" => {
                 // Runtime ops on opaque data -> intrinsic. `@schedSpawn`'s first
                 // argument is the work *function*: lower it to an `FnRef` const
                 // tag (the MIR has no indirect calls), so the VM can build the new

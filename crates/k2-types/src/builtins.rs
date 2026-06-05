@@ -203,7 +203,7 @@ impl crate::check::Checker<'_> {
                     bits: IntBits::Fixed(32),
                 })
             }
-            "@randomInt" | "@clockNow" => {
+            "@randomInt" | "@clockNow" | "@fuzzNextU64" => {
                 self.synth_all(args);
                 self.arena.intern(Type::Int {
                     signed: false,
@@ -224,7 +224,11 @@ impl crate::check::Checker<'_> {
             // statement use (`@mutexLock(id);`) precisely `void` rather than
             // Deferred, so the surrounding `void` method body type-checks exactly.
             "@schedYield" | "@schedRun" | "@chanClose" | "@mutexLock" | "@mutexUnlock"
-            | "@atomicStore" | "@wgAdd" | "@wgDone" | "@wgWait" => {
+            | "@atomicStore" | "@wgAdd" | "@wgDone" | "@wgWait"
+            // The v0.24 test-runner message recorders + the fuzz seeder are all
+            // void-returning effects, so an expression-statement use is exactly
+            // `void` (not Deferred) and the surrounding `!void` body type-checks.
+            | "@testFail" | "@testFailEq" | "@testFailSlice" | "@testFailErr" | "@fuzzSeed" => {
                 self.synth_all(args);
                 self.arena.t_void()
             }

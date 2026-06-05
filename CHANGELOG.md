@@ -449,6 +449,40 @@ is being designed in the open and nothing is stable yet.
 
 ### Fixed
 
+- **`k2c test` runner / coverage / fuzz (v0.24 review).** Nine verified defects in
+  the first-class test runner, each with a regression test:
+  - **Shared instruction budget never reset per test (BLOCKER).** The 200M-step
+    budget was a single per-VM counter that only decremented, so a large suite
+    exhausted it and spuriously FAILed a *later* correct test with "instruction
+    budget exhausted" (a position-dependent, flaky verdict — also per fuzz
+    iteration). `run_one_test` now resets `budget`/`started` per test, so each
+    test/iteration gets the full budget; a genuinely infinite test still trips it
+    *alone* while its neighbors pass.
+  - **Coverage over-counted for path-import (merged) programs (MAJOR).** Std/prelude
+    lines and functions were counted in the USER denominator and mislabeled with the
+    user filename (e.g. a bogus `main2.k2:1195` in a 5-line file). The merge now
+    records the std/build char-offset ranges and coverage excludes prelude code by
+    *provenance*, so the merged report counts only user code.
+  - **Line coverage attributed by bare global line number (MAJOR).** A line was
+    credited "hit" whenever ANY function (including an excluded test body) landed on
+    that line number. Coverage is now attributed per `(function, line)` code point,
+    so a user line is covered only when a counted user function actually ran on it.
+  - **`expectEqualSlices` rendered "expected N, found N" (MAJOR).** Equal-length but
+    differing slices reported only the two (identical) lengths. A new `@testFailSlice`
+    op scans for the first divergence: "slices differ at index I: expected X, found Y"
+    for a content mismatch, "lengths differ: N vs M" for a length mismatch.
+  - **`unreachable` trap caret on the wrong line (MINOR).** The trap inherited the
+    *following* statement's line. The originating check's span is now recorded on the
+    synthesized panic block, so the caret lands on the `unreachable` keyword.
+  - **Merged-path FAIL/uncovered location mislabeled (NIT).** A failure/uncovered line
+    in an imported file was labeled `<root>:<merged-line>`. A merged-source map now
+    recovers and reports the true `(file, line)`.
+  - **Fuzz determinism (MINOR) + `--fuzz-runs=0` silent PASS (NIT).** The shipped
+    fuzz regression now also covers a guaranteed-trigger target (caught at iteration 0
+    for every seed), the probabilistic nature of fuzzing is documented on
+    `std.testing.fuzzInput`, and `--fuzz-runs=0` is rejected ("--fuzz-runs must be
+    >= 1") instead of reporting an unexercised target as a pass.
+
 - **Native miscompile: `for (slice) |x|` over a slice parameter summed to 0
   (v0.17 review #1).** A `&array` argument passed to a `[]const u32` parameter was
   typed by the checker as `*[N]T` and lowered as a single pointer (`OneInt`), but

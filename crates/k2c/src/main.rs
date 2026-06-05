@@ -42,6 +42,7 @@ mod imports;
 mod lock;
 mod multi;
 mod render;
+mod test_cmd;
 
 use std::env;
 use std::fs;
@@ -107,6 +108,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "run-native" => cmd_run_native(rest),
         "build-native" => cmd_build_native(rest),
         "build" => build_cmd::cmd_build(rest),
+        "test" => test_cmd::cmd_test(rest),
         "bench" => cmd_bench(rest),
         "lsp" => cmd_lsp(rest),
         "help" | "--help" | "-h" => {
@@ -137,7 +139,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 /// Semantic phases that key on the appended (still-`@import`) string never see
 /// the original `@import("std")` because the AST node is rewritten in place to a
 /// name reference at the very same span.
-fn parse_program(source: &str) -> ParseResult {
+pub(crate) fn parse_program(source: &str) -> ParseResult {
     // One combined text: user source first (offsets preserved), then std.
     let mut combined = String::with_capacity(source.len() + k2_std::STD_BODY.len() + 64);
     combined.push_str(source);
@@ -742,7 +744,7 @@ fn opt_level_for(mode: BuildMode, opt_flag: bool) -> OptLevel {
 /// Applies the optimizer to `prog` under `mode` (+ optional `--opt`), returning
 /// the stats. Verifies the result is still well-formed; a malformed post-opt MIR
 /// is an internal bug surfaced as an error rather than executed.
-fn run_optimizer(
+pub(crate) fn run_optimizer(
     prog: &mut MirProgram,
     mode: BuildMode,
     opt_flag: bool,
@@ -882,6 +884,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut mode = BuildMode::Debug;
     let mut opt_flag = false;
     let mut opt_report = false;
+    // v0.24: collect + print line/function coverage of the run (`--coverage`).
+    let mut coverage = false;
+    let mut coverage_func_only = false;
     // Arguments after the path are the program's own argv (read by `sys.os.args`).
     let mut forwarded: Vec<String> = Vec::new();
     // The v0.23 OS inputs: the real-env / real-pid opt-ins and a scripted env map.
@@ -901,6 +906,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             } else {
                 return Err("`--env` expects `KEY=VALUE`".to_string());
             }
+            continue;
+        }
+        if a == "--coverage" || a == "--coverage=both" || a == "--coverage=line" {
+            coverage = true;
+            continue;
+        }
+        if a == "--coverage=func" || a == "--coverage=function" {
+            coverage = true;
+            coverage_func_only = true;
             continue;
         }
         match a {
@@ -1033,7 +1047,23 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 
     // Execute `main`; the VM streams program output and propagates the exit code.
     // The label is threaded so an escaping error's return trace points at real
-    // source locations.
+    // source locations. Under `--coverage`, run instrumented and print a coverage
+    // summary (the exit code is unchanged).
+    if coverage {
+        let boundary = source.chars().count() as u32;
+        return Ok(test_cmd::run_with_coverage(
+            &prog,
+            RunArgs {
+                mode,
+                argv: forwarded,
+                os,
+                trace_label: Some(label.clone()),
+            },
+            &label,
+            boundary,
+            coverage_func_only,
+        ));
+    }
     Ok(run_program(
         &prog,
         RunArgs {
@@ -2257,7 +2287,7 @@ impl FileLoader for FsFileLoader {
 
 /// Reads the source either from `-` (standard input) or from a file path.
 /// Returns the source text together with a human-readable label for headers.
-fn read_source(path: &str) -> Result<(String, String), String> {
+pub(crate) fn read_source(path: &str) -> Result<(String, String), String> {
     if path == "-" {
         let mut buf = String::new();
         io::stdin()

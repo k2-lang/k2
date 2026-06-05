@@ -112,6 +112,15 @@ struct FnCompiler<'p> {
     /// `try`-propagating `Return` it compiled, in emission order). Empty in
     /// ReleaseFast, where the trace machinery is stripped at compile time.
     trace_sites: Vec<TraceSite>,
+    /// The `(line, col)` side-table, kept exactly in lockstep with `code` (one
+    /// entry per emitted instruction). Every `emit` records the *current* source
+    /// position [`FnCompiler::cur_pos`], which `compile_stmt` / the terminator
+    /// loop advance to each statement's own span. See [`CompiledFn::lines`].
+    lines: Vec<(u32, u32)>,
+    /// The source position attributed to instructions emitted right now. Seeded to
+    /// the function's defining position and bumped to each statement's span as the
+    /// block loop walks it, so a span-less marker inherits the previous statement.
+    cur_pos: (u32, u32),
 }
 
 impl<'p> FnCompiler<'p> {
@@ -146,10 +155,13 @@ impl<'p> FnCompiler<'p> {
     }
 
     /// Emits an instruction, returning its index (so a later patch pass can fix a
-    /// block target embedded in it).
+    /// block target embedded in it). The current source position
+    /// ([`FnCompiler::cur_pos`]) is recorded into the parallel `lines` table so the
+    /// VM can map this instruction back to a source line for coverage/trap spans.
     fn emit(&mut self, instr: Instr) -> usize {
         let idx = self.code.len();
         self.code.push(instr);
+        self.lines.push(self.cur_pos);
         idx
     }
 
@@ -760,6 +772,14 @@ impl<'p> FnCompiler<'p> {
                 "netRecv" => IntrinsicId::NetRecv,
                 "netLocalPort" => IntrinsicId::NetLocalPort,
                 "netClose" => IntrinsicId::NetClose,
+                // The v0.24 test-runner floor: assertion-message recorders + the
+                // deterministic fuzz PRNG. See `IntrinsicId` and the VM dispatcher.
+                "testFail" => IntrinsicId::TestFail,
+                "testFailEq" => IntrinsicId::TestFailEq,
+                "testFailSlice" => IntrinsicId::TestFailSlice,
+                "testFailErr" => IntrinsicId::TestFailErr,
+                "fuzzSeed" => IntrinsicId::FuzzSeed,
+                "fuzzNextU64" => IntrinsicId::FuzzNextU64,
                 other => IntrinsicId::Unsupported(format!("@{other}")),
             },
             IntrinsicRoot::Value(_) => {
@@ -1028,6 +1048,9 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
         block_offsets: vec![usize::MAX; func.blocks.len()],
         op_window,
         trace_sites: Vec::new(),
+        lines: Vec::new(),
+        // Seed at the function's own definition position; statements override it.
+        cur_pos: (func.span.line, func.span.col),
     };
 
     // Records of control-flow instructions needing a BlockId -> offset patch.
@@ -1045,9 +1068,16 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
     for (bi, block) in func.blocks.iter().enumerate() {
         c.block_offsets[bi] = c.code.len();
         for stmt in &block.stmts {
+            // Advance the line attribution to this statement's own span (if it
+            // carries one), so every instruction it emits maps to the right source
+            // line. A span-less marker keeps the previous statement's position.
+            if let Some(sp) = stmt.span() {
+                c.cur_pos = (sp.line, sp.col);
+            }
             compile_stmt(&mut c, stmt);
         }
-        // Terminator.
+        // Terminator. It carries no span of its own, so it inherits the last
+        // statement's position — except a `Return`, which we re-anchor below.
         match &block.term {
             Terminator::Goto(t) => {
                 let idx = c.emit(Instr::Jump { target: 0 });
@@ -1090,6 +1120,9 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
                 // a plain `Return`, no `trace_sites` growth, no per-return cost.
                 match err_trace {
                     Some(span) if prog.mode != BuildMode::ReleaseFast => {
+                        // Anchor this propagating return's line on the `try` site,
+                        // so the line table points the caret at the rethrow.
+                        c.cur_pos = (span.line, span.col);
                         let site = c.trace_sites.len() as u32;
                         c.trace_sites.push(TraceSite {
                             fn_name: func.name.clone(),
@@ -1104,6 +1137,15 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
                 }
             }
             Terminator::Trap { reason } => {
+                // A synthesized panic block carries the originating check's span
+                // (e.g. the `unreachable` keyword). Anchor the trap instruction's
+                // line on it so the runner's caret lands on the trapping source, not
+                // on whatever statement was compiled last (the panic block is emitted
+                // after every ordinary block, so its inherited `cur_pos` would
+                // otherwise be the last statement's line).
+                if let Some(sp) = block.trap_span {
+                    c.cur_pos = (sp.line, sp.col);
+                }
                 c.emit(Instr::Trap { reason: *reason });
             }
             Terminator::Unreachable => {
@@ -1153,6 +1195,7 @@ fn compile_fn(prog: &MirProgram, func: &MirFunction) -> CompiledFn {
         num_regs,
         addr_taken,
         trace_sites: c.trace_sites,
+        lines: c.lines,
     }
 }
 

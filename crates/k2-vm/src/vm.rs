@@ -12,6 +12,7 @@
 use std::rc::Rc;
 
 use k2_mir::{BinOp, CastKind, DiscrKind, FnId, MirProgram, SliceMeta, TrapReason, UnOp};
+use k2_syntax::Span;
 use k2_types::TypeId;
 
 use crate::build_graph::{
@@ -170,6 +171,170 @@ impl PanicInfo {
     }
 }
 
+/// Whether a test passed or failed — the coarse status the runner reports per
+/// test before any detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestStatus {
+    /// The test ran to completion with no assertion failure, trap, leak, or
+    /// escaped error.
+    Pass,
+    /// The test failed; see the accompanying [`TestFailure`] for why.
+    Fail,
+}
+
+/// Why a test failed — the failure category the runner labels the FAIL with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailKind {
+    /// A `std.testing.expect*` assertion failed (the most common case).
+    FailedExpect,
+    /// A safety check tripped, an `@panic`/`unreachable` fired, or the budget ran
+    /// out — a clean VM panic.
+    Trap,
+    /// An error escaped the test's `!void` body (a `try` propagated past the top).
+    EscapedError,
+    /// The testing allocator detected a leak at test end (an allocation was never
+    /// freed/`deinit`ed).
+    Leak,
+}
+
+impl FailKind {
+    /// A short lowercase label for this failure kind (used in summaries/tests).
+    pub fn label(self) -> &'static str {
+        match self {
+            FailKind::FailedExpect => "failed assertion",
+            FailKind::Trap => "trap",
+            FailKind::EscapedError => "escaped error",
+            FailKind::Leak => "leak",
+        }
+    }
+}
+
+/// A structured test failure: its category, a human "expected X, found Y"–style
+/// message, and the source span the runner renders a caret over (the assertion
+/// call site, the trapping statement, or — as a fallback — the test fn itself).
+#[derive(Clone, Debug)]
+pub struct TestFailure {
+    /// Why the test failed.
+    pub kind: FailKind,
+    /// The human-readable failure message (already formatted).
+    pub message: String,
+    /// The primary span for the caret (`None` if no location is known, in which
+    /// case the driver falls back to the test function's own span).
+    pub span: Option<Span>,
+}
+
+/// The full outcome of one test run: its status and (on failure) the detail.
+#[derive(Clone, Debug)]
+pub struct TestOutcome {
+    /// Pass or fail.
+    pub status: TestStatus,
+    /// The failure detail, present iff `status == Fail`.
+    pub fail: Option<TestFailure>,
+    /// For a fuzz target, the iteration count run (`None` for a unit test).
+    pub fuzz_runs: Option<usize>,
+}
+
+/// Line + function coverage collected over a run, in deterministic order.
+///
+/// `lines_hit` / `fns_hit` are the *executed* sets; `lines_total` / `fns_total`
+/// are the *executable* denominators (user code only — synthesized wrappers and
+/// the std/build prelude are excluded by provenance). Percentages are computed by
+/// the driver with integer math (no host float) so the report is bit-identical
+/// across runs and machines.
+///
+/// Line coverage is attributed at **per-(function, line)** granularity, not by bare
+/// line number: a source line can lower instructions in more than one function, and
+/// crediting a line "hit" just because SOME function landed on that line number
+/// (even an excluded test body or a different user function sharing the line) is
+/// what made the old report over-count. The authoritative sets ([`Coverage::code_points_total`]
+/// / [`Coverage::code_points_hit`]) are `(fnid, line)` pairs; `lines_total` /
+/// `lines_hit` are line-number VIEWS derived from them purely for the human report
+/// (the uncovered-line list and the line label), while the percentage is computed
+/// from the code-point counts so it stays honest under line aliasing.
+#[derive(Clone, Debug, Default)]
+pub struct Coverage {
+    /// Executed `(fnid, line)` code points -> hit count (the authoritative
+    /// numerator, ordered for determinism). A user line is covered only if a user
+    /// function actually executed an instruction on it.
+    pub code_points_hit: std::collections::BTreeMap<(u32, u32), u64>,
+    /// The executable `(fnid, line)` code points of user code (the authoritative
+    /// denominator).
+    pub code_points_total: std::collections::BTreeSet<(u32, u32)>,
+    /// Line-number VIEW of the hit code points (line -> summed hit count), for the
+    /// human report. Derived from `code_points_hit`; not the denominator metric.
+    pub lines_hit: std::collections::BTreeMap<u32, u64>,
+    /// Line-number VIEW of the executable user source lines, for the uncovered-line
+    /// list. Derived from `code_points_total`.
+    pub lines_total: std::collections::BTreeSet<u32>,
+    /// Executed function ids.
+    pub fns_hit: std::collections::BTreeSet<u32>,
+    /// The number of executable (non-synthetic, user) functions.
+    pub fns_total: usize,
+    /// The names of the executed functions (ordered), for a function-list report.
+    pub fn_names_hit: std::collections::BTreeSet<String>,
+    /// The names of all executable (non-synthetic) functions, for the denominator
+    /// report.
+    pub fn_names_total: std::collections::BTreeSet<String>,
+}
+
+impl Coverage {
+    /// The covered/executable line-coverage counts at per-(function, line)
+    /// granularity: `(covered_code_points, total_code_points)`. The driver reports
+    /// the percentage from these so a line shared by two functions counts as two
+    /// code points (covered only when each is actually executed), never collapsing
+    /// to a single over-credited line.
+    pub fn line_counts(&self) -> (usize, usize) {
+        (self.code_points_hit.len(), self.code_points_total.len())
+    }
+}
+
+/// The options that shape a test run: the name filter, coverage collection, and
+/// the fuzz parameters (seed + iteration count). All-default runs every test once
+/// with no coverage and no fuzz — byte-identical to the legacy `run_tests`.
+#[derive(Clone, Debug)]
+pub struct RunOpts {
+    /// Run only tests whose display name contains one of these substrings (OR).
+    /// Empty means "run all".
+    pub filters: Vec<String>,
+    /// Collect line/function coverage when `true`.
+    pub coverage: bool,
+    /// Treat `fuzz` targets as fuzz runs (drive them `fuzz_runs` times) when
+    /// `true`; otherwise a `fuzz` block runs once like a plain test.
+    pub fuzz: bool,
+    /// The fuzz PRNG seed (deterministic; reproducible across runs).
+    pub seed: u64,
+    /// The number of fuzz iterations per target.
+    pub fuzz_runs: usize,
+    /// The user/std source boundary (char offset): a line/function whose span lies
+    /// at/after it is std/prelude code, excluded from the coverage denominator.
+    /// `0` disables the cut (everything counts). Used by the SINGLE-FILE path, where
+    /// the std prelude is appended after the user source so one cut separates them.
+    pub user_boundary: u32,
+    /// Char-offset half-open ranges of PRELUDE (std/build) code to exclude from the
+    /// coverage denominator by provenance. Used by the MERGED (path-import) path,
+    /// where the merge interleaves user modules, the std root, and the root file, so
+    /// a single `user_boundary` cut cannot separate user from prelude. A
+    /// function/line whose defining span starts inside any of these ranges is
+    /// prelude and is excluded. Empty disables the exclusion.
+    pub prelude_ranges: Vec<(u32, u32)>,
+}
+
+impl Default for RunOpts {
+    fn default() -> RunOpts {
+        RunOpts {
+            filters: Vec::new(),
+            coverage: false,
+            fuzz: false,
+            // The blueprint's fixed default seed (a splitmix64 increment constant
+            // variant): deterministic but recognizable.
+            seed: 0x2545_F491_4F6C_DD1D,
+            fuzz_runs: 256,
+            user_boundary: 0,
+            prelude_ranges: Vec::new(),
+        }
+    }
+}
+
 /// The kind (strategy) of an allocator instance in the registry. The kind
 /// decides how `free`/`realloc`/`deinit` behave; allocation itself always goes
 /// through the one shared managed [`Heap`], so pointers/slices from every kind
@@ -268,6 +433,30 @@ pub struct Vm<'p> {
     /// The v0.23 OS-effect state, backed by Rust `std`. All effects flow through
     /// the `sys.fs`/`sys.os`/`sys.time`/`sys.net` capabilities (no ambient global).
     os: OsState,
+    /// Whether to collect line/function coverage. Default `false`; when off, the
+    /// per-instruction coverage bump in [`Vm::run_fiber`] is skipped entirely, so a
+    /// normal run (and the test baseline) pays nothing.
+    cover: bool,
+    /// Executed `(fnid, line)` -> hit count. Keyed by the EXECUTING function as well
+    /// as the line so a line is credited only to the function that actually ran an
+    /// instruction on it — never to a different (or excluded) function that merely
+    /// shares the same physical line number. Ordered (`BTreeMap`) for a
+    /// deterministic report. Only written when `cover` is on.
+    lines_hit: std::collections::BTreeMap<(u32, u32), u64>,
+    /// The function ids that executed at least one instruction. Only written when
+    /// `cover` is on.
+    fns_hit: std::collections::BTreeSet<u32>,
+    /// The last assertion-failure message a `@testFail*` intrinsic recorded, read
+    /// by `run_one_test` when the assertion's error escapes the test. Cleared
+    /// before each test so a stale message never bleeds across tests.
+    pending_test_failure: Option<TestFailure>,
+    /// The fuzz PRNG state (splitmix64). Re-seeded per fuzz iteration by the runner
+    /// (and by `@fuzzSeed`) so each iteration is independently reproducible.
+    fuzz_state: u64,
+    /// The `(line, col)` of the instruction whose `step` last produced a clean
+    /// panic (a trap/unreachable/overflow). Recorded off the hot path so the test
+    /// runner can put a caret on the trapping statement. `None` until a trap fires.
+    last_trap_pos: Option<(u32, u32)>,
 }
 
 /// The per-run OS-effect state the v0.23 `sys.fs`/`sys.os`/`sys.time`/`sys.net`
@@ -332,6 +521,136 @@ impl<'p> Vm<'p> {
                 real_epoch: Some(std::time::Instant::now()),
                 ..OsState::default()
             },
+            cover: false,
+            lines_hit: std::collections::BTreeMap::new(),
+            fns_hit: std::collections::BTreeSet::new(),
+            pending_test_failure: None,
+            fuzz_state: 0x2545_F491_4F6C_DD1D,
+            last_trap_pos: None,
+        }
+    }
+
+    /// Enables/disables line+function coverage collection for subsequent runs.
+    pub fn set_coverage(&mut self, on: bool) {
+        self.cover = on;
+    }
+
+    /// Drains the collected coverage into a [`Coverage`], computing the executable
+    /// denominators (user lines + non-synthetic user functions) from the compiled
+    /// program with no prelude exclusion (everything counts). Deterministic: all
+    /// sets are ordered.
+    pub fn take_coverage(&mut self) -> Coverage {
+        self.coverage_with_boundary(0)
+    }
+
+    /// Like [`Vm::take_coverage`], but excludes any line/function whose defining
+    /// span starts at/after `user_boundary` (the single-file std/prelude cut). Used
+    /// by the single-file test path, where std is appended after the user source.
+    pub fn coverage_with_boundary(&mut self, user_boundary: u32) -> Coverage {
+        self.coverage_filtered(user_boundary, &[])
+    }
+
+    /// Decides whether a MIR function (given its `def.is_none()` flag and defining
+    /// span start) is COUNTED user code for coverage: it must have a source `def`
+    /// (synthesized/def-less wrappers and test bodies are excluded) and not be
+    /// prelude. Prelude is detected two ways, covering both compile paths: a
+    /// `user_boundary` cut (single-file: std appended after the user source, so
+    /// `span_start >= boundary` is prelude) and a set of `prelude_ranges` (merged
+    /// path: the std/build roots are interior regions of the merged text, so a span
+    /// starting inside a range is prelude). Using PROVENANCE rather than a single
+    /// boundary is what lets the merged path exclude the interleaved std functions.
+    fn is_counted_user_fn(
+        def_is_none: bool,
+        span_start: u32,
+        user_boundary: u32,
+        prelude_ranges: &[(u32, u32)],
+    ) -> bool {
+        if def_is_none {
+            return false;
+        }
+        if user_boundary != 0 && span_start >= user_boundary {
+            return false;
+        }
+        if prelude_ranges
+            .iter()
+            .any(|&(lo, hi)| span_start >= lo && span_start < hi)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The general coverage drain: excludes prelude by `user_boundary` (single-file)
+    /// and/or `prelude_ranges` (merged path), and attributes line coverage at
+    /// per-(function, line) granularity so a line is "covered" only when a counted
+    /// user function actually executed an instruction on it.
+    pub fn coverage_filtered(
+        &mut self,
+        user_boundary: u32,
+        prelude_ranges: &[(u32, u32)],
+    ) -> Coverage {
+        // The set of counted user function ids, plus the per-(fnid, line) executable
+        // denominator and the function-name denominator.
+        let mut counted: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut code_points_total: std::collections::BTreeSet<(u32, u32)> =
+            std::collections::BTreeSet::new();
+        let mut fns_total = 0usize;
+        let mut fn_names_total = std::collections::BTreeSet::new();
+        for (fi, func) in self.prog.funcs.iter().enumerate() {
+            if !Self::is_counted_user_fn(
+                func.def.is_none(),
+                func.span.start,
+                user_boundary,
+                prelude_ranges,
+            ) {
+                continue;
+            }
+            counted.insert(fi as u32);
+            fns_total += 1;
+            fn_names_total.insert(func.name.clone());
+            for &(line, _) in &self.compiled[fi].lines {
+                if line != 0 {
+                    code_points_total.insert((fi as u32, line));
+                }
+            }
+        }
+        // The numerator: executed `(fnid, line)` code points that belong to a counted
+        // user function AND are in the denominator (so a hit can never exceed the
+        // total). Because hits are keyed by the EXECUTING function, an excluded test
+        // body / prelude fn that ran on a user line number can no longer credit it.
+        let code_points_hit: std::collections::BTreeMap<(u32, u32), u64> = self
+            .lines_hit
+            .iter()
+            .filter(|((fi, _), _)| counted.contains(fi))
+            .filter(|(k, _)| code_points_total.contains(k))
+            .map(|(&k, &c)| (k, c))
+            .collect();
+        // Line-number VIEWS for the human report (the uncovered list + line label).
+        let lines_total: std::collections::BTreeSet<u32> =
+            code_points_total.iter().map(|&(_, l)| l).collect();
+        let mut lines_hit: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for (&(_, line), &c) in &code_points_hit {
+            *lines_hit.entry(line).or_insert(0) += c;
+        }
+        let mut fn_names_hit = std::collections::BTreeSet::new();
+        let fns_hit: std::collections::BTreeSet<u32> = self
+            .fns_hit
+            .iter()
+            .filter(|fi| counted.contains(fi))
+            .map(|&fi| {
+                fn_names_hit.insert(self.prog.funcs[fi as usize].name.clone());
+                fi
+            })
+            .collect();
+        Coverage {
+            code_points_hit,
+            code_points_total,
+            lines_hit,
+            lines_total,
+            fns_hit,
+            fns_total,
+            fn_names_hit,
+            fn_names_total,
         }
     }
 
@@ -474,62 +793,314 @@ impl<'p> Vm<'p> {
     /// Runs every `test { ... }` block in `prog` on a fresh fiber, returning
     /// `(passed, failed, report_lines)`. Each test function is named `"test …"`
     /// by the MIR lowering; a test that returns an error (its `!void` carries an
-    /// `ErrVal`) or panics is a failure. This reuses the existing test lowering;
-    /// the VM only needs this entry point.
+    /// `ErrVal`) or panics is a failure. This is the legacy line-oriented entry
+    /// point retained for the build driver; the richer first-class runner uses
+    /// [`Vm::run_tests_opts`].
     pub fn run_tests(&mut self) -> (usize, usize, Vec<String>) {
-        // Collect the test entries up front (name + id) so the borrow of `prog`
-        // does not overlap the fiber runs.
-        let tests: Vec<(FnId, String)> = self
+        let (results, _cov) = self.run_tests_opts(&RunOpts::default());
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        let report = results
+            .iter()
+            .map(|r| {
+                let name: &str = r.name.strip_prefix("test ").unwrap_or(r.name.as_str());
+                match &r.failure {
+                    None => {
+                        passed += 1;
+                        format!("{name} ... ok")
+                    }
+                    Some(f) => {
+                        failed += 1;
+                        format!("{name} ... FAILED ({})", f.message)
+                    }
+                }
+            })
+            .collect();
+        (passed, failed, report)
+    }
+
+    /// Runs the `test`/`fuzz` blocks of `prog` under `opts` and returns the
+    /// structured per-test results (in MIR lowering order) plus the collected
+    /// coverage (when `opts.coverage`). Honours the name filter, drives fuzz
+    /// targets deterministically, and checks the testing allocator for leaks at the
+    /// end of every test. Each test runs on a fresh fiber + clean scheduler state.
+    pub fn run_tests_opts(&mut self, opts: &RunOpts) -> (Vec<crate::TestResult>, Option<Coverage>) {
+        self.cover = opts.coverage;
+        // Collect the test entries up front (id + raw name + def span) so the borrow
+        // of `prog` does not overlap the fiber runs.
+        let tests: Vec<(FnId, String, Span)> = self
             .prog
             .funcs
             .iter()
             .filter(|f| f.name == "test" || f.name.starts_with("test "))
-            .map(|f| (f.id, f.name.clone()))
+            .map(|f| (f.id, f.name.clone(), f.span))
             .collect();
-        let mut passed = 0usize;
-        let mut failed = 0usize;
-        let mut report = Vec::new();
-        for (fid, name) in tests {
-            match self.run_one_test(fid) {
-                Ok(()) => {
-                    passed += 1;
-                    report.push(format!("{name} ... ok"));
-                }
-                Err(detail) => {
-                    failed += 1;
-                    report.push(format!("{name} ... FAILED ({detail})"));
-                }
+        let mut results = Vec::new();
+        for (fid, raw_name, fn_span) in tests {
+            let display: &str = raw_name.strip_prefix("test ").unwrap_or(raw_name.as_str());
+            // Apply the name filter (OR over substrings); empty filter runs all.
+            if !opts.filters.is_empty() && !opts.filters.iter().any(|f| display.contains(f)) {
+                continue;
             }
+            let is_fuzz = is_fuzz_name(display);
+            let (outcome, runs) = if is_fuzz && opts.fuzz {
+                let o = self.run_one_fuzz(fid, fn_span, opts);
+                (o, Some(opts.fuzz_runs))
+            } else {
+                (self.run_one_test(fid, fn_span, opts.seed), None)
+            };
+            results.push(crate::TestResult {
+                name: raw_name,
+                passed: outcome.status == TestStatus::Pass,
+                failure: outcome.fail,
+                fuzz_runs: runs,
+            });
         }
-        (passed, failed, report)
+        let coverage = if opts.coverage {
+            Some(self.coverage_filtered(opts.user_boundary, &opts.prelude_ranges))
+        } else {
+            None
+        };
+        (results, coverage)
     }
 
     /// Runs a single test function on a fresh fiber + clean scheduler state,
-    /// returning `Ok(())` on pass or `Err(detail)` on an error/panic.
-    fn run_one_test(&mut self, fid: FnId) -> Result<(), String> {
-        // Reset the scheduler so each test runs on its own clean fiber set (a
-        // prior test's stale fibers must not leak into this one).
+    /// returning its [`TestOutcome`]. Failure precedence: an escaped error / trap
+    /// is reported first; otherwise the testing allocator is checked for a leak,
+    /// which downgrades an apparent pass to a [`FailKind::Leak`] failure.
+    ///
+    /// `seed` seeds the fuzz PRNG so a test that calls `std.testing.fuzz` is
+    /// reproducible even outside `--fuzz` mode.
+    fn run_one_test(&mut self, fid: FnId, fn_span: Span, seed: u64) -> TestOutcome {
+        // Reset the scheduler so each test runs on its own clean fiber set (a prior
+        // test's stale fibers must not leak into this one).
         self.sched = Scheduler::new();
+        // Reset the deterministic instruction budget (and the wall-clock backstop's
+        // start) so EACH test/fuzz iteration gets the FULL budget. The budget is a
+        // single per-VM counter that only ever decrements, so without this reset it
+        // is consumed cumulatively across every test in a file: a large suite would
+        // eventually exhaust it and spuriously FAIL a later (correct) test with
+        // "instruction budget exhausted". Resetting it here makes the budget a
+        // genuine PER-TEST bound — a real infinite loop still trips it (per test),
+        // but an unrelated earlier test can never poison a later verdict. This
+        // matches the per-fiber isolation the rest of the function establishes and
+        // keeps the runner's per-test verdict independent of file position.
+        self.budget = STEP_BUDGET;
+        self.started = std::time::Instant::now();
+        // Clear per-test state: the pending assertion message and the trap position.
+        // Re-seed the fuzz PRNG for reproducibility. The testing allocator is
+        // handle-based: each test re-evaluates `@allocId(5,0)`, registering a FRESH
+        // allocator slot, so we snapshot the registry length here and only inspect
+        // the slots CREATED during this test for leaks (true per-test isolation).
+        self.pending_test_failure = None;
+        self.last_trap_pos = None;
+        self.fuzz_state = seed;
+        let alloc_watermark = self.allocators.len();
+
         let root = match self.spawn_fiber_for(fid, Vec::new()) {
             Ok(r) => r,
-            Err(h) => return Err(halt_detail(&h)),
+            Err(h) => return self.fail_from_halt(&h, fn_span),
         };
-        match self.event_loop() {
-            Ok(()) => {}
-            Err(h) => return Err(halt_detail(&h)),
+        let loop_result = self.event_loop();
+        // Capture the OUTERMOST `try` site in the error-return trace — the test
+        // body's own `try std.testing.expect*(...)` — so the caret lands on the
+        // user's assertion call, not the std helper's internal rethrow. The trace
+        // is pushed innermost-first as the error unwinds, so the last frame is the
+        // outermost (user) site.
+        let trace_span = self
+            .sched
+            .fibers
+            .get(root as usize)
+            .and_then(|f| f.err_trace.last())
+            .map(|frame| line_col_span(frame.line, frame.col));
+
+        if let Err(h) = loop_result {
+            return self.fail_from_halt(&h, fn_span);
         }
         match self.sched.fibers[root as usize].result.take() {
             Some(Value::ErrVal(tag)) => {
+                // An error escaped the test. Prefer the rich `@testFail*` message
+                // (with the assertion call-site caret) when one was recorded;
+                // otherwise fall back to the bare `error.<Name>`.
+                let span = trace_span.or(Some(fn_span));
+                let fail = match self.pending_test_failure.take() {
+                    Some(mut f) => {
+                        if f.span.is_none() {
+                            f.span = span;
+                        }
+                        f
+                    }
+                    None => {
+                        let name = self
+                            .prog
+                            .err_names
+                            .get(&k2_mir::ErrTag(tag))
+                            .cloned()
+                            .unwrap_or_else(|| format!("error{tag}"));
+                        TestFailure {
+                            kind: FailKind::EscapedError,
+                            message: format!("error escaped the test: error.{name}"),
+                            span,
+                        }
+                    }
+                };
+                TestOutcome {
+                    status: TestStatus::Fail,
+                    fail: Some(fail),
+                    fuzz_runs: None,
+                }
+            }
+            // The body ran to a non-error result: still check for a leak.
+            _ => self.leak_check_outcome(fn_span, alloc_watermark),
+        }
+    }
+
+    /// Builds a [`TestOutcome::Fail`] from a [`Halt`] (a trap or an escaped error
+    /// surfaced as a `Halt`), pairing it with the best span: the recorded trap
+    /// position for a panic, else `fn_span`. A pending `@testFail*` message is
+    /// preferred for an escaped error so the wording is the rich one.
+    fn fail_from_halt(&mut self, h: &Halt, fn_span: Span) -> TestOutcome {
+        let fail = match h {
+            Halt::Panic(info) => {
+                let span = self
+                    .last_trap_pos
+                    .map(|(l, c)| line_col_span(l, c))
+                    .or(Some(fn_span));
+                TestFailure {
+                    kind: FailKind::Trap,
+                    message: info.message(),
+                    span,
+                }
+            }
+            Halt::ProgramError(tag) => {
                 let name = self
                     .prog
                     .err_names
-                    .get(&k2_mir::ErrTag(tag))
+                    .get(&k2_mir::ErrTag(*tag))
                     .cloned()
                     .unwrap_or_else(|| format!("error{tag}"));
-                Err(format!("error.{name}"))
+                self.pending_test_failure.take().unwrap_or(TestFailure {
+                    kind: FailKind::EscapedError,
+                    message: format!("error escaped the test: error.{name}"),
+                    span: Some(fn_span),
+                })
             }
-            _ => Ok(()),
+            Halt::Exit(c) => TestFailure {
+                kind: FailKind::Trap,
+                message: format!("the test called exit({c})"),
+                span: Some(fn_span),
+            },
+        };
+        TestOutcome {
+            status: TestStatus::Fail,
+            fail: Some(fail),
+            fuzz_runs: None,
         }
+    }
+
+    /// The end-of-test leak check: any GPA/testing allocator registered DURING
+    /// this test (slots at/after `watermark`) that still has live cells leaked.
+    /// The testing allocator is handle-based — `@allocId(5,0)` registers a fresh
+    /// slot each test — so we scan the slots created this run rather than a fixed
+    /// id. Returns a [`FailKind::Leak`] outcome on a leak, else a pass. The check
+    /// is a no-op in ReleaseFast (the GPA tracker is empty there).
+    fn leak_check_outcome(&mut self, fn_span: Span, watermark: usize) -> TestOutcome {
+        if self.checks_off {
+            return TestOutcome {
+                status: TestStatus::Pass,
+                fail: None,
+                fuzz_runs: None,
+            };
+        }
+        let mut leaked_count = 0usize;
+        for st in self.allocators.iter().skip(watermark) {
+            if matches!(st.kind, AllocatorKind::Gpa) {
+                leaked_count += st.live.len();
+            }
+        }
+        if leaked_count > 0 {
+            TestOutcome {
+                status: TestStatus::Fail,
+                fail: Some(TestFailure {
+                    kind: FailKind::Leak,
+                    message: format!(
+                        "test leaked memory: {leaked_count} allocation(s) from the testing \
+                         allocator were never freed"
+                    ),
+                    span: Some(fn_span),
+                }),
+                fuzz_runs: None,
+            }
+        } else {
+            TestOutcome {
+                status: TestStatus::Pass,
+                fail: None,
+                fuzz_runs: None,
+            }
+        }
+    }
+
+    /// Drives a fuzz target deterministically: the target's body calls
+    /// `std.testing.fuzz`, which itself loops over `@fuzzNextU64()` draws. Each run
+    /// re-seeds the PRNG to `splitmix(seed ^ iteration)` so a failure is
+    /// reproducible at the same iteration. Returns the first failing iteration's
+    /// outcome (annotated with the failing input + iteration), or a pass.
+    ///
+    /// A fuzz target whose body is `try std.testing.fuzz(f, runs)` already loops
+    /// internally, so a single isolated run drives the whole stream; this wrapper
+    /// re-seeds per *outer* iteration to harden reproducibility for targets that
+    /// pull one input per call. The outer loop count is `opts.fuzz_runs`.
+    fn run_one_fuzz(&mut self, fid: FnId, fn_span: Span, opts: &RunOpts) -> TestOutcome {
+        // A zero iteration count would never run the target's body, so the loop
+        // below would fall straight through to the Pass branch — reporting an
+        // UNEXERCISED fuzz target as a green pass. Treat it as a failure here so the
+        // VM API can never produce that false pass (the CLI rejects `--fuzz-runs=0`
+        // earlier with a friendlier message; this is the defense in depth).
+        if opts.fuzz_runs == 0 {
+            return TestOutcome {
+                status: TestStatus::Fail,
+                fail: Some(TestFailure {
+                    kind: FailKind::Trap,
+                    message: "fuzz target ran 0 iterations (--fuzz-runs must be >= 1)".to_string(),
+                    span: Some(fn_span),
+                }),
+                fuzz_runs: Some(0),
+            };
+        }
+        for i in 0..opts.fuzz_runs as u64 {
+            // Independently-reproducible per-iteration seed.
+            let iter_seed = splitmix64_of(opts.seed ^ i);
+            let outcome = self.run_one_test(fid, fn_span, iter_seed);
+            if outcome.status == TestStatus::Fail {
+                // Annotate the failure with the reproducing input + iteration.
+                let mut fail = outcome.fail.unwrap();
+                fail.message = format!(
+                    "{} [fuzz iteration {i}, seed=0x{:016x}]",
+                    fail.message, opts.seed
+                );
+                return TestOutcome {
+                    status: TestStatus::Fail,
+                    fail: Some(fail),
+                    fuzz_runs: Some(i as usize + 1),
+                };
+            }
+        }
+        TestOutcome {
+            status: TestStatus::Pass,
+            fail: None,
+            fuzz_runs: Some(opts.fuzz_runs),
+        }
+    }
+
+    /// Advances the fuzz PRNG (splitmix64) and returns the next draw. Backs the
+    /// `@fuzzNextU64` intrinsic so input generation is deterministic and lives in
+    /// the VM (no std float / host entropy).
+    fn fuzz_next_u64(&mut self) -> u64 {
+        self.fuzz_state = self.fuzz_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.fuzz_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// Builds the root [`Frame`] for `fnid` seeded with `args`, registers a fresh
@@ -660,7 +1231,37 @@ impl<'p> Vm<'p> {
             let instr = self.compiled[fnid.index()].code[pc].clone();
             frame.pc += 1;
 
-            match self.step(instr)? {
+            // Coverage instrumentation (off the hot path): only when collecting.
+            // Records the executed instruction's source line KEYED BY ITS FUNCTION
+            // (so an excluded function — a test body or a prelude fn — executing on a
+            // line number that aliases a user line can never credit that user line),
+            // and marks its function as hit. Ordered maps keep the report
+            // deterministic.
+            if self.cover {
+                let (line, _col) = self.compiled[fnid.index()].lines[pc];
+                if line != 0 {
+                    *self
+                        .lines_hit
+                        .entry((fnid.index() as u32, line))
+                        .or_insert(0) += 1;
+                }
+                self.fns_hit.insert(fnid.index() as u32);
+            }
+
+            let flow = match self.step(instr) {
+                Ok(f) => f,
+                Err(h) => {
+                    // Record where the trap fired (the just-executed instruction)
+                    // so the test runner can put a caret on the trapping statement.
+                    // This is off the normal path (only when a clean panic occurs).
+                    if let Halt::Panic(_) = &h {
+                        let (line, col) = self.compiled[fnid.index()].lines[pc];
+                        self.last_trap_pos = Some((line, col));
+                    }
+                    return Err(h);
+                }
+            };
+            match flow {
                 Flow::Next | Flow::Jumped => {}
                 // A blocking intrinsic already parked the current fiber (recording
                 // its dst as the resume register); just stop running it.
@@ -1835,6 +2436,141 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Formats a test operand for an "expected X, found Y" message, using the same
+    /// rendering the `Writer.print` `{}` path uses (scalars decimal/bool; a byte
+    /// slice/string as quoted text). Heap-backed byte slices are read here, where
+    /// the heap is reachable, so a string assertion shows the actual bytes.
+    fn format_test_value(&self, v: Option<&Value>) -> String {
+        match v {
+            None => "<missing>".to_string(),
+            Some(Value::Str(_)) => format!("\"{}\"", self.read_bytes(v)),
+            // A `[]const u8` byte slice is shown as a quoted string; any other
+            // slice falls back to the default value rendering.
+            Some(Value::Slice { ptr, len }) if self.is_byte_slice(*ptr, *len) => {
+                format!("\"{}\"", self.read_bytes(v))
+            }
+            Some(val) => {
+                let mut out = Vec::new();
+                // `format_into` with a `{}` placeholder reuses the shared engine.
+                if crate::fmt::format_into(&mut out, b"{}", std::slice::from_ref(val)).is_ok() {
+                    String::from_utf8_lossy(&out).into_owned()
+                } else {
+                    "<value>".to_string()
+                }
+            }
+        }
+    }
+
+    /// Reads a slice/array operand into `(len, elements)` for a slice-comparison
+    /// failure message. Handles a fat `[]T` slice (`ptr`+`len`), a `&[_]T{…}`
+    /// pointer-to-array, and a string/byte slice. Elements past what the heap can
+    /// load are dropped, so a malformed operand yields the prefix it could read
+    /// rather than panicking — this is a diagnostic path, never the hot path.
+    fn read_slice_elems(&self, v: Option<&Value>) -> (usize, Vec<Value>) {
+        match v {
+            Some(Value::Slice { ptr, len }) => {
+                let mut out = Vec::with_capacity(*len);
+                for i in 0..*len {
+                    match self.heap.load_index(*ptr, i) {
+                        Ok(e) => out.push(e),
+                        Err(_) => break,
+                    }
+                }
+                (*len, out)
+            }
+            Some(Value::Str(b)) => {
+                let elems = b
+                    .iter()
+                    .map(|&byte| {
+                        Value::int(
+                            byte as i128,
+                            IntRepr {
+                                width: 8,
+                                signed: false,
+                            },
+                        )
+                    })
+                    .collect();
+                (b.len(), elems)
+            }
+            Some(Value::Ptr(p)) => match self.heap.load(*p) {
+                Ok(Value::Array(elems)) => (elems.len(), elems.to_vec()),
+                _ => {
+                    let n = self.heap.len_of(*p).unwrap_or(0);
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match self.heap.load_index(*p, i) {
+                            Ok(e) => out.push(e),
+                            Err(_) => break,
+                        }
+                    }
+                    (n, out)
+                }
+            },
+            _ => (0, Vec::new()),
+        }
+    }
+
+    /// Builds the slice-comparison failure message naming the actual divergence:
+    /// "lengths differ: N vs M" when the lengths differ, else "slices differ at
+    /// index I: expected X, found Y" for the first differing element (formatted with
+    /// the shared value formatter). If both compare equal here (a length-only diff
+    /// the caller already screened, or an unreadable operand), falls back to a
+    /// generic message so the verdict is never lost.
+    fn slice_diff_message(&self, a: Option<&Value>, b: Option<&Value>) -> String {
+        let (alen, aelems) = self.read_slice_elems(a);
+        let (blen, belems) = self.read_slice_elems(b);
+        if alen != blen {
+            return format!("expectEqualSlices failed: lengths differ: {alen} vs {blen}");
+        }
+        for i in 0..aelems.len().min(belems.len()) {
+            if !self.values_eq(&aelems[i], &belems[i]) {
+                let x = self.format_test_value(Some(&aelems[i]));
+                let y = self.format_test_value(Some(&belems[i]));
+                return format!(
+                    "expectEqualSlices failed: slices differ at index {i}: expected {x}, found {y}"
+                );
+            }
+        }
+        // Should not normally be reached (the helper only calls this on a real
+        // mismatch); keep a defined message so a fail is never silent.
+        "expectEqualSlices failed: slices differ".to_string()
+    }
+
+    /// `true` if the slice `(ptr, len)` is a byte slice (every element an 8-bit /
+    /// small-literal integer) — the test for rendering it as a quoted string.
+    fn is_byte_slice(&self, ptr: Ptr, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        for i in 0..len {
+            match self.heap.load_index(ptr, i) {
+                Ok(Value::Int { v, repr })
+                    if repr.width == 8 || (repr.width == 0 && (0..=255).contains(&v)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Formats an error operand (an `error.X` value or its tag) by name, for the
+    /// `expectError` mismatch message. A non-error value renders via the default
+    /// value formatter, so an unexpected *success* value reads naturally.
+    fn format_error_operand(&self, v: Option<&Value>) -> String {
+        match v {
+            Some(Value::ErrVal(tag)) => {
+                let name = self
+                    .prog
+                    .err_names
+                    .get(&k2_mir::ErrTag(*tag))
+                    .cloned()
+                    .unwrap_or_else(|| format!("error{tag}"));
+                format!("error.{name}")
+            }
+            other => self.format_test_value(other),
+        }
+    }
+
     /// Reads a build handle id from a value: a bare integer, a `{ id }` handle
     /// struct (Artifact/Step/Module), or a pointer to one (`&run_exe.step`). This
     /// is how `addRunArtifact(exe)`, `installArtifact(a)`, `addModule(.., mod)`,
@@ -2536,6 +3272,83 @@ impl<'p> Vm<'p> {
             | IntrinsicId::NetRecv
             | IntrinsicId::NetLocalPort
             | IntrinsicId::NetClose => self.dispatch_os_handle(id, recv, args),
+
+            // ---- The v0.24 test-runner floor ----------------------------
+            // `@testFail*` record the assertion message; `@fuzz*` drive the PRNG.
+            IntrinsicId::TestFail => {
+                // `@testFail(kind, a, b)`: a generic failure; `kind` is a string
+                // literal naming the helper. The two trailing operands are reserved
+                // for length-style messages (rendered when present and integral).
+                let kind = self.read_bytes(args.first());
+                let detail = self.read_bytes(args.get(1));
+                let message = if detail.is_empty() {
+                    format!("{kind} failed")
+                } else {
+                    format!("{kind} failed: {detail}")
+                };
+                self.pending_test_failure = Some(TestFailure {
+                    kind: FailKind::FailedExpect,
+                    message,
+                    span: None,
+                });
+                Ok(Value::Unit)
+            }
+            IntrinsicId::TestFailEq => {
+                // `@testFailEq(a, b)`: format "expected <a>, found <b>".
+                let a = self.format_test_value(args.first());
+                let b = self.format_test_value(args.get(1));
+                self.pending_test_failure = Some(TestFailure {
+                    kind: FailKind::FailedExpect,
+                    message: format!("expectEqual failed: expected {a}, found {b}"),
+                    span: None,
+                });
+                Ok(Value::Unit)
+            }
+            IntrinsicId::TestFailSlice => {
+                // `@testFailSlice(a, b)`: report the ACTUAL divergence of two slices.
+                // On a length mismatch, name both lengths ("lengths differ: N vs M");
+                // otherwise scan for the first differing index and name it with the
+                // two elements there. This replaces the old `@testFailEq(a.len,
+                // b.len)`, which on an equal-length-but-differing pair rendered the
+                // useless "expected N, found N" (both lengths).
+                let msg = self.slice_diff_message(args.first(), args.get(1));
+                self.pending_test_failure = Some(TestFailure {
+                    kind: FailKind::FailedExpect,
+                    message: msg,
+                    span: None,
+                });
+                Ok(Value::Unit)
+            }
+            IntrinsicId::TestFailErr => {
+                // `@testFailErr(expected, found)`: both are error values/tags.
+                let exp = self.format_error_operand(args.first());
+                let found = self.format_error_operand(args.get(1));
+                self.pending_test_failure = Some(TestFailure {
+                    kind: FailKind::FailedExpect,
+                    message: format!("expectError failed: expected {exp}, found {found}"),
+                    span: None,
+                });
+                Ok(Value::Unit)
+            }
+            IntrinsicId::FuzzSeed => {
+                let seed = args
+                    .first()
+                    .and_then(|v| v.as_i128())
+                    .map(|v| v as u64)
+                    .unwrap_or(0);
+                self.fuzz_state = seed;
+                Ok(Value::Unit)
+            }
+            IntrinsicId::FuzzNextU64 => {
+                let v = self.fuzz_next_u64();
+                Ok(Value::int(
+                    v as i128,
+                    IntRepr {
+                        width: 64,
+                        signed: false,
+                    },
+                ))
+            }
 
             IntrinsicId::Unsupported(name) => Err(Halt::Panic(PanicInfo {
                 reason: TrapReason::Panic,
@@ -4316,14 +5129,28 @@ fn needs_handle_receiver(id: &IntrinsicId) -> bool {
     )
 }
 
-/// A short human description of a [`Halt`], used by the test runner to report why
-/// a test failed (an error name, a panic message, or an explicit exit).
-fn halt_detail(h: &Halt) -> String {
-    match h {
-        Halt::ProgramError(tag) => format!("error tag {tag}"),
-        Halt::Panic(info) => format!("panic: {}", info.message()),
-        Halt::Exit(c) => format!("exit {c}"),
-    }
+/// `true` if a test's display name marks it as a fuzz target (`fuzz: …` or
+/// `fuzz …`). Since the surface grammar has no `fuzz` block keyword, a fuzz target
+/// is an ordinary `test "fuzz: name" { ... }` whose body calls `std.testing.fuzz`.
+fn is_fuzz_name(display: &str) -> bool {
+    let d = display.trim_start_matches('"');
+    d.starts_with("fuzz:") || d.starts_with("fuzz ")
+}
+
+/// Builds a single-line caret span from a 1-based `(line, col)`: a zero-width
+/// point span carrying the position. The renderer underlines from `col` to
+/// end-of-line, so the offsets are not needed for a line-anchored caret.
+fn line_col_span(line: u32, col: u32) -> Span {
+    Span::point(0, line, col)
+}
+
+/// A single splitmix64 step over `x` — used to derive a per-fuzz-iteration seed
+/// from `(seed ^ iteration)` so each iteration is independently reproducible.
+fn splitmix64_of(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Finds the scheduler-object handle id of `kind` among an intrinsic's operands.

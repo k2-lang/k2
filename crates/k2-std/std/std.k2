@@ -1173,28 +1173,85 @@ pub const testing = struct {
     /// handle; the test harness checks it at test end and fails on a leak.
     pub const allocator: Allocator = @allocHandle(@allocId(5, 0));
 
-    /// Succeed iff `ok` is true.
+    /// Succeed iff `ok` is true. On failure records a clear message for the runner
+    /// ("expect failed: condition was false") and returns the test error.
     pub fn expect(ok: bool) !void {
-        if (not ok) return error.TestUnexpectedResult;
+        if (not ok) {
+            @testFail("expect", "condition was false");
+            return error.TestUnexpectedResult;
+        }
     }
 
-    /// Succeed iff `expected == actual`.
+    /// Succeed iff `expected == actual`. On mismatch records the rich
+    /// "expected X, found Y" message (formatted by the VM value formatter) so the
+    /// runner can show exactly what differed.
     pub fn expectEqual(expected: anytype, actual: anytype) !void {
-        if (expected != actual) return error.TestExpectedEqual;
+        if (expected != actual) {
+            @testFailEq(expected, actual);
+            return error.TestExpectedEqual;
+        }
     }
 
     /// Succeed iff `actual` is the error `expected` (and not a success value).
     pub fn expectError(expected: anyerror, actual: anytype) !void {
         if (actual) |_| {
+            @testFail("expectError", "expected an error, found a value");
             return error.TestExpectedError;
         } else |e| {
-            if (e != expected) return error.TestUnexpectedError;
+            if (e != expected) {
+                @testFailErr(expected, e);
+                return error.TestUnexpectedError;
+            }
         }
     }
 
-    /// Succeed iff two slices are element-wise equal.
+    /// Succeed iff two slices are element-wise equal. On mismatch records the ACTUAL
+    /// divergence: a "lengths differ: N vs M" message when the lengths differ, else
+    /// "slices differ at index I: expected X, found Y" naming the first differing
+    /// element — never the misleading "expected N, found N" (the two lengths) that a
+    /// bare length comparison produced on an equal-length-but-differing pair.
     pub fn expectEqualSlices(comptime T: type, a: []const T, b: []const T) !void {
-        if (not mem.eql(T, a, b)) return error.TestExpectedEqual;
+        if (not mem.eql(T, a, b)) {
+            @testFailSlice(a, b);
+            return error.TestExpectedEqual;
+        }
+    }
+
+    /// Succeed iff two byte strings are equal (a `[]const u8` specialization of
+    /// `expectEqualSlices`). On mismatch the runner shows the quoted bytes.
+    pub fn expectEqualStrings(a: []const u8, b: []const u8) !void {
+        if (not mem.eql(u8, a, b)) {
+            @testFailEq(a, b);
+            return error.TestExpectedEqual;
+        }
+    }
+
+    /// Draw the next deterministic pseudo-random `u64` fuzz input from the
+    /// fixed-seed PRNG. Use it inside a `test "fuzz: ..."` block, then call the
+    /// function under test DIRECTLY on the value, and run with `k2c test --fuzz`:
+    /// the runner re-runs the block on N inputs (`--fuzz-runs`), re-seeding per
+    /// iteration from `--seed`, and reports the first failing input + iteration so
+    /// a planted bug is reproducible. A direct call is used (not a function value)
+    /// because the MIR has no indirect calls; the runner supplies the loop.
+    ///
+    /// PROBABILISTIC, not exhaustive. Fuzzing samples the input space; for a given
+    /// `--seed` the run is fully deterministic and reproducible, but whether a bug is
+    /// FOUND depends on the seed and on `--fuzz-runs` exceeding ~1/p, where p is the
+    /// probability a random input triggers the bug. A bug that fires on a single
+    /// specific byte (p ≈ 1/256) can be MISSED at `--fuzz-runs=256` under an unlucky
+    /// seed (~37% miss rate, the coupon-collector tail), reading as a false PASS.
+    /// For a deterministic regression set `--fuzz-runs` well above 1/p (or test the
+    /// trigger directly); a passing fuzz run means "no failure in N samples", not
+    /// "proven correct".
+    ///
+    /// ```
+    /// test "fuzz: parse never traps" {
+    ///     const x = std.testing.fuzzInput();
+    ///     try parse(x);            // a direct call — the runner drives the loop
+    /// }
+    /// ```
+    pub fn fuzzInput() u64 {
+        return @fuzzNextU64();
     }
 };
 

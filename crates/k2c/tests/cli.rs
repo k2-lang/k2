@@ -2783,3 +2783,512 @@ fn check_rich_caret_copies_leading_tab() {
         "underline must copy the leading tab verbatim, got: {after_bar:?}"
     );
 }
+
+// ===========================================================================
+//  v0.24 — the `k2c test` runner, coverage, and fuzzing.
+// ===========================================================================
+
+/// Runs `k2c test <args...>` feeding `source` on stdin (path `-`), returning
+/// `(success, stdout, stderr)`. Deterministic: the VM is single-threaded and the
+/// runner uses ordered maps + a fixed-seed PRNG.
+fn test_stdin(extra: &[&str], source: &str) -> (bool, String, String) {
+    let mut cmd = k2c();
+    cmd.arg("test");
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg("-");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn test_passing_suite_exits_zero_with_summary() {
+    let src = r#"
+        const std = @import("std");
+        test "adds" { try std.testing.expectEqual(@as(i32, 4), 2 + 2); }
+        test "strings" { try std.testing.expectEqualStrings("abc", "abc"); }
+        test "slices" { try std.testing.expectEqualSlices(u8, "xy", "xy"); }
+        test "cond" { try std.testing.expect(1 < 2); }
+    "#;
+    let (ok, stdout, _stderr) = test_stdin(&[], src);
+    assert!(ok, "a passing suite must exit zero");
+    assert!(
+        stdout.contains("4 passed, 0 failed, 4 total"),
+        "summary missing; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_failing_expect_reports_expected_vs_found_and_exits_nonzero() {
+    let src = r#"
+        const std = @import("std");
+        test "bad" { try std.testing.expectEqual(@as(i32, 5), 2 + 2); }
+    "#;
+    let (ok, stdout, stderr) = test_stdin(&[], src);
+    assert!(!ok, "a failing test must exit nonzero");
+    assert!(
+        stderr.contains("FAIL"),
+        "stderr should mark a FAIL: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected 5, found 4"),
+        "must report expected-vs-found; stderr: {stderr}"
+    );
+    // A caret diagnostic underlines the assertion.
+    assert!(stderr.contains('^'), "a caret must underline the assertion");
+    assert!(
+        stdout.contains("0 passed, 1 failed, 1 total"),
+        "summary missing; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_leak_is_reported_and_exits_nonzero() {
+    // The allocation escapes the helper into a returned struct, so the static
+    // leak analysis cannot prove it leaks — the RUNTIME testing-allocator check
+    // catches it at test end.
+    let src = r#"
+        const std = @import("std");
+        const Holder = struct { buf: []u8 };
+        fn makeHolder(alloc: std.mem.Allocator) !Holder {
+            const a = try alloc.alloc(u8, 16);
+            return Holder{ .buf = a };
+        }
+        test "leak" {
+            const h = try makeHolder(std.testing.allocator);
+            _ = h;
+        }
+    "#;
+    let (ok, stdout, stderr) = test_stdin(&[], src);
+    assert!(!ok, "a leaking test must exit nonzero");
+    assert!(
+        stderr.to_lowercase().contains("leak"),
+        "must report a leak; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("0 passed, 1 failed, 1 total"),
+        "summary missing; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_leak_free_with_defer_passes() {
+    // The mirror of the leak test: a matching `defer` frees, so it passes — the
+    // leak check must not produce a false positive.
+    let src = r#"
+        const std = @import("std");
+        test "clean" {
+            var alloc = std.testing.allocator;
+            const a = try alloc.alloc(u8, 16);
+            defer alloc.free(a);
+            try std.testing.expectEqual(@as(usize, 16), a.len);
+        }
+    "#;
+    let (ok, stdout, stderr) = test_stdin(&[], src);
+    assert!(ok, "a leak-free test must pass; stderr: {stderr}");
+    assert!(
+        stdout.contains("1 passed, 0 failed, 1 total"),
+        "summary missing; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_coverage_prints_summary_with_percentages() {
+    let src = r#"
+        const std = @import("std");
+        fn dbl(x: i32) i32 { return x * 2; }
+        test "t" { try std.testing.expectEqual(@as(i32, 8), dbl(4)); }
+    "#;
+    let (ok, stdout, _stderr) = test_stdin(&["--coverage"], src);
+    assert!(ok, "the coverage run must still pass its tests");
+    assert!(stdout.contains("coverage:"), "stdout: {stdout}");
+    assert!(stdout.contains("lines:"), "line coverage section missing");
+    assert!(
+        stdout.contains("functions:"),
+        "function coverage section missing"
+    );
+    assert!(stdout.contains('%'), "a percentage must be printed");
+}
+
+#[test]
+fn test_coverage_is_deterministic_across_runs() {
+    let src = r#"
+        const std = @import("std");
+        fn dbl(x: i32) i32 { return x * 2; }
+        fn unused(x: i32) i32 { return x + 1; }
+        test "t" { try std.testing.expectEqual(@as(i32, 8), dbl(4)); }
+    "#;
+    let (_ok1, out1, _e1) = test_stdin(&["--coverage"], src);
+    let (_ok2, out2, _e2) = test_stdin(&["--coverage"], src);
+    assert_eq!(
+        out1, out2,
+        "coverage output must be byte-identical across runs"
+    );
+    // `unused` is never called, so coverage must be < 100% (and report it).
+    assert!(
+        out1.contains("uncovered lines:"),
+        "an uncovered line should be listed; stdout: {out1}"
+    );
+}
+
+#[test]
+fn test_filter_runs_only_matching_tests() {
+    let src = r#"
+        const std = @import("std");
+        test "alpha" { try std.testing.expect(true); }
+        test "beta" { try std.testing.expect(true); }
+        test "gamma" { try std.testing.expect(true); }
+    "#;
+    let (ok, stdout, _stderr) = test_stdin(&["--filter", "beta"], src);
+    assert!(ok);
+    assert!(
+        stdout.contains("1 passed, 0 failed, 1 total"),
+        "filter should select exactly one test; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_verbose_lists_each_ok_line() {
+    let src = r#"
+        const std = @import("std");
+        test "alpha" { try std.testing.expect(true); }
+        test "beta" { try std.testing.expect(true); }
+    "#;
+    let (ok, _stdout, stderr) = test_stdin(&["--verbose"], src);
+    assert!(ok);
+    assert!(
+        stderr.contains("alpha"),
+        "verbose should list each test name"
+    );
+    assert!(stderr.contains("beta"));
+    assert!(stderr.contains("... ok"), "verbose should print `ok` lines");
+}
+
+#[test]
+fn test_fuzz_finds_planted_bug_deterministically() {
+    let src = r#"
+        const std = @import("std");
+        fn trapsAt(x: u64) !void {
+            if ((x & 0xFF) == 0x42) { unreachable; }
+        }
+        test "fuzz: trapsAt" {
+            const x = std.testing.fuzzInput();
+            try trapsAt(x);
+        }
+    "#;
+    let (ok1, _out1, err1) = test_stdin(&["--fuzz", "--fuzz-runs=256"], src);
+    assert!(!ok1, "fuzzing must find the planted bug and exit nonzero");
+    assert!(err1.contains("FAIL"), "stderr should mark a FAIL: {err1}");
+    assert!(
+        err1.contains("fuzz iteration"),
+        "the failing iteration must be reported for reproducibility: {err1}"
+    );
+    // Reproducibility: the same seed finds the bug at the same iteration.
+    let (ok2, _out2, err2) = test_stdin(&["--fuzz", "--fuzz-runs=256"], src);
+    assert!(!ok2);
+    let iter = |s: &str| {
+        s.split("fuzz iteration ")
+            .nth(1)
+            .and_then(|t| t.split([',', ']']).next())
+            .map(|t| t.trim().to_string())
+    };
+    assert_eq!(
+        iter(&err1),
+        iter(&err2),
+        "the same seed must reproduce the failure at the same iteration"
+    );
+}
+
+#[test]
+fn test_fuzz_clean_target_passes() {
+    let src = r#"
+        const std = @import("std");
+        fn neverTraps(x: u64) !void { _ = x; }
+        test "fuzz: neverTraps" {
+            const x = std.testing.fuzzInput();
+            try neverTraps(x);
+        }
+    "#;
+    let (ok, stdout, _stderr) = test_stdin(&["--fuzz", "--fuzz-runs=256"], src);
+    assert!(ok, "a clean fuzz target must pass");
+    assert!(stdout.contains("1 passed, 0 failed, 1 total"));
+}
+
+#[test]
+fn test_expect_error_mismatch_is_reported() {
+    let src = r#"
+        const std = @import("std");
+        fn boom() !void { return error.Boom; }
+        test "wrong error" {
+            try std.testing.expectError(error.Nope, boom());
+        }
+    "#;
+    let (ok, _stdout, stderr) = test_stdin(&[], src);
+    assert!(!ok, "an error mismatch must fail the test");
+    assert!(
+        stderr.contains("expectError failed"),
+        "must name the failing helper; stderr: {stderr}"
+    );
+    assert!(stderr.contains("error.Boom"), "must name the found error");
+}
+
+// ===========================================================================
+//  v0.24 milestone regression tests (the verified review findings), CLI level.
+// ===========================================================================
+
+/// [BLOCKER] A suite of many work-heavy tests all pass: the per-test budget reset
+/// means a later test never spuriously FAILs with "instruction budget exhausted"
+/// because earlier tests consumed the shared budget.
+#[test]
+fn test_budget_reset_heavy_suite_all_passes() {
+    let src = r#"
+        const std = @import("std");
+        fn busy() u64 {
+            var acc: u64 = 0;
+            var i: u64 = 0;
+            while (i < 200000) : (i += 1) { acc = (acc + (i & 0xFF)) & 0xFFFF; }
+            return acc;
+        }
+        test "h1" { _ = busy(); try std.testing.expect(true); }
+        test "h2" { _ = busy(); try std.testing.expect(true); }
+        test "h3" { _ = busy(); try std.testing.expect(true); }
+        test "h4" { _ = busy(); try std.testing.expect(true); }
+        test "h5" { _ = busy(); try std.testing.expect(true); }
+    "#;
+    let (ok, stdout, stderr) = test_stdin(&[], src);
+    assert!(ok, "every correct test must pass; stderr: {stderr}");
+    assert!(
+        stdout.contains("5 passed, 0 failed, 5 total"),
+        "no test may inherit an exhausted budget; stdout: {stdout}"
+    );
+}
+
+/// [MAJOR] `expectEqualSlices` on equal-length-but-different slices names the
+/// differing INDEX and elements (not the old "expected N, found N" of the lengths);
+/// a length mismatch names both lengths.
+#[test]
+fn test_expect_equal_slices_names_the_difference() {
+    // Content mismatch at index 1: expected 2, found 9.
+    let content = r#"
+        const std = @import("std");
+        test "content" {
+            try std.testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, &[_]u32{ 1, 9, 3 });
+        }
+    "#;
+    let (ok, _stdout, stderr) = test_stdin(&[], content);
+    assert!(!ok, "a differing slice must fail");
+    assert!(
+        stderr.contains("index 1") && stderr.contains("expected 2") && stderr.contains("found 9"),
+        "must name the differing index + elements; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("expected 3, found 3"),
+        "must not print the misleading length-based 'expected 3, found 3'; stderr: {stderr}"
+    );
+
+    // Length mismatch names both lengths.
+    let length = r#"
+        const std = @import("std");
+        test "length" {
+            try std.testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, &[_]u32{ 1, 2 });
+        }
+    "#;
+    let (ok, _stdout, stderr) = test_stdin(&[], length);
+    assert!(!ok);
+    assert!(
+        stderr.contains("lengths differ"),
+        "a length mismatch must say so; stderr: {stderr}"
+    );
+}
+
+/// [MINOR] An `unreachable` trap caret must land on the `unreachable` keyword's own
+/// line, even when a statement follows the enclosing block (previously the caret
+/// landed on the following statement).
+#[test]
+fn test_unreachable_caret_on_its_own_line() {
+    // The `unreachable;` is on line 5; a `try` statement follows the block on line 7.
+    let src = "const std = @import(\"std\");\n\
+               test \"t\" {\n\
+               \x20\x20\x20\x20const x: u32 = 1;\n\
+               \x20\x20\x20\x20if (x == 1) {\n\
+               \x20\x20\x20\x20\x20\x20\x20\x20unreachable;\n\
+               \x20\x20\x20\x20}\n\
+               \x20\x20\x20\x20try std.testing.expect(true);\n\
+               }\n";
+    let (ok, _stdout, stderr) = test_stdin(&[], src);
+    assert!(!ok, "a reached `unreachable` must fail");
+    assert!(
+        stderr.contains("reached unreachable code"),
+        "must report the unreachable trap; stderr: {stderr}"
+    );
+    // The caret header must name line 5 (the `unreachable;`), not line 7.
+    assert!(
+        stderr.contains(":5:"),
+        "the caret must land on the `unreachable` line (5); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(":7:"),
+        "the caret must NOT land on the following statement (line 7); stderr: {stderr}"
+    );
+}
+
+/// [NIT] `--fuzz-runs=0` must be rejected as a misconfiguration, never silently
+/// PASS an unexercised fuzz target. The flag is rejected during argument parsing
+/// (before any source is read), so this drives a real file rather than stdin.
+#[test]
+fn test_fuzz_runs_zero_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("k2_fuzz0_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.k2");
+    std::fs::write(
+        &file,
+        "const std = @import(\"std\");\n\
+         fn neverTraps(x: u64) !void { _ = x; }\n\
+         test \"fuzz: neverTraps\" {\n\
+         \x20\x20\x20\x20const x = std.testing.fuzzInput();\n\
+         \x20\x20\x20\x20try neverTraps(x);\n\
+         }\n",
+    )
+    .unwrap();
+    let out = k2c()
+        .arg("test")
+        .arg(&file)
+        .arg("--fuzz")
+        .arg("--fuzz-runs=0")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "--fuzz-runs=0 must not exit zero");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains(">= 1") || combined.to_lowercase().contains("must be"),
+        "must explain that fuzz runs must be >= 1; output: {combined}"
+    );
+    assert!(
+        !stdout.contains("1 passed, 0 failed"),
+        "must not report a silent pass; stdout: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [MINOR] A guaranteed-trigger fuzz target (traps on EVERY input) is caught at
+/// iteration 0 regardless of seed — a deterministic fuzz regression target.
+#[test]
+fn test_fuzz_guaranteed_trigger_is_deterministic_across_seeds() {
+    let src = r#"
+        const std = @import("std");
+        fn alwaysTraps(x: u64) !void { _ = x; unreachable; }
+        test "fuzz: alwaysTraps" {
+            const x = std.testing.fuzzInput();
+            try alwaysTraps(x);
+        }
+    "#;
+    for seed in ["0", "0xDEADBEEF", "12345"] {
+        let arg = format!("--seed={seed}");
+        let (ok, _stdout, stderr) = test_stdin(&["--fuzz", "--fuzz-runs=256", &arg], src);
+        assert!(!ok, "the always-trap bug must be found for seed {seed}");
+        assert!(
+            stderr.contains("fuzz iteration 0"),
+            "must be caught at iteration 0 for seed {seed}; stderr: {stderr}"
+        );
+    }
+}
+
+/// [MAJOR]/[NIT] Coverage of a PATH-IMPORT (merged) program reports only USER
+/// lines/functions with correct file:line numbers and a sensible percentage — std
+/// prelude lines/functions no longer bleed into the user denominator (previously
+/// `lines: 3/4 (75%)` with a bogus `mainN.k2:1195` std line).
+#[test]
+fn test_merged_coverage_excludes_std_and_uses_real_lines() {
+    let dir = std::env::temp_dir().join(format!("k2_merged_cov_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.k2"),
+        "pub fn used(a: i32) i32 { return a; }\npub fn unused(a: i32) i32 { return a + 100; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.k2"),
+        "const std = @import(\"std\");\n\
+         const h = @import(\"./helper.k2\");\n\
+         fn localUsed() i32 { return 7; }\n\
+         fn localUnused() i32 { return 9; }\n\
+         test \"t\" { try std.testing.expectEqual(@as(i32, 7), localUsed()); }\n",
+    )
+    .unwrap();
+    let out = k2c()
+        .arg("test")
+        .arg(dir.join("main.k2"))
+        .arg("--coverage")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "the test must pass; stdout: {stdout}");
+    // No std line should appear: the bogus high merged-line number (the std body is
+    // ~1.8k lines) must never be listed, and no four-digit line should leak.
+    assert!(
+        !stdout.contains(":11") && !stdout.contains(":12") && !stdout.contains(":18"),
+        "no std-region merged line may leak into the report; stdout: {stdout}"
+    );
+    // The uncovered user function `localUnused` (line 4 of main.k2) is reported with
+    // its REAL file:line, not a merged coordinate.
+    assert!(
+        stdout.contains("main.k2:4"),
+        "the uncovered user line must be the real main.k2:4; stdout: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [NIT] A FAIL inside an IMPORTED file is relabeled with the true (file, line) via
+/// the merged-path source map, instead of asserting a false `<root>:<merged-line>`.
+#[test]
+fn test_merged_fail_caret_names_true_file_and_line() {
+    let dir = std::env::temp_dir().join(format!("k2_merged_fail_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.k2"),
+        "pub fn broken(a: u32, b: u32) u32 {\n    return a - b;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.k2"),
+        "const std = @import(\"std\");\n\
+         const h = @import(\"./helper.k2\");\n\
+         test \"t\" { try std.testing.expect(h.broken(1, 5) == 0); }\n",
+    )
+    .unwrap();
+    let out = k2c().arg("test").arg(dir.join("main.k2")).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the underflow trap must fail the test"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The trap is genuinely in helper.k2 line 2 (`return a - b;`); the relabel note
+    // must name it, recovering the true source location of the merged offset.
+    assert!(
+        stderr.contains("helper.k2:2"),
+        "the failure must be relabeled to the true helper.k2:2; stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

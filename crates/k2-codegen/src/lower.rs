@@ -4679,6 +4679,21 @@ impl<'p> FnLower<'p> {
             "randomInt" => return self.lower_random_int(),
             "randomBytes" => return self.lower_random_bytes(args),
             "envGet" => return self.lower_env_get(),
+            // The v0.24 test-runner intrinsics. They exist purely for the VM's
+            // `k2c test` runner (recording assertion messages / driving the fuzz
+            // PRNG); the native backend has no test runner, so they are pure no-ops
+            // here. `@testFail*`/`@fuzzSeed` are void (RAX irrelevant); `@fuzzNextU64`
+            // returns a deterministic `0` (native does not fuzz). This keeps a
+            // natively-compiled std (which references `@testFailEq` inside
+            // `expectEqual`) building cleanly instead of refusing.
+            "testFail" | "testFailEq" | "testFailSlice" | "testFailErr" | "fuzzSeed" => {
+                self.asm.mov_ri(Gpr::Rax, 0);
+                return Ok(());
+            }
+            "fuzzNextU64" => {
+                self.asm.mov_ri(Gpr::Rax, 0);
+                return Ok(());
+            }
             _ => {}
         }
         let ty = self.predicate_type(args);

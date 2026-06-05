@@ -417,6 +417,7 @@ impl MirFunction {
             stmts: Vec::new(),
             term: Terminator::Unreachable,
             is_panic: false,
+            trap_span: None,
         });
         id
     }
@@ -561,6 +562,15 @@ pub struct BasicBlock {
     pub term: Terminator,
     /// `true` if this block is a synthesized panic/trap target.
     pub is_panic: bool,
+    /// For a synthesized panic/trap block (a [`Terminator::Trap`] target), the
+    /// source span of the check/keyword that *originates* the trap (e.g. the
+    /// `unreachable` keyword). A panic block holds no span-carrying statement of
+    /// its own, so without this the VM/codegen would attribute the trap to whatever
+    /// statement happened to be compiled last — landing the diagnostic caret on the
+    /// wrong line when a statement follows the enclosing block. Set when the panic
+    /// block is created from the first check that targets it; `None` for an ordinary
+    /// block (whose terminator already inherits its last statement's span).
+    pub trap_span: Option<Span>,
 }
 
 // =========================================================================
@@ -737,6 +747,19 @@ impl Rvalue {
 }
 
 impl Statement {
+    /// The source span this statement carries, if any. The two value-bearing
+    /// statements ([`Statement::Assign`], [`Statement::Eval`]) and a safety
+    /// [`Statement::Check`] each anchor a span; the advisory storage/note markers
+    /// carry none. Used by the VM's line table (coverage + trap span reporting)
+    /// to map each executed instruction back to a source line.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Statement::Assign { span, .. } | Statement::Eval { span, .. } => Some(*span),
+            Statement::Check(c) => Some(c.span),
+            Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Note(_) => None,
+        }
+    }
+
     /// The locals this statement reads or writes (used by [`MirProgram::verify`]
     /// to catch references to out-of-range locals). Safety-`Check` operands are
     /// not walked here — checks are realized into branches before verification.

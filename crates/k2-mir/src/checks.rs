@@ -16,6 +16,7 @@
 //! statements to split, so no panic edges appear).
 
 use crate::ir::*;
+use k2_syntax::Span;
 use k2_types::TypeId;
 
 /// Realizes every [`Statement::Check`] in `func` as a branch to the shared panic
@@ -58,9 +59,12 @@ pub(crate) fn split_checks(func: &mut MirFunction) {
         func.blocks[cont.index()].stmts = trailing;
         func.blocks[cont.index()].term = old_term;
 
-        // The shared panic block (created lazily) for this reason set.
+        // The shared panic block (created lazily) for this reason set. Pass the
+        // originating check's span so the panic block's trap carries the source
+        // location of the check/keyword that triggers it (e.g. the `unreachable`),
+        // not whatever statement is compiled last.
         let reason = trap_reason(&check.kind);
-        let panic_bb = ensure_panic_block(func, reason);
+        let panic_bb = ensure_panic_block(func, reason, check.span);
 
         // A dump note naming the check, so Debug-mode safety scaffolding stays
         // verifiable even after the check is realized as a branch.
@@ -83,8 +87,11 @@ pub(crate) fn split_checks(func: &mut MirFunction) {
 
 /// Returns (creating if needed) a shared panic block for `func` whose terminator
 /// traps with `reason`. To keep one block per reason we encode the reason in the
-/// block; the first panic block created becomes `func.panic_block`.
-fn ensure_panic_block(func: &mut MirFunction, reason: TrapReason) -> BlockId {
+/// block; the first panic block created becomes `func.panic_block`. `origin` is the
+/// span of the check/keyword that triggers the trap; it is recorded on the block so
+/// the trap diagnostic's caret lands on that source location (the FIRST originating
+/// check wins for a shared block — the common single-`unreachable` case is exact).
+fn ensure_panic_block(func: &mut MirFunction, reason: TrapReason, origin: Span) -> BlockId {
     // Reuse an existing panic block with the same reason if present.
     for b in &func.blocks {
         if b.is_panic {
@@ -98,6 +105,7 @@ fn ensure_panic_block(func: &mut MirFunction, reason: TrapReason) -> BlockId {
     let id = func.new_block();
     func.blocks[id.index()].is_panic = true;
     func.blocks[id.index()].term = Terminator::Trap { reason };
+    func.blocks[id.index()].trap_span = Some(origin);
     if func.panic_block.is_none() {
         func.panic_block = Some(id);
     }

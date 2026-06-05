@@ -69,6 +69,59 @@ pub struct MergedProgram {
     pub source: String,
     /// The resolved input files.
     pub inputs: InputFiles,
+    /// The char-offset half-open ranges of the merged text that hold PRELUDE
+    /// (std / build / build_options) code rather than user code. The merge
+    /// interleaves user modules, the std root, and the root file, so a single
+    /// user/std boundary offset cannot separate them; coverage excludes any
+    /// function/line whose defining span falls inside one of these ranges (by
+    /// provenance, not by a single cut). Empty when no prelude was appended.
+    pub prelude_ranges: Vec<(u32, u32)>,
+    /// A line-level source map recovering the true `(file, line)` of a merged line.
+    /// Path imports merge several files into one text, so a span's merged line is
+    /// NOT the user's file line; the runner uses this to relabel a FAIL caret /
+    /// uncovered line with the real source location instead of the misleading
+    /// `<root>:<merged-line>`.
+    pub source_map: SourceMap,
+}
+
+/// A line-level map from a merged-text line (1-based) back to the original
+/// `(file display name, file line)` it came from. Built as the merge appends each
+/// file's body at a known merged-line offset; the import rewrite is a same-line byte
+/// substitution, so line numbers are preserved 1:1 within a body.
+#[derive(Clone, Debug, Default)]
+pub struct SourceMap {
+    /// Segments in ascending merged-line order. Each is
+    /// `(merged_start_line, line_count, file_display, file_start_line)`: merged lines
+    /// `[merged_start_line, merged_start_line + line_count)` map to `file_display`
+    /// lines starting at `file_start_line`.
+    segments: Vec<(u32, u32, String, u32)>,
+}
+
+impl SourceMap {
+    /// Records that `line_count` lines of `file` starting at the file's
+    /// `file_start_line` were emitted beginning at merged line `merged_start_line`.
+    fn push(&mut self, merged_start_line: u32, line_count: u32, file: &str, file_start_line: u32) {
+        if line_count > 0 {
+            self.segments.push((
+                merged_start_line,
+                line_count,
+                file.to_string(),
+                file_start_line,
+            ));
+        }
+    }
+
+    /// Recovers the original `(file, line)` for a merged line (1-based), or `None`
+    /// if the line falls in synthesized scaffolding (a wrapper `struct {` header, the
+    /// std prelude, the build-options root, …) that maps to no user source.
+    pub fn resolve(&self, merged_line: u32) -> Option<(&str, u32)> {
+        for (start, count, file, file_start) in &self.segments {
+            if merged_line >= *start && merged_line < start + count {
+                return Some((file.as_str(), file_start + (merged_line - start)));
+            }
+        }
+        None
+    }
 }
 
 /// Reads a `.k2` file from disk, mapping an I/O error to a labeled diagnostic.
@@ -211,6 +264,11 @@ pub fn merge(inputs: &CompileInputs) -> Result<MergedProgram, MultiDiag> {
     // Build the merged source. The root file stays at the outermost level; every
     // OTHER reachable file is wrapped as a nested namespace const.
     let mut out = String::new();
+    // The source map (merged line -> original file/line) and a running merged-line
+    // counter. `out` always ends on a fresh line after each segment below, so the
+    // next segment begins at `merged_line`.
+    let mut source_map = SourceMap::default();
+    let line_count_of = |s: &str| s.lines().count() as u32 + u32::from(!s.ends_with('\n'));
 
     // 1. Wrapped imported modules (everything except the root file), sorted by
     //    relative path for determinism. The namespace name is keyed on the file's
@@ -218,25 +276,47 @@ pub fn merge(inputs: &CompileInputs) -> Result<MergedProgram, MultiDiag> {
     let mut wrapped: Vec<(&PathBuf, &String)> =
         discovered.iter().filter(|(p, _)| **p != root).collect();
     wrapped.sort_by(|a, b| a.1.cmp(b.1));
-    for (path, _rel) in &wrapped {
+    for (path, rel) in &wrapped {
         let body = read_file(path)?;
         let rewritten = rewrite_imports_text(&body, path, &named);
+        // The `const __k2_mod_<h> = struct {` header is one synthesized line; the
+        // file body then begins on the next merged line, mapping to file line 1.
         out.push_str(&format!("const {} = struct {{\n", mod_name(path)));
+        let body_start_line = line_count_of(&out) + 1;
+        source_map.push(body_start_line, line_count_of(&rewritten), rel, 1);
         out.push_str(&rewritten);
         out.push_str("\n};\n");
     }
 
     // 2. The std root + (optionally) the build root + the build_options root.
+    //    Record each appended region's CHAR-offset range so coverage can exclude
+    //    prelude code by provenance (the merge interleaves user + prelude, so a
+    //    single boundary offset cannot). Offsets are char counts to match the
+    //    char-based spans the front end produces.
+    let mut prelude_ranges: Vec<(u32, u32)> = Vec::new();
+    let prelude_start = out.chars().count() as u32;
     out.push_str(&k2_std::std_root_item_source());
     if inputs.inject_build {
         out.push_str(&k2_std::build_root_item_source());
     }
     out.push_str(&synth_build_options(&inputs.build_options));
+    let prelude_end = out.chars().count() as u32;
+    if prelude_end > prelude_start {
+        prelude_ranges.push((prelude_start, prelude_end));
+    }
 
     // 3. The root file's items at the outermost level (it IS the program — its
     //    `main`/`build` must stay a top-level entry the lowerer enqueues).
     let root_body = read_file(&root)?;
     let root_rewritten = rewrite_imports_text(&root_body, &root, &named);
+    let root_display = rel_to_root(&root, &build_root);
+    let root_start_line = line_count_of(&out) + 1;
+    source_map.push(
+        root_start_line,
+        line_count_of(&root_rewritten),
+        &root_display,
+        1,
+    );
     out.push_str(&root_rewritten);
     if !out.ends_with('\n') {
         out.push('\n');
@@ -266,6 +346,8 @@ pub fn merge(inputs: &CompileInputs) -> Result<MergedProgram, MultiDiag> {
     Ok(MergedProgram {
         source: out,
         inputs: InputFiles { files },
+        prelude_ranges,
+        source_map,
     })
 }
 

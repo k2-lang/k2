@@ -410,6 +410,9 @@ fn inline_one(prog: &mut MirProgram, ci: usize, site: CallSite) {
             stmts,
             term,
             is_panic: cb.is_panic,
+            // Preserve the originating trap span so an inlined callee's `unreachable`
+            // still points its caret at the keyword, not the call site.
+            trap_span: cb.trap_span,
         });
     }
 }
@@ -436,6 +439,8 @@ fn split_call_block(func: &mut MirFunction, bi: usize, si: usize) -> Split {
         stmts: trailing,
         term: orig_term,
         is_panic: false,
+        // A continuation block is ordinary control flow, never a trap target.
+        trap_span: None,
     });
     Split { cont: cont_id }
 }
@@ -689,6 +694,7 @@ impl CloneBody for MirFunction {
                     stmts: b.stmts.clone(),
                     term: b.term.clone(),
                     is_panic: b.is_panic,
+                    trap_span: b.trap_span,
                 })
                 .collect(),
             entry: self.entry,

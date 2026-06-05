@@ -59,7 +59,10 @@ pub use build_graph::{
     TargetTriple,
 };
 pub use value::{Capability, IntRepr, SchedKind, Value};
-pub use vm::{BuildInputs, Halt, OsInputs, PanicInfo, Vm};
+pub use vm::{
+    BuildInputs, Coverage, FailKind, Halt, OsInputs, PanicInfo, RunOpts, TestFailure, TestOutcome,
+    TestStatus, Vm,
+};
 
 /// Runs `build(b)` over a compiled `build.k2` program and returns the recorded
 /// [`BuildGraph`]. The program is the merged `build.k2` (with the bundled `build`
@@ -94,31 +97,166 @@ pub struct TestReport {
     pub stderr: Vec<u8>,
 }
 
+/// One test's structured result: its display name (the part after `test `), its
+/// pass/fail status, and — on failure — a [`TestFailure`] carrying the reason and
+/// the source span the runner renders a caret over.
+#[derive(Clone, Debug)]
+pub struct TestResult {
+    /// The test's display name (the `"…"` part of `test "…" { }`).
+    pub name: String,
+    /// `true` iff the test passed (no failed assertion, trap, leak, or escaped
+    /// error).
+    pub passed: bool,
+    /// The structured failure (reason + message + span), present iff `!passed`.
+    pub failure: Option<TestFailure>,
+    /// For a fuzz target, the number of iterations run before the result (`None`
+    /// for a plain unit test).
+    pub fuzz_runs: Option<usize>,
+}
+
+/// The rich outcome of running a program's `test`/`fuzz` blocks: the structured
+/// per-test results, the captured streams, and (when requested) the coverage
+/// summary. The driver renders FAILs with the v0.20 caret and prints the summary.
+pub struct RichTestReport {
+    /// The per-test results, in MIR lowering order (deterministic).
+    pub results: Vec<TestResult>,
+    /// The captured stdout across all tests.
+    pub stdout: Vec<u8>,
+    /// The captured stderr across all tests.
+    pub stderr: Vec<u8>,
+    /// The collected coverage, present iff `RunOpts::coverage` was set.
+    pub coverage: Option<Coverage>,
+}
+
+impl RichTestReport {
+    /// The number of tests that passed.
+    pub fn passed(&self) -> usize {
+        self.results.iter().filter(|r| r.passed).count()
+    }
+    /// The number of tests that failed.
+    pub fn failed(&self) -> usize {
+        self.results.iter().filter(|r| !r.passed).count()
+    }
+}
+
 /// Compiles + runs every `test { ... }` block in `prog`, returning a
 /// [`TestReport`]. Each test runs on a fresh fiber with clean scheduler state, so
 /// one test cannot leak fibers into the next. A `catch_unwind` backstop maps any
 /// stray internal Rust panic to a failing report rather than aborting.
+///
+/// This is the legacy line-oriented entry point the build driver's `test` step
+/// still consumes (it prints `# N passed, M failed`). The richer
+/// [`run_tests_opts`] backs the first-class `k2c test` runner (caret diagnostics,
+/// filter, coverage, fuzz). Both share the same per-test isolation + leak check.
 pub fn run_tests(prog: &MirProgram) -> TestReport {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let report = run_tests_opts(prog, &RunOpts::default());
+    let lines: Vec<String> = report
+        .results
+        .iter()
+        .map(|r| match &r.failure {
+            None => format!("{} ... ok", display_test_name(&r.name)),
+            Some(f) => format!("{} ... FAILED ({})", display_test_name(&r.name), f.message),
+        })
+        .collect();
+    TestReport {
+        passed: report.passed(),
+        failed: report.failed(),
+        lines,
+        stdout: report.stdout,
+        stderr: report.stderr,
+    }
+}
+
+/// Renders a raw MIR test-function name (`"test foo"`) as its display form (the
+/// part after the leading `test `), matching the legacy report wording.
+fn display_test_name(raw: &str) -> &str {
+    raw.strip_prefix("test ").unwrap_or(raw)
+}
+
+/// Compiles + runs the `test`/`fuzz` blocks of `prog` under `opts`, returning a
+/// [`RichTestReport`]. Honours the name filter, collects coverage when asked, and
+/// drives fuzz targets deterministically. A `catch_unwind` backstop maps any stray
+/// internal Rust panic to a single synthetic failing result rather than aborting.
+pub fn run_tests_opts(prog: &MirProgram, opts: &RunOpts) -> RichTestReport {
+    let opts = opts.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut vm = Vm::new(prog);
-        let (passed, failed, lines) = vm.run_tests();
-        (passed, failed, lines, vm.stdout, vm.stderr)
+        let (results, coverage) = vm.run_tests_opts(&opts);
+        (results, coverage, vm.stdout, vm.stderr)
     }));
     match result {
-        Ok((passed, failed, lines, stdout, stderr)) => TestReport {
-            passed,
-            failed,
-            lines,
+        Ok((results, coverage, stdout, stderr)) => RichTestReport {
+            results,
             stdout,
             stderr,
+            coverage,
         },
-        Err(_) => TestReport {
-            passed: 0,
-            failed: 1,
-            lines: vec!["internal VM error (Rust panic) running tests".to_string()],
+        Err(_) => RichTestReport {
+            results: vec![TestResult {
+                name: "<internal>".to_string(),
+                passed: false,
+                failure: Some(TestFailure {
+                    kind: FailKind::Trap,
+                    message: "internal VM error (Rust panic) running tests".to_string(),
+                    span: None,
+                }),
+                fuzz_runs: None,
+            }],
             stdout: Vec::new(),
             stderr: Vec::new(),
+            coverage: None,
         },
+    }
+}
+
+/// Runs `main` under coverage instrumentation, returning the run outcome, exit
+/// code, captured streams, and the collected [`Coverage`]. Backs `k2c run
+/// --coverage`. `user_boundary` is the char offset at/after which a function/line
+/// is appended std/prelude code excluded from the user denominator (`0` counts
+/// everything). Deterministic: the VM is single-threaded and coverage uses ordered
+/// `BTreeMap`/`BTreeSet`, so the report is identical across runs of the same MIR.
+pub fn run_program_coverage(
+    prog: &MirProgram,
+    args: RunArgs,
+    user_boundary: u32,
+) -> (RunOutcome, i32, Vec<u8>, Vec<u8>, Coverage) {
+    let mut os = args.os;
+    if os.argv.is_empty() {
+        os.argv = args.argv;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut vm = Vm::new(prog);
+        vm.with_os_inputs(os);
+        vm.set_coverage(true);
+        let halt = vm.run_main();
+        let (outcome, code) = match halt {
+            Ok(()) => (RunOutcome::Ok, 0),
+            Err(Halt::ProgramError(tag)) => {
+                let name = prog
+                    .err_names
+                    .get(&k2_mir::ErrTag(tag))
+                    .cloned()
+                    .unwrap_or_else(|| format!("error{tag}"));
+                (RunOutcome::Errored(name), 1)
+            }
+            Err(Halt::Panic(info)) => (RunOutcome::Panicked(info.message()), 134),
+            Err(Halt::Exit(c)) => (RunOutcome::Ok, c),
+        };
+        // Exclude the std/prelude appended after the user source (single-file run
+        // path) so the reported denominator is USER code only, with honest
+        // per-(function, line) attribution.
+        let cov = vm.coverage_with_boundary(user_boundary);
+        (outcome, code, vm.stdout, vm.stderr, cov)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(_) => (
+            RunOutcome::Panicked("internal VM error (Rust panic)".to_string()),
+            134,
+            Vec::new(),
+            Vec::new(),
+            Coverage::default(),
+        ),
     }
 }
 
