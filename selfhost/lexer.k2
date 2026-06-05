@@ -1,0 +1,721 @@
+//! # k2 lexer, written in k2 — self-hosting groundwork (v0.29)
+//!
+//! This is a faithful re-implementation of the Rust reference lexer
+//! (`crates/k2-lexer/src/lib.rs`) **in k2 itself**, run by the k2 toolchain
+//! (`k2c run` on the VM, `k2c run-native` on x86-64). It exists to prove the
+//! language is expressive enough to lex itself — a first step toward
+//! self-hosting — and it is held to that standard mechanically: the differential
+//! harness in `crates/k2c/tests/selfhost_lexer.rs` feeds the same corpus to this
+//! lexer and to the Rust lexer and asserts the token streams are identical.
+//!
+//! ## The differential signature
+//!
+//! For every token this program prints one line `line:col Kind byteLen`:
+//!   * `line`/`col` are 1-based; `col` counts **Unicode scalars** (UTF-8
+//!     continuation bytes do not advance it), exactly like the Rust lexer's
+//!     `Vec<char>` cursor.
+//!   * `Kind` is the token-kind name, spelled identically to the Rust
+//!     `TokenKind` `Debug` form (`KwConst`, `IntLiteral`, `Plus`, …).
+//!   * `byteLen` is the token's length in source bytes, equal to the Rust
+//!     `Token::text.len()`.
+//!
+//! `(line, col, byteLen)` pins a token's exact span in the shared source, so the
+//! lexeme text is determined and need not be printed: matching signatures imply
+//! identical text. The stream ends with `… Eof 0`, like `tokenize`.
+//!
+//! The lexer is allocation-free and reads no I/O: it lexes the embedded
+//! `SAMPLE` byte array. The differential harness rewrites the `SAMPLE`
+//! definition (delimited by the two unique marker lines near the bottom of
+//! this file) to lex arbitrary corpora.
+
+const std = @import("std");
+
+// =========================================================================
+//  Token-kind codes. The *names* (see `kindName`) mirror the Rust
+//  `TokenKind` Debug spelling, which is what the differential compares.
+// =========================================================================
+
+const K_IDENT: u32 = 0;
+const K_BUILTIN: u32 = 1;
+const K_ESCAPED_IDENT: u32 = 2;
+
+const K_KW_CONST: u32 = 3;
+const K_KW_VAR: u32 = 4;
+const K_KW_PUB: u32 = 5;
+const K_KW_FN: u32 = 6;
+const K_KW_COMPTIME: u32 = 7;
+const K_KW_RETURN: u32 = 8;
+const K_KW_STRUCT: u32 = 9;
+const K_KW_ENUM: u32 = 10;
+const K_KW_UNION: u32 = 11;
+const K_KW_ERROR: u32 = 12;
+const K_KW_IF: u32 = 13;
+const K_KW_ELSE: u32 = 14;
+const K_KW_WHILE: u32 = 15;
+const K_KW_FOR: u32 = 16;
+const K_KW_SWITCH: u32 = 17;
+const K_KW_BREAK: u32 = 18;
+const K_KW_CONTINUE: u32 = 19;
+const K_KW_DEFER: u32 = 20;
+const K_KW_ERRDEFER: u32 = 21;
+const K_KW_TRY: u32 = 22;
+const K_KW_CATCH: u32 = 23;
+const K_KW_ORELSE: u32 = 24;
+const K_KW_AND: u32 = 25;
+const K_KW_OR: u32 = 26;
+const K_KW_NOT: u32 = 27;
+const K_KW_UNREACHABLE: u32 = 28;
+const K_KW_TEST: u32 = 29;
+const K_KW_EXTERN: u32 = 30;
+const K_KW_EXPORT: u32 = 31;
+const K_KW_INLINE: u32 = 32;
+const K_KW_ALIGN: u32 = 33;
+const K_KW_TRUE: u32 = 34;
+const K_KW_FALSE: u32 = 35;
+const K_KW_NULL: u32 = 36;
+const K_KW_UNDEFINED: u32 = 37;
+
+const K_INT: u32 = 38;
+const K_FLOAT: u32 = 39;
+const K_CHAR: u32 = 40;
+const K_STRING: u32 = 41;
+const K_MULTILINE: u32 = 42;
+
+const K_PLUS: u32 = 43;
+const K_MINUS: u32 = 44;
+const K_STAR: u32 = 45;
+const K_SLASH: u32 = 46;
+const K_PERCENT: u32 = 47;
+const K_AMP: u32 = 48;
+const K_PIPE: u32 = 49;
+const K_CARET: u32 = 50;
+const K_TILDE: u32 = 51;
+const K_SHL: u32 = 52;
+const K_SHR: u32 = 53;
+const K_EQEQ: u32 = 54;
+const K_NOTEQ: u32 = 55;
+const K_LT: u32 = 56;
+const K_LTEQ: u32 = 57;
+const K_GT: u32 = 58;
+const K_GTEQ: u32 = 59;
+const K_EQ: u32 = 60;
+const K_PLUSEQ: u32 = 61;
+const K_MINUSEQ: u32 = 62;
+const K_STAREQ: u32 = 63;
+const K_SLASHEQ: u32 = 64;
+const K_PERCENTEQ: u32 = 65;
+const K_AMPEQ: u32 = 66;
+const K_PIPEEQ: u32 = 67;
+const K_CARETEQ: u32 = 68;
+const K_SHLEQ: u32 = 69;
+const K_SHREQ: u32 = 70;
+const K_PLUSPLUS: u32 = 71;
+const K_BANG: u32 = 72;
+const K_QUESTION: u32 = 73;
+const K_DOTSTAR: u32 = 74;
+const K_DOTQUESTION: u32 = 75;
+const K_DOT: u32 = 76;
+const K_DOTDOT: u32 = 77;
+const K_DOTDOTDOT: u32 = 78;
+const K_FATARROW: u32 = 79;
+
+const K_LPAREN: u32 = 80;
+const K_RPAREN: u32 = 81;
+const K_LBRACE: u32 = 82;
+const K_RBRACE: u32 = 83;
+const K_LBRACKET: u32 = 84;
+const K_RBRACKET: u32 = 85;
+const K_COMMA: u32 = 86;
+const K_SEMICOLON: u32 = 87;
+const K_COLON: u32 = 88;
+
+const K_DOC_COMMENT: u32 = 89;
+const K_EOF: u32 = 90;
+const K_ERROR: u32 = 91;
+
+/// Sentinel returned by `lexOperator` when the cursor is not on a symbolic
+/// character (never emitted; never passed to `kindName`).
+const K_NONE: u32 = 999;
+
+/// Maps a kind code to its name, spelled exactly like the Rust `TokenKind`
+/// `Debug` output so the two token streams compare byte-for-byte.
+fn kindName(k: u32) []const u8 {
+    return switch (k) {
+        K_IDENT => "Ident",
+        K_BUILTIN => "Builtin",
+        K_ESCAPED_IDENT => "EscapedIdent",
+        K_KW_CONST => "KwConst",
+        K_KW_VAR => "KwVar",
+        K_KW_PUB => "KwPub",
+        K_KW_FN => "KwFn",
+        K_KW_COMPTIME => "KwComptime",
+        K_KW_RETURN => "KwReturn",
+        K_KW_STRUCT => "KwStruct",
+        K_KW_ENUM => "KwEnum",
+        K_KW_UNION => "KwUnion",
+        K_KW_ERROR => "KwError",
+        K_KW_IF => "KwIf",
+        K_KW_ELSE => "KwElse",
+        K_KW_WHILE => "KwWhile",
+        K_KW_FOR => "KwFor",
+        K_KW_SWITCH => "KwSwitch",
+        K_KW_BREAK => "KwBreak",
+        K_KW_CONTINUE => "KwContinue",
+        K_KW_DEFER => "KwDefer",
+        K_KW_ERRDEFER => "KwErrdefer",
+        K_KW_TRY => "KwTry",
+        K_KW_CATCH => "KwCatch",
+        K_KW_ORELSE => "KwOrelse",
+        K_KW_AND => "KwAnd",
+        K_KW_OR => "KwOr",
+        K_KW_NOT => "KwNot",
+        K_KW_UNREACHABLE => "KwUnreachable",
+        K_KW_TEST => "KwTest",
+        K_KW_EXTERN => "KwExtern",
+        K_KW_EXPORT => "KwExport",
+        K_KW_INLINE => "KwInline",
+        K_KW_ALIGN => "KwAlign",
+        K_KW_TRUE => "KwTrue",
+        K_KW_FALSE => "KwFalse",
+        K_KW_NULL => "KwNull",
+        K_KW_UNDEFINED => "KwUndefined",
+        K_INT => "IntLiteral",
+        K_FLOAT => "FloatLiteral",
+        K_CHAR => "CharLiteral",
+        K_STRING => "StringLiteral",
+        K_MULTILINE => "MultilineString",
+        K_PLUS => "Plus",
+        K_MINUS => "Minus",
+        K_STAR => "Star",
+        K_SLASH => "Slash",
+        K_PERCENT => "Percent",
+        K_AMP => "Amp",
+        K_PIPE => "Pipe",
+        K_CARET => "Caret",
+        K_TILDE => "Tilde",
+        K_SHL => "Shl",
+        K_SHR => "Shr",
+        K_EQEQ => "EqEq",
+        K_NOTEQ => "NotEq",
+        K_LT => "Lt",
+        K_LTEQ => "LtEq",
+        K_GT => "Gt",
+        K_GTEQ => "GtEq",
+        K_EQ => "Eq",
+        K_PLUSEQ => "PlusEq",
+        K_MINUSEQ => "MinusEq",
+        K_STAREQ => "StarEq",
+        K_SLASHEQ => "SlashEq",
+        K_PERCENTEQ => "PercentEq",
+        K_AMPEQ => "AmpEq",
+        K_PIPEEQ => "PipeEq",
+        K_CARETEQ => "CaretEq",
+        K_SHLEQ => "ShlEq",
+        K_SHREQ => "ShrEq",
+        K_PLUSPLUS => "PlusPlus",
+        K_BANG => "Bang",
+        K_QUESTION => "Question",
+        K_DOTSTAR => "DotStar",
+        K_DOTQUESTION => "DotQuestion",
+        K_DOT => "Dot",
+        K_DOTDOT => "DotDot",
+        K_DOTDOTDOT => "DotDotDot",
+        K_FATARROW => "FatArrow",
+        K_LPAREN => "LParen",
+        K_RPAREN => "RParen",
+        K_LBRACE => "LBrace",
+        K_RBRACE => "RBrace",
+        K_LBRACKET => "LBracket",
+        K_RBRACKET => "RBracket",
+        K_COMMA => "Comma",
+        K_SEMICOLON => "Semicolon",
+        K_COLON => "Colon",
+        K_DOC_COMMENT => "DocComment",
+        K_EOF => "Eof",
+        else => "Error",
+    };
+}
+
+// =========================================================================
+//  Byte classification (ASCII; identifiers and digits are ASCII-only, so a
+//  multibyte scalar never starts or extends one — matching the Rust lexer).
+// =========================================================================
+
+fn isIdentStart(b: u32) bool {
+    return b == '_' or (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z');
+}
+fn isIdentCont(b: u32) bool {
+    return isIdentStart(b) or (b >= '0' and b <= '9');
+}
+fn isContByte(b: u32) bool {
+    // UTF-8 continuation byte 0x80..=0xBF — never advances the scalar column.
+    return b >= 0x80 and b <= 0xBF;
+}
+
+/// Digit classes for `consumeDigits`: 0=dec 1=hex 2=oct 3=bin.
+fn acceptDigit(class: u32, b: u32) bool {
+    return switch (class) {
+        0 => b >= '0' and b <= '9',
+        1 => (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F'),
+        2 => b >= '0' and b <= '7',
+        3 => b == '0' or b == '1',
+        else => false,
+    };
+}
+
+// =========================================================================
+//  Cursor + low-level peek/bump. `pos` is a byte index; `col` is a scalar
+//  count (continuation bytes do not advance it), `line` 1-based.
+// =========================================================================
+
+const Cursor = struct {
+    pos: usize,
+    line: u32,
+    col: u32,
+};
+
+const Token = struct {
+    kind: u32,
+    line: u32,
+    col: u32,
+    len: u32,
+};
+
+/// Byte `n` scalars... no — `n` *bytes* ahead, or 256 (an impossible byte) at
+/// or past end of input. All call sites peek ASCII bytes, where byte-distance
+/// equals scalar-distance, so this matches the Rust scalar `peek_at`.
+fn peekAt(src: []const u8, cur: *Cursor, n: usize) u32 {
+    const i = cur.pos + n;
+    if (i < src.len) return @as(u32, src[i]);
+    return 256;
+}
+fn peek(src: []const u8, cur: *Cursor) u32 {
+    return peekAt(src, cur, 0);
+}
+
+/// Advances one byte, maintaining line (on `\n`) and scalar column (skipping
+/// continuation bytes). A no-op at end of input.
+fn bump(src: []const u8, cur: *Cursor) void {
+    if (cur.pos >= src.len) return;
+    const b = @as(u32, src[cur.pos]);
+    cur.pos += 1;
+    if (b == '\n') {
+        cur.line += 1;
+        cur.col = 1;
+    } else if (isContByte(b)) {
+        // mid-scalar: column unchanged
+    } else {
+        cur.col += 1;
+    }
+}
+
+/// Advances over one whole Unicode scalar (lead byte + continuation bytes) —
+/// used for the single-scalar `Error` fallback so its byte length matches the
+/// Rust lexer's one-`char` error lexeme.
+fn bumpScalar(src: []const u8, cur: *Cursor) void {
+    bump(src, cur);
+    while (isContByte(peek(src, cur))) {
+        bump(src, cur);
+    }
+}
+
+fn mkTok(kind: u32, line: u32, col: u32, start: usize, cur: *Cursor) Token {
+    return Token{
+        .kind = kind,
+        .line = line,
+        .col = col,
+        .len = @intCast(cur.pos - start),
+    };
+}
+
+/// Bumps `n` bytes and emits a fixed-width operator/punctuation token.
+fn emitFixed(src: []const u8, cur: *Cursor, n: u32, kind: u32, line: u32, col: u32, start: usize) Token {
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        bump(src, cur);
+    }
+    return mkTok(kind, line, col, start, cur);
+}
+
+// =========================================================================
+//  Sub-lexers
+// =========================================================================
+
+/// Consumes a run of digits of `class`, allowing single `_` separators between
+/// two accepted digits (not leading/trailing/adjacent).
+fn consumeDigits(src: []const u8, cur: *Cursor, class: u32) void {
+    while (true) {
+        const c = peek(src, cur);
+        if (acceptDigit(class, c)) {
+            bump(src, cur);
+        } else if (c == '_' and acceptDigit(class, peekAt(src, cur, 1))) {
+            bump(src, cur);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Scans a `"`-delimited body starting on the opening quote. Returns true if it
+/// terminated, false if unterminated (EOF or newline) — the Rust string rule.
+fn scanQuoted(src: []const u8, cur: *Cursor, quote: u32) bool {
+    bump(src, cur); // opening quote
+    while (true) {
+        const c = peek(src, cur);
+        if (c == 256 or c == '\n') return false;
+        if (c == quote) {
+            bump(src, cur);
+            return true;
+        }
+        if (c == '\\') {
+            bump(src, cur);
+            if (peek(src, cur) != 256) bump(src, cur);
+        } else {
+            bump(src, cur);
+        }
+    }
+}
+
+fn lexString(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    const ok = scanQuoted(src, cur, '"');
+    if (ok) return mkTok(K_STRING, line, col, start, cur);
+    return mkTok(K_ERROR, line, col, start, cur);
+}
+
+fn lexChar(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    const ok = scanQuoted(src, cur, '\'');
+    if (ok) return mkTok(K_CHAR, line, col, start, cur);
+    return mkTok(K_ERROR, line, col, start, cur);
+}
+
+/// `@name` builtin or `@"..."` escaped identifier (or a bare-`@` error).
+fn lexAt(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    bump(src, cur); // '@'
+    const c = peek(src, cur);
+    if (c == '"') {
+        const ok = scanQuoted(src, cur, '"');
+        if (ok) return mkTok(K_ESCAPED_IDENT, line, col, start, cur);
+        return mkTok(K_ERROR, line, col, start, cur);
+    }
+    if (isIdentStart(c)) {
+        bump(src, cur);
+        while (isIdentCont(peek(src, cur))) {
+            bump(src, cur);
+        }
+        return mkTok(K_BUILTIN, line, col, start, cur);
+    }
+    return mkTok(K_ERROR, line, col, start, cur);
+}
+
+/// True iff `src[start..start+len]` equals the keyword `kw`.
+fn matchKw(src: []const u8, start: usize, len: usize, kw: []const u8) bool {
+    if (len != kw.len) return false;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (src[start + i] != kw[i]) return false;
+    }
+    return true;
+}
+
+fn keywordKind(src: []const u8, start: usize, len: usize) u32 {
+    if (matchKw(src, start, len, "const")) return K_KW_CONST;
+    if (matchKw(src, start, len, "var")) return K_KW_VAR;
+    if (matchKw(src, start, len, "pub")) return K_KW_PUB;
+    if (matchKw(src, start, len, "fn")) return K_KW_FN;
+    if (matchKw(src, start, len, "comptime")) return K_KW_COMPTIME;
+    if (matchKw(src, start, len, "return")) return K_KW_RETURN;
+    if (matchKw(src, start, len, "struct")) return K_KW_STRUCT;
+    if (matchKw(src, start, len, "enum")) return K_KW_ENUM;
+    if (matchKw(src, start, len, "union")) return K_KW_UNION;
+    if (matchKw(src, start, len, "error")) return K_KW_ERROR;
+    if (matchKw(src, start, len, "if")) return K_KW_IF;
+    if (matchKw(src, start, len, "else")) return K_KW_ELSE;
+    if (matchKw(src, start, len, "while")) return K_KW_WHILE;
+    if (matchKw(src, start, len, "for")) return K_KW_FOR;
+    if (matchKw(src, start, len, "switch")) return K_KW_SWITCH;
+    if (matchKw(src, start, len, "break")) return K_KW_BREAK;
+    if (matchKw(src, start, len, "continue")) return K_KW_CONTINUE;
+    if (matchKw(src, start, len, "defer")) return K_KW_DEFER;
+    if (matchKw(src, start, len, "errdefer")) return K_KW_ERRDEFER;
+    if (matchKw(src, start, len, "try")) return K_KW_TRY;
+    if (matchKw(src, start, len, "catch")) return K_KW_CATCH;
+    if (matchKw(src, start, len, "orelse")) return K_KW_ORELSE;
+    if (matchKw(src, start, len, "and")) return K_KW_AND;
+    if (matchKw(src, start, len, "or")) return K_KW_OR;
+    if (matchKw(src, start, len, "not")) return K_KW_NOT;
+    if (matchKw(src, start, len, "unreachable")) return K_KW_UNREACHABLE;
+    if (matchKw(src, start, len, "test")) return K_KW_TEST;
+    if (matchKw(src, start, len, "extern")) return K_KW_EXTERN;
+    if (matchKw(src, start, len, "export")) return K_KW_EXPORT;
+    if (matchKw(src, start, len, "inline")) return K_KW_INLINE;
+    if (matchKw(src, start, len, "align")) return K_KW_ALIGN;
+    if (matchKw(src, start, len, "true")) return K_KW_TRUE;
+    if (matchKw(src, start, len, "false")) return K_KW_FALSE;
+    if (matchKw(src, start, len, "null")) return K_KW_NULL;
+    if (matchKw(src, start, len, "undefined")) return K_KW_UNDEFINED;
+    return K_IDENT;
+}
+
+fn lexIdentOrKeyword(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    bump(src, cur);
+    while (isIdentCont(peek(src, cur))) {
+        bump(src, cur);
+    }
+    const len = cur.pos - start;
+    const k = keywordKind(src, start, len);
+    return mkTok(k, line, col, start, cur);
+}
+
+/// `0x…` hex integer or hex float (`p`/`P` binary exponent).
+fn lexHexOrHexFloat(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    bump(src, cur); // '0'
+    bump(src, cur); // 'x'/'X'
+    consumeDigits(src, cur, 1);
+    var isFloat = false;
+    if (peek(src, cur) == '.') {
+        isFloat = true;
+        bump(src, cur);
+        consumeDigits(src, cur, 1);
+    }
+    const p = peek(src, cur);
+    if (p == 'p' or p == 'P') {
+        isFloat = true;
+        bump(src, cur);
+        const s = peek(src, cur);
+        if (s == '+' or s == '-') bump(src, cur);
+        consumeDigits(src, cur, 0);
+    }
+    if (isFloat) return mkTok(K_FLOAT, line, col, start, cur);
+    return mkTok(K_INT, line, col, start, cur);
+}
+
+fn lexNumber(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    if (peek(src, cur) == '0') {
+        const c1 = peekAt(src, cur, 1);
+        if (c1 == 'x' or c1 == 'X') return lexHexOrHexFloat(src, cur, line, col, start);
+        if (c1 == 'o' or c1 == 'O') {
+            bump(src, cur);
+            bump(src, cur);
+            consumeDigits(src, cur, 2);
+            return mkTok(K_INT, line, col, start, cur);
+        }
+        if (c1 == 'b' or c1 == 'B') {
+            bump(src, cur);
+            bump(src, cur);
+            consumeDigits(src, cur, 3);
+            return mkTok(K_INT, line, col, start, cur);
+        }
+    }
+    consumeDigits(src, cur, 0);
+    var isFloat = false;
+    // Fractional part needs a digit on both sides of '.'.
+    if (peek(src, cur) == '.' and acceptDigit(0, peekAt(src, cur, 1))) {
+        isFloat = true;
+        bump(src, cur);
+        consumeDigits(src, cur, 0);
+    }
+    const e = peek(src, cur);
+    if (e == 'e' or e == 'E') {
+        isFloat = true;
+        bump(src, cur);
+        const s = peek(src, cur);
+        if (s == '+' or s == '-') bump(src, cur);
+        consumeDigits(src, cur, 0);
+    }
+    if (isFloat) return mkTok(K_FLOAT, line, col, start, cur);
+    return mkTok(K_INT, line, col, start, cur);
+}
+
+/// One or more consecutive `\\`-prefixed lines; raw; ends at the first line
+/// that does not begin (after optional leading spaces/tabs) with `\\`.
+fn lexMultiline(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    while (true) {
+        bump(src, cur); // first '\'
+        bump(src, cur); // second '\'
+        while (true) {
+            const c = peek(src, cur);
+            if (c == 256 or c == '\n') break;
+            bump(src, cur);
+        }
+        // Look past the newline + leading whitespace for another `\\` line.
+        var look = cur.pos;
+        if (look < src.len and src[look] == '\n') {
+            look += 1;
+            while (look < src.len and (src[look] == ' ' or src[look] == '\t')) {
+                look += 1;
+            }
+            if (look + 1 < src.len and src[look] == '\\' and src[look + 1] == '\\') {
+                while (cur.pos < look) {
+                    bump(src, cur);
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    return mkTok(K_MULTILINE, line, col, start, cur);
+}
+
+/// One operator/punctuation token by maximal munch, or `K_NONE` if the cursor
+/// is not on a symbolic character.
+fn lexOperator(src: []const u8, cur: *Cursor, line: u32, col: u32, start: usize) Token {
+    const c0 = peek(src, cur);
+    const c1 = peekAt(src, cur, 1);
+    const c2 = peekAt(src, cur, 2);
+
+    if (c0 == '+') {
+        if (c1 == '+') return emitFixed(src, cur, 2, K_PLUSPLUS, line, col, start);
+        if (c1 == '=') return emitFixed(src, cur, 2, K_PLUSEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_PLUS, line, col, start);
+    }
+    if (c0 == '-') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_MINUSEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_MINUS, line, col, start);
+    }
+    if (c0 == '*') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_STAREQ, line, col, start);
+        return emitFixed(src, cur, 1, K_STAR, line, col, start);
+    }
+    if (c0 == '/') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_SLASHEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_SLASH, line, col, start);
+    }
+    if (c0 == '%') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_PERCENTEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_PERCENT, line, col, start);
+    }
+    if (c0 == '&') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_AMPEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_AMP, line, col, start);
+    }
+    if (c0 == '|') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_PIPEEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_PIPE, line, col, start);
+    }
+    if (c0 == '^') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_CARETEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_CARET, line, col, start);
+    }
+    if (c0 == '~') return emitFixed(src, cur, 1, K_TILDE, line, col, start);
+    if (c0 == '<') {
+        if (c1 == '<' and c2 == '=') return emitFixed(src, cur, 3, K_SHLEQ, line, col, start);
+        if (c1 == '<') return emitFixed(src, cur, 2, K_SHL, line, col, start);
+        if (c1 == '=') return emitFixed(src, cur, 2, K_LTEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_LT, line, col, start);
+    }
+    if (c0 == '>') {
+        if (c1 == '>' and c2 == '=') return emitFixed(src, cur, 3, K_SHREQ, line, col, start);
+        if (c1 == '>') return emitFixed(src, cur, 2, K_SHR, line, col, start);
+        if (c1 == '=') return emitFixed(src, cur, 2, K_GTEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_GT, line, col, start);
+    }
+    if (c0 == '=') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_EQEQ, line, col, start);
+        if (c1 == '>') return emitFixed(src, cur, 2, K_FATARROW, line, col, start);
+        return emitFixed(src, cur, 1, K_EQ, line, col, start);
+    }
+    if (c0 == '!') {
+        if (c1 == '=') return emitFixed(src, cur, 2, K_NOTEQ, line, col, start);
+        return emitFixed(src, cur, 1, K_BANG, line, col, start);
+    }
+    if (c0 == '?') return emitFixed(src, cur, 1, K_QUESTION, line, col, start);
+    if (c0 == '.') {
+        if (c1 == '.' and c2 == '.') return emitFixed(src, cur, 3, K_DOTDOTDOT, line, col, start);
+        if (c1 == '.') return emitFixed(src, cur, 2, K_DOTDOT, line, col, start);
+        if (c1 == '*') return emitFixed(src, cur, 2, K_DOTSTAR, line, col, start);
+        if (c1 == '?') return emitFixed(src, cur, 2, K_DOTQUESTION, line, col, start);
+        return emitFixed(src, cur, 1, K_DOT, line, col, start);
+    }
+    if (c0 == '(') return emitFixed(src, cur, 1, K_LPAREN, line, col, start);
+    if (c0 == ')') return emitFixed(src, cur, 1, K_RPAREN, line, col, start);
+    if (c0 == '{') return emitFixed(src, cur, 1, K_LBRACE, line, col, start);
+    if (c0 == '}') return emitFixed(src, cur, 1, K_RBRACE, line, col, start);
+    if (c0 == '[') return emitFixed(src, cur, 1, K_LBRACKET, line, col, start);
+    if (c0 == ']') return emitFixed(src, cur, 1, K_RBRACKET, line, col, start);
+    if (c0 == ',') return emitFixed(src, cur, 1, K_COMMA, line, col, start);
+    if (c0 == ';') return emitFixed(src, cur, 1, K_SEMICOLON, line, col, start);
+    if (c0 == ':') return emitFixed(src, cur, 1, K_COLON, line, col, start);
+
+    return Token{ .kind = K_NONE, .line = line, .col = col, .len = 0 };
+}
+
+/// `///` doc comment (exactly three slashes), retained as a token; scans to the
+/// end of the line, the newline excluded.
+fn lexDocComment(src: []const u8, cur: *Cursor) Token {
+    const line = cur.line;
+    const col = cur.col;
+    const start = cur.pos;
+    while (true) {
+        const c = peek(src, cur);
+        if (c == 256 or c == '\n') break;
+        bump(src, cur);
+    }
+    return mkTok(K_DOC_COMMENT, line, col, start, cur);
+}
+
+/// Produces the next token, skipping whitespace and `//`/`////…` line comments
+/// (a `///` doc comment is emitted as a token).
+fn nextToken(src: []const u8, cur: *Cursor) Token {
+    // Whitespace + line-comment trivia.
+    while (true) {
+        const c = peek(src, cur);
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            bump(src, cur);
+        } else if (c == '/' and peekAt(src, cur, 1) == '/') {
+            const isDoc = peekAt(src, cur, 2) == '/' and peekAt(src, cur, 3) != '/';
+            if (isDoc) return lexDocComment(src, cur);
+            // ordinary line comment, discarded
+            while (true) {
+                const d = peek(src, cur);
+                if (d == 256 or d == '\n') break;
+                bump(src, cur);
+            }
+        } else {
+            break;
+        }
+    }
+
+    const line = cur.line;
+    const col = cur.col;
+    const start = cur.pos;
+    const c = peek(src, cur);
+
+    if (c == 256) return Token{ .kind = K_EOF, .line = line, .col = col, .len = 0 };
+    if (c == 0) {
+        bump(src, cur);
+        return mkTok(K_ERROR, line, col, start, cur);
+    }
+    if (c == '@') return lexAt(src, cur, line, col, start);
+    if (isIdentStart(c)) return lexIdentOrKeyword(src, cur, line, col, start);
+    if (acceptDigit(0, c)) return lexNumber(src, cur, line, col, start);
+    if (c == '"') return lexString(src, cur, line, col, start);
+    if (c == '\'') return lexChar(src, cur, line, col, start);
+    if (c == '\\' and peekAt(src, cur, 1) == '\\') return lexMultiline(src, cur, line, col, start);
+
+    const op = lexOperator(src, cur, line, col, start);
+    if (op.kind != K_NONE) return op;
+
+    // Unexpected character: one whole scalar becomes an Error token.
+    bumpScalar(src, cur);
+    return mkTok(K_ERROR, line, col, start, cur);
+}
+
+//k2-selfhost-sample-begin
+const SAMPLE = [_]u8{ 0x2f, 0x2f, 0x2f, 0x20, 0x64, 0x6f, 0x63, 0x0a, 0x70, 0x75, 0x62, 0x20, 0x66, 0x6e, 0x20, 0x6d, 0x61, 0x69, 0x6e, 0x28, 0x29, 0x20, 0x21, 0x76, 0x6f, 0x69, 0x64, 0x20, 0x7b, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x63, 0x6f, 0x6e, 0x73, 0x74, 0x20, 0x78, 0x20, 0x3d, 0x20, 0x30, 0x78, 0x46, 0x46, 0x5f, 0x46, 0x46, 0x3b, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x72, 0x65, 0x74, 0x75, 0x72, 0x6e, 0x3b, 0x0a, 0x7d, 0x0a };
+//k2-selfhost-sample-end
+
+/// Lexes the embedded `SAMPLE` and prints one `line:col Kind byteLen` per token.
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const src: []const u8 = SAMPLE[0..];
+    var cur = Cursor{ .pos = 0, .line = 1, .col = 1 };
+    // Discard a leading UTF-8 BOM, like the Rust lexer.
+    if (src.len >= 3 and src[0] == 0xEF and src[1] == 0xBB and src[2] == 0xBF) {
+        cur.pos = 3;
+    }
+    while (true) {
+        const t = nextToken(src, &cur);
+        try out.print("{d}:{d} {s} {d}\n", .{ t.line, t.col, kindName(t.kind), t.len });
+        if (t.kind == K_EOF) break;
+    }
+}

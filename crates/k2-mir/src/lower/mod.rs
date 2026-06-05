@@ -1507,7 +1507,29 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             Expr::Index { base, index, span } => {
                 let base_place = self.lower_place_autoderef(base);
-                let elem_ty = self.type_at(*span);
+                // The element type must come from the BASE collection, not from
+                // the index expression's recorded type. Bidirectional checking
+                // can stamp a *coerced* type at the index span (e.g. the operand
+                // of `@as(u32, s[0])` records u32), and the native backend would
+                // then size the element memory load by that wrong width — reading
+                // 4 bytes for a `[]const u8` element and yielding garbage. Derive
+                // it from the slice/array/vector element; fall back to the span
+                // type only if the base is not a recognizable collection.
+                let span_ty = self.type_at(*span);
+                let base_ty = self.type_at(base.span());
+                let elem_ty = {
+                    let arena = &self.lo.typed.arena;
+                    let peeled = match arena.get(base_ty) {
+                        Type::Pointer { pointee, .. } => *pointee,
+                        _ => base_ty,
+                    };
+                    match arena.get(peeled) {
+                        Type::Slice { elem, .. }
+                        | Type::Array { elem, .. }
+                        | Type::Vector { elem, .. } => *elem,
+                        _ => span_ty,
+                    }
+                };
                 let idx_ty = self.lo.typed.arena.t_usize();
                 let idx = self.lower_operand(index, idx_ty);
                 self.emit_bounds_check(&base_place, base, &idx, *span);

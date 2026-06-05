@@ -762,6 +762,15 @@ impl FnBuilder<'_, '_> {
                 operand,
                 ..
             } => self.switch_item_value(operand, scrut_ty).map(|v| -v),
+            // A named value `const` used as a prong (`const Max = 5; switch (x) {
+            // Max => ... }`). Fold through the const's initializer so the arm
+            // actually matches; without this the prong yields `None` and is
+            // silently dropped from the generated `Switch` (it never matches —
+            // the arm becomes dead and the scrutinee falls through to `else`).
+            Expr::Ident { .. } => {
+                let init = self.top_level_const_init(e)?;
+                self.switch_item_value(&init, scrut_ty)
+            }
             _ => {
                 let _ = scrut_ty;
                 None

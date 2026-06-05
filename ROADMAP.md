@@ -243,7 +243,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | v0.26 | LSP completeness: references/rename/signature-help/semantic-tokens | tooling |
 | v0.27 | Debug info: DWARF in the native backend; gdb-debuggable | tooling |
 | v0.28 | Doc generator (`k2c doc`) + doc-tests ✅ | tooling |
-| v0.29 | Self-hosting groundwork: a k2-written front-end, run by the toolchain | self-host |
+| v0.29 | Self-hosting groundwork: a k2-written front-end, run by the toolchain ✅ | self-host |
 | v0.30 | 1.0 readiness: conformance suite, stability pass, full integration | maturity |
 
 ### Native track (v0.14–v0.18)
@@ -280,11 +280,24 @@ and a **documentation generator**.
 
 ### Maturity (v0.29–v0.30)
 
-- **v0.29 — Self-hosting groundwork.** A k2-written lexer (and parser) compiled
-  and run by the toolchain and **differentially tested against the Rust
-  front-end** — a proof of expressiveness. (k2 still does not *commit* to full
-  self-hosting; the Rust implementation stays the reference until a self-hosted
-  one clearly wins on robustness.)
+- **v0.29 — Self-hosting groundwork. ✅** A k2-written **lexer**
+  ([`selfhost/lexer.k2`](selfhost/lexer.k2)) — a faithful port of the Rust
+  reference lexer (`crates/k2-lexer`) — compiled and run by the toolchain on
+  **both** the bytecode VM and the **native** x86-64 backend, and
+  **differentially tested against the Rust front-end** over a broad corpus
+  (every token kind, maximal munch, all literal forms, comment/doc/multiline
+  boundaries, multibyte column tracking, BOM/NUL, and the example programs). The
+  lexer is allocation-free and emits a canonical `line:col Kind byteLen`
+  signature per token; `(line, col, byteLen)` pins each lexeme's exact span in
+  the shared source, so identical signatures prove identical tokenization. The
+  effort flushed out — and fixed — **two latent compiler bugs** that only a real
+  k2 program of this size exercises: a `switch` prong that is a named value
+  `const` silently never matched (MIR `switch` lowering dropped it), and
+  widening a value loaded directly from a slice index used the *coerced* result
+  type to size the native load (reading 4 bytes for a `[]const u8` element). Both
+  fixes live in shared MIR lowering, so the VM and native backend agree. (k2
+  still does not *commit* to full self-hosting; the Rust implementation stays the
+  reference until a self-hosted one clearly wins on robustness.)
 - **v0.30 — 1.0 readiness.** A spec-**conformance** test suite, a stability
   pass over the language surface, and a full integration sweep: every example
   runs on **both** the VM and the native backend, the whole suite is green, and
