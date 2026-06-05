@@ -84,9 +84,21 @@ fn build_and_run(prog: &MirProgram) -> i32 {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
     }
-    let status = std::process::Command::new(&path)
-        .status()
-        .expect("run binary");
+    // Executing a freshly-written file can transiently fail with ETXTBSY
+    // ("Text file busy", errno 26) when another test thread's fork+exec still
+    // holds a writable fd to this just-written binary; retry with a short
+    // backoff (matching the run_native helper in src/tests.rs).
+    let mut attempt = 0;
+    let status = loop {
+        match std::process::Command::new(&path).status() {
+            Ok(s) => break s,
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("run binary: {e:?}"),
+        }
+    };
     let _ = std::fs::remove_file(&path);
     status.code().unwrap_or(-1)
 }
