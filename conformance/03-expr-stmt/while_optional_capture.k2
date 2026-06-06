@@ -1,0 +1,22 @@
+// `while (opt) |v| { ... }` — a while loop driven by an optional, binding the
+// payload each iteration and exiting when it yields null (spec §03.4).
+const std = @import("std");
+
+fn nextSquare(state: *u32) ?u32 {
+    if (state.* >= 5) return null;
+    const v = state.*;
+    state.* += 1;
+    return v * v;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var i: u32 = 0;
+    var sum: u32 = 0;
+    var count: u32 = 0;
+    while (nextSquare(&i)) |sq| {
+        sum += sq;
+        count += 1;
+    }
+    try out.print("count={d} sum={d}\n", .{ count, sum });
+}
