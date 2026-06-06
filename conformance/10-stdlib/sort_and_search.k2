@@ -1,0 +1,35 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // In-place sort test with ascending and descending
+    var asc_arr = [_]i32{42, -7, 13, 0, 99, -1, 8, 25, 64, 2};
+    std.sort.Sorter(i32, std.sort.asc(i32)).sort(&asc_arr);
+
+    const asc_is_sorted: u32 = if (std.sort.Sorter(i32, std.sort.asc(i32)).isSorted(&asc_arr)) 1 else 0;
+    const asc_min = asc_arr[0];
+    const asc_max = asc_arr[asc_arr.len - 1];
+
+    // Binary search for a value
+    const search_result = std.sort.Sorter(i32, std.sort.asc(i32)).binarySearch(&asc_arr, 13);
+    const found_13: u32 = if (search_result != null) 1 else 0;
+
+    // Descending sort
+    var desc_arr = [_]i32{42, -7, 13, 0, 99, -1, 8, 25, 64, 2};
+    std.sort.Sorter(i32, std.sort.desc(i32)).sort(&desc_arr);
+
+    const desc_is_sorted: u32 = if (std.sort.Sorter(i32, std.sort.desc(i32)).isSorted(&desc_arr)) 1 else 0;
+    const desc_min = desc_arr[desc_arr.len - 1];
+    const desc_max = desc_arr[0];
+
+    // Sum of all elements (deterministic)
+    var sum: i64 = 0;
+    var i: usize = 0;
+    while (i < asc_arr.len) : (i += 1) {
+        sum += @as(i64, asc_arr[i]);
+    }
+
+    try out.print("asc_sorted={d} asc_min={d} asc_max={d} found_13={d} desc_sorted={d} desc_min={d} desc_max={d} sum={d}\n",
+        .{asc_is_sorted, asc_min, asc_max, found_13, desc_is_sorted, desc_min, desc_max, sum});
+}

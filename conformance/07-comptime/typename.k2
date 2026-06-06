@@ -1,0 +1,18 @@
+const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    const name_u32 = @typeName(u32);
+    const name_point = @typeName(Point);
+    const name_slice = @typeName([]const u8);
+    
+    try out.print("type_u32={s}\n", .{name_u32});
+    try out.print("type_point={s}\n", .{name_point});
+    try out.print("type_slice={s}\n", .{name_slice});
+}

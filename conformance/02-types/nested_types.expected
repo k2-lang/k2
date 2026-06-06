@@ -1,0 +1,4 @@
+shape1: radius=3
+total radius=6
+shape[1] center x=10 y=20
+subset length=2

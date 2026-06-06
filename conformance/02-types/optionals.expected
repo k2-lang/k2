@@ -1,0 +1,5 @@
+maybeDouble(50)=100
+maybeDouble(200)=999
+maybeInt(0)=10
+maybeInt(5)=0
+explicit value=42

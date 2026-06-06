@@ -1,0 +1,37 @@
+// try_propagation.k2 — try keyword to propagate errors up
+const std = @import("std");
+
+const ParseError = error{ BadFormat, OutOfRange };
+
+fn parseNum(text: []const u8) ParseError!u32 {
+    if (text.len == 0) return ParseError.BadFormat;
+    var result: u32 = 0;
+    for (text) |ch| {
+        if (ch < '0' or ch > '9') return ParseError.BadFormat;
+        const digit = @as(u32, ch - '0');
+        if (result > 4294967295 / 10) return ParseError.OutOfRange;
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+fn processTwo(a: []const u8, b: []const u8) ParseError!u32 {
+    const x = try parseNum(a);
+    const y = try parseNum(b);
+    return x + y;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Success: both parse, propagate neither error
+    const s = try processTwo("10", "20");
+    try out.print("processTwo(\"10\", \"20\") = {d}\n", .{s});
+
+    // Fail on first
+    const f1 = processTwo("xyz", "20") catch |err| {
+        try out.print("First failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try out.print("Should not reach: {d}\n", .{f1});
+}

@@ -1,0 +1,41 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // ASCII classification and conversion
+    const digits = [_]u8{'0', '5', '9', 'a', '3'};
+    var digit_count: u32 = 0;
+    var i: usize = 0;
+    while (i < digits.len) : (i += 1) {
+        if (std.ascii.isDigit(digits[i])) digit_count += 1;
+    }
+
+    const alpha_count: u32 = if (std.ascii.isAlpha('A')) 1 else 0;
+    const alnum_count: u32 = if (std.ascii.isAlphanumeric('5')) 1 else 0;
+    const ws_count: u32 = if (std.ascii.isWhitespace(' ')) 1 else 0;
+
+    // ASCII case conversion
+    const lower_x = std.ascii.toLower('X');
+    const upper_a = std.ascii.toUpper('a');
+
+    // Math functions
+    const gcd_val = std.math.gcd(252, 105);
+    const lcm_val = std.math.lcm(12, 18);
+    const pow_val = std.math.powU64(2, 10);
+    const min_val = std.math.min(i32, 42, 13);
+    const max_val = std.math.max(i32, 42, 13);
+    const clamp_val = std.math.clamp(i64, 500, 0, 255);
+
+    // Big integer operations
+    const big_a = std.Big.fromU64(1000000);
+    const big_b = std.Big.fromU64(999999);
+    const big_sum = std.Big.add(big_a, big_b);
+    const big_prod = std.Big.mul(std.Big.fromU64(123), std.Big.fromU64(456));
+
+    var big_buf: [80]u8 = undefined;
+    const big_sum_str = big_sum.toDecimal(&big_buf);
+    
+    try out.print("digits={d} alpha={d} alnum={d} ws={d} lower_x={c} upper_a={c} gcd={d} lcm={d} pow={d} min={d} max={d} clamp={d}\n",
+        .{digit_count, alpha_count, alnum_count, ws_count, lower_x, upper_a, gcd_val, lcm_val, pow_val, min_val, max_val, clamp_val});
+}

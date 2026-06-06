@@ -1,0 +1,25 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Simple ASCII characters
+    const a: u8 = 'a';
+    const zero: u8 = '0';
+
+    // Escape sequences
+    const newline: u8 = '\n';
+    const tab: u8 = '\t';
+    const quote: u8 = '\'';
+    const backslash: u8 = '\\';
+
+    // Hex escape
+    const hex_byte: u8 = '\x41';
+
+    // Unicode scalar
+    const euro: u32 = '€';
+
+    try out.print("{d} {d} {d}\n", .{ a, zero, hex_byte });
+    try out.print("{d} {d} {d}\n", .{ newline, tab, quote });
+    try out.print("{d} {d}\n", .{ backslash, euro });
+}

@@ -1,0 +1,4 @@
+handleError("") = 1
+handleError("*secret") = 2
+handleError("!broken") = 3
+handleError("normal.txt") = 0

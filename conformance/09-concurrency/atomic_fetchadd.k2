@@ -1,0 +1,24 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Basic atomic operations
+    var at = std.atomic.Value(u64).init(0);
+    
+    // Test fetchAdd
+    var prev = at.fetchAdd(10, .monotonic);
+    try out.print("fetchAdd(10) returned: {d}\n", .{prev});
+    
+    var cur = at.load(.monotonic);
+    try out.print("after fetchAdd(10): {d}\n", .{cur});
+    
+    // Test store and load
+    at.store(42, .monotonic);
+    try out.print("after store(42): {d}\n", .{at.load(.monotonic)});
+    
+    // Test swap
+    var old = at.swap(100, .monotonic);
+    try out.print("swap(100) returned: {d}\n", .{old});
+    try out.print("after swap(100): {d}\n", .{at.load(.monotonic)});
+}

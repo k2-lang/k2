@@ -1,0 +1,22 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Various identifier styles
+    const simple_name = 1;
+    const camelCase = 2;
+    const PascalCase = 3;
+    const _underscore_prefix = 4;
+    const with_multiple_underscores = 5;
+    const _: u32 = 6; // discard binding
+
+    // All-digit case-sensitivity
+    const Point = 10;
+    const point = 20;
+    const POINT = 30;
+
+    try out.print("{d} {d} {d}\n", .{ simple_name, camelCase, PascalCase });
+    try out.print("{d} {d}\n", .{ _underscore_prefix, with_multiple_underscores });
+    try out.print("{d} {d} {d}\n", .{ Point, point, POINT });
+}

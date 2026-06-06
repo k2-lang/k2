@@ -1,0 +1,45 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak");
+    }
+    const alloc = gpa.allocator();
+
+    // StringHashMap(u32) - word count style
+    var map = std.StringHashMap(u32).init(alloc);
+    defer map.deinit();
+
+    // Insert word frequencies
+    const words = [_][]const u8{ "apple", "banana", "apple", "cherry", "banana", "apple", "date" };
+    
+    var idx: usize = 0;
+    while (idx < words.len) : (idx += 1) {
+        const word = words[idx];
+        const result = try map.getOrPut(word);
+        if (result.found_existing) {
+            result.value_ptr.* += 1;
+        } else {
+            result.value_ptr.* = 1;
+        }
+    }
+
+    // Sum all frequencies
+    var sum: u32 = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        sum += entry.value;
+    }
+
+    const count = map.count();
+    const apple_freq = map.get("apple").?;
+    const missing = map.get("xyz");
+    const has_banana: u32 = if (map.contains("banana")) 1 else 0;
+
+    try out.print("unique={d} total={d} apple={d} missing={d} has_banana={d}\n",
+        .{count, sum, apple_freq, if (missing == null) 0 else missing.?, has_banana});
+}

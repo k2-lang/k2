@@ -1,0 +1,27 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Decimal literals
+    const dec_simple: u32 = 42;
+    const dec_underscore: u32 = 1_000_000;
+    const dec_zero: u32 = 0;
+
+    // Hex literals
+    const hex_simple: u32 = 0xFF;
+    const hex_underscore: u32 = 0xFF_FF;
+
+    // Octal literals
+    const oct_simple: u32 = 0o755;
+    const oct_underscore: u32 = 0o7_5_5;
+
+    // Binary literals
+    const bin_simple: u8 = 0b1010;
+    const bin_underscore: u8 = 0b1010_0101;
+
+    try out.print("{d} {d} {d}\n", .{ dec_simple, dec_underscore, dec_zero });
+    try out.print("{d} {d}\n", .{ hex_simple, hex_underscore });
+    try out.print("{d} {d}\n", .{ oct_simple, oct_underscore });
+    try out.print("{d} {d}\n", .{ bin_simple, bin_underscore });
+}

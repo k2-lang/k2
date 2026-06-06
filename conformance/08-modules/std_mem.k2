@@ -1,0 +1,29 @@
+// std_mem.k2 - Using std.mem and other std submodules
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("leak detected");
+    }
+    const alloc = gpa.allocator();
+    
+    // Use std.mem.copy and std.mem.eql
+    var src = [_]u8{ 1, 2, 3, 4, 5 };
+    var dst = [_]u8{ 0, 0, 0, 0, 0 };
+    std.mem.copy(u8, &dst, &src);
+    
+    const equal = std.mem.eql(u8, &src, &dst);
+    const equal_flag: u32 = if (equal) 1 else 0;
+    
+    // Use std.ascii classification
+    const is_digit = std.ascii.isDigit('5');
+    const is_alpha = std.ascii.isAlpha('A');
+    const digit_flag: u32 = if (is_digit) 1 else 0;
+    const alpha_flag: u32 = if (is_alpha) 1 else 0;
+    
+    try out.print("equal={d}\n", .{ equal_flag });
+    try out.print("is_digit={d} is_alpha={d}\n", .{ digit_flag, alpha_flag });
+}

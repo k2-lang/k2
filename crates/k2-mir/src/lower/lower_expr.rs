@@ -1832,6 +1832,23 @@ impl FnBuilder<'_, '_> {
         span: Span,
     ) {
         let agg_ty = self.type_at(span);
+        // `union`/`union(enum)` values are accepted by the front-end (parse,
+        // resolve, type-check, format, doc) but their runtime payload
+        // storage/retrieval is not yet implemented in either backend — the
+        // initializer would otherwise lower to a plain struct aggregate and read
+        // back `undefined`. Per k2's first rule — implement what is feasible and
+        // *cleanly refuse* the rest, NEVER miscompile — refuse the construction
+        // here with a compile-time diagnostic rather than emit a wrong value.
+        // (`k2c check` still accepts the program; only running/compiling it is
+        // refused.) Tracked as future work in ROADMAP.md (Beyond 0.30).
+        if matches!(self.lo.typed.arena.get(agg_ty), Type::Union(_)) {
+            self.lo.diagnostics.push(Diagnostic::error(
+                span,
+                "constructing a `union`/`union(enum)` value is not yet supported by the \
+                 backends (runtime payload storage is unimplemented); model the sum type as \
+                 an `enum` tag plus a payload `struct` for now. See ROADMAP.md (Beyond 0.30).",
+            ));
+        }
         match body {
             k2_syntax::InitBody::Fields(fields) => {
                 // `.{}` empty initializer on a slice type -> the empty slice.

@@ -1,0 +1,33 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Arithmetic
+    const add = 5 + 3;
+    const sub = 10 - 4;
+    const mul = 3 * 4;
+    const div = 12 / 3;
+    const modulo = 13 % 5;
+
+    // Bitwise
+    const bit_and = 0xFF & 0x0F;
+    const bit_or = 0xF0 | 0x0F;
+    const bit_xor = 0xFF ^ 0x0F;
+    const bit_not: u32 = ~@as(u32, 0);
+    const shift_left = 1 << 3;
+    const shift_right = 16 >> 2;
+
+    // Comparison
+    const eq = if (5 == 5) 1 else 0;
+    const ne = if (5 != 3) 1 else 0;
+    const lt = if (3 < 5) 1 else 0;
+    const le = if (5 <= 5) 1 else 0;
+    const gt = if (5 > 3) 1 else 0;
+    const ge = if (5 >= 5) 1 else 0;
+
+    try out.print("{d} {d} {d} {d} {d}\n", .{ add, sub, mul, div, modulo });
+    try out.print("{d} {d} {d}\n", .{ bit_and, bit_or, bit_xor });
+    try out.print("{d} {d}\n", .{ shift_left, shift_right });
+    try out.print("{d} {d} {d} {d} {d} {d}\n", .{ eq, ne, lt, le, gt, ge });
+}

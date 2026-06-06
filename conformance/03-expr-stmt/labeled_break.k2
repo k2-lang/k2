@@ -1,0 +1,51 @@
+// Test labeled blocks and break statements
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Test 1: simple labeled block with break
+    var sum1: i32 = 0;
+    var i: i32 = 0;
+    outer1: {
+        while (i < 10) : (i += 1) {
+            if (i == 5) {
+                break :outer1;
+            }
+            sum1 = sum1 + i;
+        }
+    }
+    // sum1 = 0+1+2+3+4 = 10
+    
+    // Test 2: nested labeled blocks
+    var sum2: i32 = 0;
+    var j: i32 = 0;
+    outer2: {
+        while (j < 3) : (j += 1) {
+            var k: i32 = 0;
+            while (k < 3) : (k += 1) {
+                if (k == 2) {
+                    break :outer2;
+                }
+                sum2 = sum2 + 1;
+            }
+        }
+    }
+    // sum2 = 2 (1 + 1, breaks on k==2 in first iteration of j)
+    
+    // Test 3: break without label (from inner loop only)
+    var sum3: i32 = 0;
+    var x: i32 = 0;
+    while (x < 3) : (x += 1) {
+        var y: i32 = 0;
+        while (y < 5) : (y += 1) {
+            if (y == 2) {
+                break;
+            }
+            sum3 = sum3 + 1;
+        }
+    }
+    // sum3 = 2*3 = 6
+    
+    try out.print("sum1={d} sum2={d} sum3={d}\n", .{ sum1, sum2, sum3 });
+}

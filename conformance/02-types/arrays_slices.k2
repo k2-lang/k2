@@ -1,0 +1,32 @@
+// arrays_slices.k2 - Arrays, slices, indexing, and slicing
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Array literal
+    const arr = [_]i32{ 10, 20, 30, 40, 50 };
+    
+    // Test .len
+    try out.print("array len={d}\n", .{arr.len});
+    
+    // Test indexing
+    try out.print("arr[0]={d} arr[2]={d} arr[4]={d}\n", .{ arr[0], arr[2], arr[4] });
+    
+    // Test slicing
+    const slice1 = arr[1..4];
+    try out.print("slice[1..4] len={d}\n", .{slice1.len});
+    
+    const slice2 = arr[0..2];
+    try out.print("slice[0..2] len={d} values: {d} {d}\n", .{ slice2.len, slice2[0], slice2[1] });
+    
+    // Compute sum of array via slicing
+    var sum: i32 = 0;
+    for (arr) |v| sum += v;
+    try out.print("sum={d}\n", .{sum});
+    
+    // Test .len on slices
+    var total: usize = 0;
+    for (slice1) |_| total += 1;
+    try out.print("slice1 iterated count={d}\n", .{total});
+}

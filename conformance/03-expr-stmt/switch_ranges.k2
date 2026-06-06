@@ -1,0 +1,42 @@
+// Test switch statements with ranges and else
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // switch with ranges
+    const classify = [_]i32{ 0, 1, 5, 9, 10, 15, 20, 100 };
+    var sum: i32 = 0;
+    
+    for (classify) |val| {
+        const category: i32 = switch (val) {
+            1...3 => 100,      // range 1 to 3
+            4...6 => 200,      // range 4 to 6
+            7...9 => 300,      // range 7 to 9
+            0 => 10,           // exact value
+            10 => 50,          // exact value
+            else => 500,       // else clause
+        };
+        sum = sum + category;
+    }
+    // 10 + 100 + 200 + 300 + 50 + 500 + 500 + 500 = 2160
+    
+    // switch as expression
+    var value: i32 = 7;
+    const result: i32 = switch (value) {
+        1...5 => 1,
+        6...8 => 2,
+        else => 0,
+    };
+    
+    // switch with single values
+    var code: i32 = 3;
+    const msg_val: i32 = switch (code) {
+        1 => 10,
+        2 => 20,
+        3 => 30,
+        else => 99,
+    };
+    
+    try out.print("sum={d} result={d} msg_val={d}\n", .{ sum, result, msg_val });
+}

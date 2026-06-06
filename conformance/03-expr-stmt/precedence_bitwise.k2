@@ -1,0 +1,27 @@
+// Test operator precedence and bitwise operations
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Test precedence: multiplication before addition
+    const p1: i32 = 2 + 3 * 4;  // 2 + 12 = 14
+    
+    // Test bitwise AND, OR, XOR
+    const a: u32 = 0xFF;
+    const b: u32 = 0x0F;
+    const and_result: u32 = a & b;    // 0x0F = 15
+    const or_result: u32 = a | b;     // 0xFF = 255
+    const xor_result: u32 = a ^ b;    // 0xF0 = 240
+    const not_result: u32 = ~a;       // all bits flipped
+    
+    // Bitwise shift
+    const shift_left: u32 = 5 << 2;   // 20
+    const shift_right: u32 = 20 >> 2; // 5
+    
+    // Mixed: precedence of * and + vs bitwise
+    const mixed: u32 = (2 + 3) & 7;   // 5 & 7 = 5
+    
+    try out.print("p1={d} and={d} or={d} xor={d} shift_left={d} shift_right={d} mixed={d}\n", 
+        .{ p1, and_result, or_result, xor_result, shift_left, shift_right, mixed });
+}

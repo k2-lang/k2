@@ -1,0 +1,5 @@
+fetchAdd(10) returned: 0
+after fetchAdd(10): 10
+after store(42): 42
+swap(100) returned: 42
+after swap(100): 100

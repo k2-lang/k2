@@ -1,0 +1,34 @@
+// struct_namespace.k2 - Struct used as a namespace with pub consts and fns
+const Color = struct {
+    pub const RED = 0xFF0000;
+    pub const GREEN = 0x00FF00;
+    pub const BLUE = 0x0000FF;
+    
+    pub fn mix(c1: u32, c2: u32) u32 {
+        return c1 ^ c2;
+    }
+    
+    pub fn brightness(rgb: u32) u32 {
+        const r = (rgb >> 16) & 0xFF;
+        const g = (rgb >> 8) & 0xFF;
+        const b = rgb & 0xFF;
+        return (r + g + b) / 3;
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Access pub consts from the namespace struct
+    const red = Color.RED;
+    const green = Color.GREEN;
+    const blue = Color.BLUE;
+    
+    // Call pub fns from the namespace struct
+    const mixed = Color.mix(red, green);
+    const bright = Color.brightness(blue);
+    
+    try out.print("red={d} green={d} blue={d}\n", .{ red, green, blue });
+    try out.print("mixed={d}\n", .{ mixed });
+    try out.print("brightness={d}\n", .{ bright });
+}

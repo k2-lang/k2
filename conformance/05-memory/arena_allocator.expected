@@ -1,0 +1,6 @@
+gpa_init
+arena_init
+arena_alloc_1_sum_45
+arena_alloc_2_ok
+arena_alloc_3_ok
+arena_deinit_ok

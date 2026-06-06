@@ -1,0 +1,48 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak");
+    }
+    const alloc = gpa.allocator();
+
+    // IntHashMap(u32, u32)
+    var map = std.IntHashMap(u32, u32).init(alloc);
+    defer map.deinit();
+
+    // Insert key-value pairs: key -> key^2
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        try map.put(i, i * i);
+    }
+
+    // Check contains for various keys
+    const has5: u32 = if (map.contains(5)) 1 else 0;
+    const has100: u32 = if (map.contains(100)) 1 else 0;
+
+    // Get a value
+    const val10 = map.get(10).?;
+
+    // Remove some keys (those divisible by 3)
+    var removed: u32 = 0;
+    i = 0;
+    while (i < 20) : (i += 1) {
+        if (i % 3 == 0) {
+            if (map.remove(i)) removed += 1;
+        }
+    }
+
+    // Sum all remaining values
+    var sum: u64 = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        sum += @as(u64, entry.value);
+    }
+
+    try out.print("count={d} has5={d} has100={d} val10={d} removed={d} sum={d}\n", 
+        .{map.count(), has5, has100, val10, removed, sum});
+}

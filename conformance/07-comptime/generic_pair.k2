@@ -1,0 +1,20 @@
+const std = @import("std");
+
+fn Pair(comptime A: type, comptime B: type) type {
+    return struct {
+        first: A,
+        second: B,
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Pair of u32 and u32
+    var p1: Pair(u32, u32) = .{ .first = 10, .second = 20 };
+    try out.print("pair1: first={d} second={d}\n", .{ p1.first, p1.second });
+    
+    // Pair of u32 and u8
+    var p2: Pair(u32, u8) = .{ .first = 100, .second = 5 };
+    try out.print("pair2: first={d} second={d}\n", .{ p2.first, p2.second });
+}

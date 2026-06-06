@@ -1,0 +1,42 @@
+// multi_toplevel.k2 - Multiple top-level const and fn declarations
+const std = @import("std");
+
+const MAGIC_NUMBER = 42;
+const MAGIC_STRING = "hello";
+
+fn double(x: i32) i32 {
+    return x * 2;
+}
+
+fn triple(x: i32) i32 {
+    return x * 3;
+}
+
+const Utils = struct {
+    pub fn add(a: i32, b: i32) i32 {
+        return a + b;
+    }
+    
+    pub fn subtract(a: i32, b: i32) i32 {
+        return a - b;
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Use multiple top-level consts
+    const num1 = MAGIC_NUMBER;
+    
+    // Use multiple top-level functions
+    const doubled = double(num1);
+    const tripled = triple(num1);
+    
+    // Use struct as namespace
+    const added = Utils.add(doubled, tripled);
+    const subtracted = Utils.subtract(doubled, tripled);
+    
+    try out.print("magic={d}\n", .{ num1 });
+    try out.print("doubled={d} tripled={d}\n", .{ doubled, tripled });
+    try out.print("added={d} subtracted={d}\n", .{ added, subtracted });
+}

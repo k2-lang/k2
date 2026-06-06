@@ -1,0 +1,6 @@
+array len=5
+arr[0]=10 arr[2]=30 arr[4]=50
+slice[1..4] len=3
+slice[0..2] len=2 values: 10 20
+sum=150
+slice1 iterated count=3

@@ -1,0 +1,5 @@
+sizeof_u32=4
+sizeof_u8=1
+sizeof_u64=8
+alignof_u32=4
+alignof_u8=1

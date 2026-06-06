@@ -1,0 +1,32 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    // ArrayList with u32 elements
+    var list = std.ArrayList(u32).init(alloc);
+    defer list.deinit();
+
+    // Append 10 elements
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        try list.append(i * 2);
+    }
+
+    // Sum all elements
+    var sum: u64 = 0;
+    var j: usize = 0;
+    while (j < list.len()) : (j += 1) {
+        sum += @as(u64, list.get(j).?);
+    }
+
+    const len = list.len();
+    try out.print("len={d} sum={d}\n", .{len, sum});
+}

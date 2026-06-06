@@ -1,0 +1,27 @@
+// catch_default.k2 — catch with default values instead of capture
+const std = @import("std");
+
+const LookupError = error{ NotFound, BadKey };
+
+fn lookup(key: u32, val: u32) LookupError!u32 {
+    if (key == 0) return LookupError.BadKey;
+    if (key > 10) return LookupError.NotFound;
+    return key * val;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // catch with default: success path
+    const a = lookup(3, 5) catch 999;
+    try out.print("lookup(3, 5) = {d}\n", .{a});
+
+    // catch with default: failure path uses the default
+    const b = lookup(20, 5) catch 999;
+    try out.print("lookup(20, 5) = {d}\n", .{b});
+
+    // Multiple catches
+    const c = lookup(0, 5) catch 111;
+    const d = lookup(5, 2) catch 222;
+    try out.print("lookup(0, 5) = {d}, lookup(5, 2) = {d}\n", .{ c, d });
+}

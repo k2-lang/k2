@@ -1,0 +1,25 @@
+// nested_struct.k2 - Nested struct types and field access
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const Container = struct {
+    pub fn makePoint(x: i32, y: i32) Point {
+        return Point{ .x = x, .y = y };
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Create an instance of the struct via the container
+    const pt = Container.makePoint(10, 20);
+    
+    // Access struct fields
+    const sum = pt.x + pt.y;
+    const product = pt.x * pt.y;
+    
+    try out.print("x={d} y={d}\n", .{ pt.x, pt.y });
+    try out.print("sum={d} product={d}\n", .{ sum, product });
+}

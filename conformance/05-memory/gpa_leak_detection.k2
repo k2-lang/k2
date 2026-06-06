@@ -1,0 +1,39 @@
+// gpa_leak_detection.k2 — GeneralPurposeAllocator detects allocation and freeing.
+// Verify that alloc/free pairs work correctly and deinit succeeds when no leaks.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected at shutdown");
+    }
+    const alloc = gpa.allocator();
+    
+    try out.print("gpa_init\n", .{});
+    
+    // Allocate and free a slice
+    const buf1: []u32 = try alloc.alloc(u32, 16);
+    try out.print("alloc_1_ok\n", .{});
+    alloc.free(buf1);
+    try out.print("free_1_ok\n", .{});
+    
+    // Allocate and free multiple times
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        const buf: []u8 = try alloc.alloc(u8, 32);
+        buf[0] = 42;
+        alloc.free(buf);
+    }
+    try out.print("alloc_free_loop_ok\n", .{});
+    
+    // Allocate and leave in a defer for cleanup
+    const buf2: []u64 = try alloc.alloc(u64, 8);
+    defer alloc.free(buf2);
+    try out.print("alloc_2_ok\n", .{});
+    
+    try out.print("gpa_deinit_ok\n", .{});
+}

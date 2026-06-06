@@ -1,0 +1,38 @@
+// int_widths.k2 - Integer types, @as, @intCast
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Different integer widths
+    const a: u8 = 250;
+    const b: u16 = 60000;
+    const c: u32 = 4_000_000_000;
+    const d: u64 = 18_000_000_000_000_000_000;
+    
+    try out.print("u8={d} u16={d} u32={d} u64={d}\n", .{ a, b, c, d });
+    
+    // Signed integers
+    const x: i8 = -50;
+    const y: i16 = -30000;
+    const z: i32 = -2_000_000_000;
+    
+    try out.print("i8={d} i16={d} i32={d}\n", .{ x, y, z });
+    
+    // @as casts at compile time (type annotation)
+    const casted = @as(u32, 100);
+    try out.print("@as(u32,100)={d}\n", .{casted});
+    
+    // Arithmetic with different widths via @as
+    const w1 = @as(u64, 1000);
+    const w2 = @as(u64, 2000);
+    const sum = w1 + w2;
+    try out.print("sum={d}\n", .{sum});
+    
+    // Bool is a type
+    const t: bool = true;
+    const f: bool = false;
+    const bt: u8 = if (t) 1 else 0;
+    const bf: u8 = if (f) 1 else 0;
+    try out.print("bool: true={d} false={d}\n", .{ bt, bf });
+}

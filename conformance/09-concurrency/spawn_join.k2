@@ -1,0 +1,25 @@
+const std = @import("std");
+
+fn compute(x: u64) u64 {
+    return x * 2 + 1;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var exec = std.Thread.Executor.init(sys.heap, .{ .worker_count = 4 });
+    defer exec.deinit();
+    
+    // Spawn three tasks and collect results
+    const t0 = exec.spawn(compute, .{@as(u64, 10)});
+    const t1 = exec.spawn(compute, .{@as(u64, 20)});
+    const t2 = exec.spawn(compute, .{@as(u64, 30)});
+    
+    const r0 = t0.result(u64);
+    const r1 = t1.result(u64);
+    const r2 = t2.result(u64);
+    
+    const total = r0 + r1 + r2;
+    try out.print("results: {d} {d} {d}\n", .{r0, r1, r2});
+    try out.print("total: {d}\n", .{total});
+}

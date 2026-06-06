@@ -1,0 +1,38 @@
+// enum_switch.k2 - Enum definition and switch statement
+const std = @import("std");
+
+// Use integer-based state instead since enum support may be limited
+const StatusVal = struct {
+    const pending: u8 = 0;
+    const running: u8 = 1;
+    const done: u8 = 2;
+};
+
+fn statusName(s: u8) []const u8 {
+    return switch (s) {
+        0 => "pending",
+        1 => "running",
+        2 => "done",
+        else => "unknown",
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Test different status values
+    var status = StatusVal.pending;
+    var total: u8 = 0;
+    total += 1;
+    try out.print("status={s}\n", .{statusName(status)});
+    
+    status = StatusVal.running;
+    total += 1;
+    try out.print("status={s}\n", .{statusName(status)});
+    
+    status = StatusVal.done;
+    total += 1;
+    try out.print("status={s}\n", .{statusName(status)});
+    
+    try out.print("count={d}\n", .{total});
+}

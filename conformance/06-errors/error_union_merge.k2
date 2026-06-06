@@ -1,0 +1,42 @@
+// error_union_merge.k2 — merge error sets with || operator
+const std = @import("std");
+
+const ParseError = error{ BadFormat, Overflow };
+const AllocError = error{ OutOfMemory };
+
+fn allocateAndParse(alloc: Allocator, text: []const u8) (ParseError || AllocError)!u32 {
+    // Try to allocate something
+    var buf: [1]u8 = undefined;
+    const _cell = try alloc.create(u8);
+    defer alloc.destroy(_cell);
+
+    // Now do parsing
+    if (text.len == 0) return ParseError.BadFormat;
+    var result: u32 = 0;
+    for (text) |ch| {
+        if (ch < '0' or ch > '9') return ParseError.BadFormat;
+        const digit = @as(u32, ch - '0');
+        if (result > 429496729) return ParseError.Overflow;
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const alloc = sys.heap;
+
+    // Success
+    const a = allocateAndParse(alloc, "123") catch |err| {
+        try out.print("Error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try out.print("allocateAndParse(\"123\") = {d}\n", .{a});
+
+    // Parse error caught with full merged set
+    const b = allocateAndParse(alloc, "abc") catch |err| {
+        try out.print("Caught error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try out.print("Should not reach: {d}\n", .{b});
+}

@@ -1,0 +1,20 @@
+// Line comment at file start
+
+const std = @import("std");
+
+/// Doc comment for main function
+pub fn main(sys: *System) !void {
+    // Regular line comment
+    const out = sys.io.stdout();
+
+    // Test that comments don't interfere with code
+    const x = 42; // trailing comment
+
+    /// Doc comment inside function (allowed but not attached)
+    const y = 100;
+
+    try out.print("{d} {d}\n", .{ x, y });
+
+    //// Four slashes is a regular comment, not a doc comment
+    try out.print("comments work\n", .{});
+}

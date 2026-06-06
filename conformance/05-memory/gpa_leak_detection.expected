@@ -1,0 +1,6 @@
+gpa_init
+alloc_1_ok
+free_1_ok
+alloc_free_loop_ok
+alloc_2_ok
+gpa_deinit_ok

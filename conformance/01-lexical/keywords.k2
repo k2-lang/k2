@@ -1,0 +1,39 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Test each keyword group works in context
+    const val: u32 = 42;
+    var mutable: u32 = 10;
+
+    if (val > 0) {
+        try out.print("{d}\n", .{val});
+    } else {
+        try out.print("negative\n", .{});
+    }
+
+    var count: u32 = 0;
+    while (count < 3) : (count += 1) {
+        count = count + 1;
+    }
+
+    for ([_]u32{ 1, 2, 3 }) |x| {
+        try out.print("{d}\n", .{x});
+    }
+
+    const result = if (true) 99 else 0;
+    try out.print("{d}\n", .{result});
+
+    const maybe: ?u32 = 42;
+    const unwrapped = maybe orelse 0;
+    try out.print("{d}\n", .{unwrapped});
+
+    const a = true;
+    const b = false;
+    const c = null;
+    const d = undefined;
+
+    const bool_result = a and not b;
+    try out.print("{d}\n", .{ if (bool_result) 1 else 0 });
+}

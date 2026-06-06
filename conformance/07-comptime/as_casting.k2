@@ -1,0 +1,21 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // @as for explicit type conversion
+    const a: u32 = 42;
+    const b: u64 = @as(u64, a);
+    const c: u8 = @as(u8, 200);
+    
+    try out.print("a={d}\n", .{a});
+    try out.print("b={d}\n", .{b});
+    try out.print("c={d}\n", .{c});
+    
+    // @as with expressions
+    const x = @as(u32, 5);
+    const y = @as(u32, 3);
+    const result = @as(u32, x + y);
+    
+    try out.print("result={d}\n", .{result});
+}

@@ -1,0 +1,2 @@
+validate(5) = 10
+validate(150) failed: BadValue

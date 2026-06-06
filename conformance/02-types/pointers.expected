@@ -1,0 +1,6 @@
+ptr.* =42
+ptr.get()=42
+after set: cell.value=100
+px.* =55
+after modify: x=77
+const ptr: 33

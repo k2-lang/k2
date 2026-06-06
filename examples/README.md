@@ -2,16 +2,27 @@
 
 > **k2** — *Kardashev Type II.* Total control over the machine, with zero waste.
 
-A guided tour of k2 through six small, complete programs. Each file is real,
+A guided tour of k2 through a handful of small, complete programs. Each file is real,
 idiomatic k2 you can read top to bottom; together they cover the language's
 defining ideas: **no ambient authority**, **no hidden allocation**, **no hidden
 control flow**, **errors as values**, and **comptime as the only
 metaprogramming**.
 
+Every example runs on the bytecode **VM** (`k2c run`, the semantic reference).
+`hello`, `errors`, and `allocators` also run on the **native** x86-64 backend
+(`k2c run-native`) with byte-identical output; the others use capabilities
+outside the current native subset (generic containers with aggregate elements,
+cooperative fibers, fs/net/time syscalls) and are *cleanly refused* by the
+native backend — they never miscompile. `comptime_reflection.k2` is a
+compile-time-reflection showcase: its compile-time machinery (type inspection,
+sizing, field validation, code generation) is the point; printing each field's
+*runtime* value needs runtime `inline for`, a documented post-1.0 item, so
+running it reaches that limit as a clean panic-trap.
+
 Every example shares the same vocabulary. There is exactly one way to print
 (through the `io` capability), one way to allocate (through an `Allocator`
 capability), one error mechanism (`error` sets with `try`/`catch`/`errdefer`),
-and one metaprogramming mechanism (`comptime`). Once you have read these six
+and one metaprogramming mechanism (`comptime`). Once you have read these
 files, you have seen most of the language.
 
 ---
@@ -23,7 +34,7 @@ program executed by the compiler's comptime engine — there is no second build
 language.
 
 ```sh
-# Build everything (Debug: Cranelift + full safety toolkit).
+# Build everything (Debug: full safety toolkit; k2 emits its own machine code).
 k2 build
 
 # Build and run one example.
@@ -63,6 +74,7 @@ through it.
 | [`comptime_reflection.k2`](comptime_reflection.k2) | `@typeInfo`, `inline for`, `@field`, `@compileError` | Generate a struct printer and a serializer at compile time. |
 | [`concurrency.k2`](concurrency.k2) | `Executor`/`Task` spawn-join, `Channel(T)`, `Mutex`, `atomic`, `event.Loop`/`await` | Deterministic cooperative concurrency: capabilities passed, never global. |
 | [`data_structures.k2`](data_structures.k2) | `std.IntHashMap`, `std.sort`, `std.unicode`, `std.math`/`std.Big` | The stdlib containers and algorithms: a resizing hash map, an in-place sort, UTF-8, and a big integer. |
+| [`os_capabilities.k2`](os_capabilities.k2) | `sys.fs`, `sys.time`, `sys.os`, `sys.net` | The OS-facing capabilities: files, a monotonic clock, pid/args — all passed, never ambient. |
 | [`build.k2`](build.k2) | `*Build`, artifacts, options, steps | A realistic build description, written in k2 itself. |
 
 ---
@@ -275,7 +287,8 @@ What to notice:
   `*System`. There is no ambient build state; everything flows through `b`.
 - **`build(b)` only *describes* a graph** of `Step` values; it compiles nothing
   itself and (like all comptime) performs no I/O. The toolchain then walks the
-  requested step with the real backends — Cranelift for Debug, LLVM for Release.
+  requested step with the real backends — the bytecode VM, or k2's own pure-`std`
+  native code generator (x86-64 / aarch64) for `build-native`.
 - **Build options are comptime values in your code.** `addOption(...)` surfaces
   a `-D` flag to the compiled program via `@import("build_options")`, where the
   dead branch is eliminated — a zero-cost compile-time switch.

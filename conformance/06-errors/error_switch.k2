@@ -1,0 +1,39 @@
+// error_switch.k2 — switch over captured error for exhaustive handling
+const std = @import("std");
+
+const FileError = error{ NotFound, PermissionDenied, ReadFailed };
+
+fn openFile(path: []const u8) FileError!u32 {
+    if (path.len == 0) return FileError.NotFound;
+    if (path[0] == '*') return FileError.PermissionDenied;
+    if (path[0] == '!') return FileError.ReadFailed;
+    return 42;
+}
+
+fn handleError(path: []const u8) u8 {
+    const result = openFile(path) catch |err| {
+        // Switch must be exhaustive: all cases of FileError
+        return switch (err) {
+            error.NotFound => 1,
+            error.PermissionDenied => 2,
+            error.ReadFailed => 3,
+        };
+    };
+    return 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const c1 = handleError("");
+    try out.print("handleError(\"\") = {d}\n", .{c1});
+
+    const c2 = handleError("*secret");
+    try out.print("handleError(\"*secret\") = {d}\n", .{c2});
+
+    const c3 = handleError("!broken");
+    try out.print("handleError(\"!broken\") = {d}\n", .{c3});
+
+    const c4 = handleError("normal.txt");
+    try out.print("handleError(\"normal.txt\") = {d}\n", .{c4});
+}

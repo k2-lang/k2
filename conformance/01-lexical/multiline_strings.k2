@@ -1,0 +1,18 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const usage =
+        \\Usage: k2 build
+        \\Options:
+        \\  --help    Show this help
+        ;
+
+    const raw_backslash =
+        \\C:\Windows\System32
+        ;
+
+    try out.print("{d}\n", .{usage.len});
+    try out.print("{d}\n", .{raw_backslash.len});
+}

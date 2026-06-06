@@ -1,0 +1,3 @@
+lookup(3, 5) = 15
+lookup(20, 5) = 999
+lookup(0, 5) = 111, lookup(5, 2) = 10

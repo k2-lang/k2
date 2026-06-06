@@ -1,0 +1,14 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Decimal floats
+    const pi: f64 = 3.141_592_653;
+    const avo: f64 = 6.022e23;
+    const tiny: f64 = 1.5e-9;
+    const simple: f64 = 1.0;
+
+    try out.print("{d} {d}\n", .{ pi, avo });
+    try out.print("{d} {d}\n", .{ tiny, simple });
+}

@@ -2216,6 +2216,44 @@ pub fn main(sys: *System) !void {
     );
 }
 
+/// `union`/`union(enum)` is accepted by the front-end (`k2c check` succeeds) but
+/// its runtime payload storage is unimplemented; constructing one must be a
+/// **clean compile-time refusal** on BOTH backends — never a silent miscompile
+/// that reads back `undefined`. This pins that contract (see ROADMAP Beyond 0.30).
+#[test]
+fn union_construction_is_cleanly_refused_not_miscompiled() {
+    let src = br#"
+const std = @import("std");
+const Shape = union(enum) { circle: u32, square: u32 };
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const s = Shape{ .circle = 7 };
+    const a = switch (s) { .circle => |r| r, .square => |w| w };
+    try out.print("{d}\n", .{a});
+}
+"#;
+    // The front-end accepts it — only running/compiling is refused.
+    let (check_code, _co, _ce) = run_with_code(&["check", "-"], src);
+    assert_eq!(check_code, 0, "union(enum) must still type-check");
+
+    for backend in ["run", "run-native"] {
+        let (code, out, err) = run_with_code(&[backend, "-"], src);
+        assert_ne!(
+            code, 0,
+            "`{backend}` must refuse union construction, not run it"
+        );
+        assert!(
+            err.contains("union"),
+            "`{backend}` union refusal must name the unsupported feature, got: {err}"
+        );
+        // Crucially, it must NOT have silently produced the (wrong) `7`/garbage.
+        assert!(
+            out.is_empty(),
+            "`{backend}` must emit no output for a refused union program, got: {out:?}"
+        );
+    }
+}
+
 /// **HARD ACCEPTANCE**: `k2c run-native` in `--debug`, `--release-safe`, and
 /// `--release-fast` produces stdout + exit byte-identical to `k2c run` (the VM) in
 /// the same mode, and identical to native `--debug`, for hello/errors/allocators.

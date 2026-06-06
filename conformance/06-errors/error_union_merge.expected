@@ -1,0 +1,2 @@
+allocateAndParse("123") = 123
+Caught error: BadFormat

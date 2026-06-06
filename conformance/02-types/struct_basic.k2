@@ -1,0 +1,38 @@
+// struct_basic.k2 - Basic struct definition, fields, and construction
+const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const Rect = struct {
+    tl: Point,
+    br: Point,
+    
+    pub fn area(self: *const Rect) i32 {
+        const width = self.br.x - self.tl.x;
+        const height = self.br.y - self.tl.y;
+        return width * height;
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Construct a struct with .{...}
+    const p1 = Point{ .x = 10, .y = 20 };
+    const p2 = Point{ .x = 30, .y = 40 };
+    
+    // Struct with nested structs
+    const rect = Rect{ .tl = p1, .br = p2 };
+    
+    // Access fields
+    try out.print("point: x={d} y={d}\n", .{ p1.x, p1.y });
+    try out.print("rect area={d}\n", .{ rect.area() });
+    
+    // Modify fields
+    var mut_point = p1;
+    mut_point.x = 50;
+    try out.print("modified: x={d}\n", .{ mut_point.x });
+}

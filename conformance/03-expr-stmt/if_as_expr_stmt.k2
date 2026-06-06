@@ -1,0 +1,43 @@
+// Test if/else as expression and statement
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // if/else as expression (simple)
+    const x: i32 = 5;
+    const y: i32 = if (x > 3) 100 else 200;  // should be 100
+    
+    // if/else as expression with blocks (ternary-like)
+    const z: i32 = if (x < 10) 20 else 30;  // should be 20
+    
+    // if as statement
+    var sum: i32 = 0;
+    if (x > 0) {
+        sum = sum + x;
+    }
+    
+    // if without else (statement)
+    var flag: i32 = 0;
+    if (x == 5) {
+        flag = 1;
+    }
+    
+    // Complex condition with logical ops
+    const a: i32 = 10;
+    const b: i32 = 20;
+    const result: i32 = if (a < b and b > 15) 777 else 888;  // should be 777
+    
+    // if/else chain as statement
+    var chain_result: i32 = 0;
+    if (x < 0) {
+        chain_result = 10;
+    } else if (x < 10) {
+        chain_result = 20;
+    } else {
+        chain_result = 30;
+    }
+    
+    try out.print("y={d} z={d} sum={d} flag={d} result={d} chain={d}\n", 
+        .{ y, z, sum, flag, result, chain_result });
+}

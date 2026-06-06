@@ -1,0 +1,41 @@
+// Test while loops with continue and payload
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Simple while loop
+    var i: i32 = 0;
+    var sum: i32 = 0;
+    while (i < 5) {
+        sum = sum + i;
+        i = i + 1;
+    }  // sum = 0+1+2+3+4 = 10
+    
+    // while with continue
+    var j: i32 = 0;
+    var even_sum: i32 = 0;
+    while (j < 10) : (j += 1) {
+        if (j % 2 == 1) {
+            continue;  // skip odd numbers
+        }
+        even_sum = even_sum + j;
+    }  // even_sum = 0+2+4+6+8 = 20
+    
+    // while with payload (optional binding)
+    var k: i32 = 5;
+    var countdown: i32 = 0;
+    while (k > 0) : (k -= 1) {
+        countdown = countdown + k;
+    }  // countdown = 5+4+3+2+1 = 15
+    
+    // while with condition and payload combined
+    var n: i32 = 1;
+    var product: i32 = 1;
+    while (n <= 4) : (n += 1) {
+        product = product * n;
+    }  // product = 1*1*2*3*4 = 24
+    
+    try out.print("sum={d} even_sum={d} countdown={d} product={d}\n", 
+        .{ sum, even_sum, countdown, product });
+}

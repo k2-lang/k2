@@ -1,0 +1,45 @@
+// pointers.k2 - Pointers, dereference, and pointer methods
+const std = @import("std");
+
+const Cell = struct {
+    value: i32,
+    
+    pub fn get(self: *const Cell) i32 {
+        return self.value;
+    }
+    
+    pub fn set(self: *Cell, v: i32) void {
+        self.value = v;
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Create a stack value and take its address
+    var cell = Cell{ .value = 42 };
+    const ptr: *Cell = &cell;
+    
+    // Dereference and access
+    try out.print("ptr.* ={d}\n", .{ptr.*.value});
+    
+    // Use pointer methods
+    try out.print("ptr.get()={d}\n", .{ptr.get()});
+    
+    // Modify through pointer
+    ptr.set(100);
+    try out.print("after set: cell.value={d}\n", .{cell.value});
+    
+    // Pointer to primitive
+    var x: i32 = 55;
+    const px: *i32 = &x;
+    try out.print("px.* ={d}\n", .{px.*});
+    
+    px.* = 77;
+    try out.print("after modify: x={d}\n", .{x});
+    
+    // const pointer
+    const y: i32 = 33;
+    const py: *const i32 = &y;
+    try out.print("const ptr: {d}\n", .{py.*});
+}

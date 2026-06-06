@@ -1,0 +1,58 @@
+// methods_and_slices.k2 — Methods via self: *T and passing slices
+const std = @import("std");
+
+const Counter = struct {
+    value: u32,
+    
+    /// Method to initialize counter
+    pub fn init(initial: u32) @This() {
+        return Counter{ .value = initial };
+    }
+    
+    /// Method that mutates self
+    pub fn increment(self: *Counter) void {
+        self.value += 1;
+    }
+    
+    /// Method that reads self (immutable)
+    pub fn get(self: *const Counter) u32 {
+        return self.value;
+    }
+};
+
+/// Function that takes a slice
+fn sumSlice(items: []const u32) u32 {
+    var sum: u32 = 0;
+    for (items) |item| {
+        sum += item;
+    }
+    return sum;
+}
+
+/// Function that counts elements matching a condition
+fn countGreater(items: []const i32, threshold: i32) u32 {
+    var count: u32 = 0;
+    for (items) |item| {
+        if (item > threshold) count += 1;
+    }
+    return count;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Test methods with self
+    var counter = Counter.init(10);
+    counter.increment();
+    counter.increment();
+    const count_val = counter.get();
+    
+    // Test slice functions
+    const nums = [_]u32{ 1, 2, 3, 4, 5 };
+    const sum = sumSlice(&nums);
+    
+    const vals = [_]i32{ -5, 0, 3, 7, 1 };
+    const gt2 = countGreater(&vals, 2);
+    
+    try out.print("counter={d} sum={d} gt2={d}\n", .{ count_val, sum, gt2 });
+}

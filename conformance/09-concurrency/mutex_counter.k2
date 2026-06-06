@@ -1,0 +1,37 @@
+const std = @import("std");
+
+const Counter = struct {
+    mu: std.Thread.Mutex,
+    value: u64,
+};
+
+fn bump(c: *Counter, times: u64) void {
+    var k: u64 = 0;
+    while (k < times) : (k += 1) {
+        c.mu.lock();
+        defer c.mu.unlock();
+        c.value += 1;
+    }
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var exec = std.Thread.Executor.init(sys.heap, .{ .worker_count = 4 });
+    defer exec.deinit();
+    
+    var counter = Counter{ .mu = std.Thread.Mutex.init(), .value = 0 };
+    
+    // Spawn 4 tasks, each bumping 250 times
+    const b0 = exec.spawn(bump, .{ &counter, @as(u64, 250) });
+    const b1 = exec.spawn(bump, .{ &counter, @as(u64, 250) });
+    const b2 = exec.spawn(bump, .{ &counter, @as(u64, 250) });
+    const b3 = exec.spawn(bump, .{ &counter, @as(u64, 250) });
+    
+    b0.join();
+    b1.join();
+    b2.join();
+    b3.join();
+    
+    try out.print("counter: {d}\n", .{counter.value});
+}

@@ -1,0 +1,19 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // @sizeOf and @alignOf are comptime operations
+    const sz_u32 = @sizeOf(u32);
+    const sz_u8 = @sizeOf(u8);
+    const sz_u64 = @sizeOf(u64);
+    
+    const align_u32 = @alignOf(u32);
+    const align_u8 = @alignOf(u8);
+    
+    try out.print("sizeof_u32={d}\n", .{sz_u32});
+    try out.print("sizeof_u8={d}\n", .{sz_u8});
+    try out.print("sizeof_u64={d}\n", .{sz_u64});
+    try out.print("alignof_u32={d}\n", .{align_u32});
+    try out.print("alignof_u8={d}\n", .{align_u8});
+}

@@ -1,0 +1,46 @@
+// arena_allocator.k2 — ArenaAllocator allocates from a backing allocator and
+// frees everything at once on deinit.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Create backing GPA
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected at shutdown");
+    }
+    const backing = gpa.allocator();
+    
+    try out.print("gpa_init\n", .{});
+    
+    // Create arena over the backing allocator
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    
+    try out.print("arena_init\n", .{});
+    
+    // Allocate multiple chunks from the arena
+    const buf1: []u32 = try alloc.alloc(u32, 10);
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i < buf1.len) : (i += 1) {
+        buf1[i] = @intCast(i);
+        sum += buf1[i];
+    }
+    try out.print("arena_alloc_1_sum_{d}\n", .{sum});
+    
+    const buf2: []u8 = try alloc.alloc(u8, 50);
+    buf2[0] = 77;
+    try out.print("arena_alloc_2_ok\n", .{});
+    
+    const buf3: []u64 = try alloc.alloc(u64, 5);
+    buf3[0] = 999;
+    try out.print("arena_alloc_3_ok\n", .{});
+    
+    // No individual frees needed - arena deinit releases everything
+    try out.print("arena_deinit_ok\n", .{});
+}

@@ -1,0 +1,42 @@
+// mutual_recursion.k2 — Mutually recursive functions
+const std = @import("std");
+
+/// Check if a number is even (calls isOdd)
+fn isEven(n: u32) bool {
+    if (n == 0) return true;
+    return isOdd(n - 1);
+}
+
+/// Check if a number is odd (calls isEven)
+fn isOdd(n: u32) bool {
+    if (n == 0) return false;
+    return isEven(n - 1);
+}
+
+/// Count elements that are even (uses isEven)
+fn countEvens(items: []const u32) u32 {
+    var count: u32 = 0;
+    for (items) |item| {
+        if (isEven(item)) count += 1;
+    }
+    return count;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    const e4 = isEven(4);
+    const e5 = isEven(5);
+    const o3 = isOdd(3);
+    const o2 = isOdd(2);
+    
+    const nums = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const evens = countEvens(&nums);
+    
+    const e4_int: u32 = if (e4) 1 else 0;
+    const e5_int: u32 = if (e5) 1 else 0;
+    const o3_int: u32 = if (o3) 1 else 0;
+    const o2_int: u32 = if (o2) 1 else 0;
+    
+    try out.print("even(4)={d} even(5)={d} odd(3)={d} odd(2)={d} evens_in_8={d}\n", .{ e4_int, e5_int, o3_int, o2_int, evens });
+}

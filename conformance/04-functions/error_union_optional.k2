@@ -1,0 +1,32 @@
+// error_union_optional.k2 — Error unions (!T) with try, optionals (?T)
+const std = @import("std");
+
+const DivideError = error{ DivideByZero };
+
+/// Function returning error union
+fn safeDivide(a: i32, b: i32) DivideError!i32 {
+    if (b == 0) return DivideError.DivideByZero;
+    return a / b;
+}
+
+/// Function returning optional
+fn firstPositive(a: i32, b: i32) ?i32 {
+    if (a > 0) return a;
+    if (b > 0) return b;
+    return null;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Test error union with try
+    const div1 = safeDivide(10, 2) catch 0;
+    const div2 = safeDivide(10, 0) catch -1;
+    
+    // Test optional
+    const pos1 = firstPositive(5, 3) orelse 0;
+    const pos2 = firstPositive(-2, 7) orelse 0;
+    const pos3 = firstPositive(-1, -2) orelse 0;
+    
+    try out.print("div(10,2)={d} div(10,0)={d} first(5,3)={d} first(-2,7)={d} first(-1,-2)={d}\n", .{ div1, div2, pos1, pos2, pos3 });
+}

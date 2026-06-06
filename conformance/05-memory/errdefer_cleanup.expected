@@ -1,0 +1,6 @@
+start
+alloc_ok
+free_buf2
+free_buf1
+caught_error
+end

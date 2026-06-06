@@ -1,0 +1,16 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Comptime const arithmetic
+    const a = 42;
+    const b = 8;
+    const sum = a + b;
+    const product = a * b;
+    const quotient = a / b;
+    
+    try out.print("sum={d}\n", .{sum});
+    try out.print("product={d}\n", .{product});
+    try out.print("quotient={d}\n", .{quotient});
+}

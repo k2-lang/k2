@@ -1,0 +1,56 @@
+// Test blocks as expressions with labeled break
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Test 1: simple labeled block returning a value
+    const a: i32 = blk_a: {
+        var x: i32 = 5;
+        var y: i32 = 3;
+        break :blk_a x + y;
+    };
+    // a = 8
+    
+    // Test 2: labeled block with conditional return
+    const b: i32 = blk_b: {
+        const condition: bool = true;
+        const result: i32 = if (condition) 100 else 200;
+        break :blk_b result;
+    };
+    // b = 100
+    
+    // Test 3: labeled block with loop and break
+    const c: i32 = blk_c: {
+        var sum: i32 = 0;
+        var i: i32 = 0;
+        while (i < 5) : (i += 1) {
+            sum = sum + i;
+            if (i == 3) {
+                break :blk_c sum;
+            }
+        }
+        break :blk_c sum;
+    };
+    // c = 0+1+2+3 = 6
+    
+    // Test 4: nested labeled blocks
+    const d: i32 = outer: {
+        const inner: i32 = inner_blk: {
+            break :inner_blk 42;
+        };
+        break :outer inner + 8;
+    };
+    // d = 50
+    
+    // Test 5: complex expression in block
+    const e: i32 = blk_e: {
+        const x: i32 = 10;
+        const y: i32 = 20;
+        const z: i32 = if (x < y) 5 else 10;
+        break :blk_e x + y + z;
+    };
+    // e = 35
+    
+    try out.print("a={d} b={d} c={d} d={d} e={d}\n", .{ a, b, c, d, e });
+}

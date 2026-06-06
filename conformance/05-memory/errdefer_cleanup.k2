@@ -1,0 +1,41 @@
+// errdefer_cleanup.k2 — Verify errdefer unwinds on error, regular defer on success.
+// Shows the trace of cleanup order when an error occurs mid-function.
+
+const std = @import("std");
+
+fn testAllocFailure(alloc: Allocator, out: anytype) !void {
+    // Allocate first resource
+    const buf1: []u8 = try alloc.alloc(u8, 10);
+    defer out.print("free_buf1\n", .{}) catch {};
+    errdefer alloc.free(buf1);
+    
+    // Allocate second resource
+    const buf2: []u8 = try alloc.alloc(u8, 20);
+    defer out.print("free_buf2\n", .{}) catch {};
+    errdefer alloc.free(buf2);
+    
+    try out.print("alloc_ok\n", .{});
+    
+    // Force an error
+    return error.TestError;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected at shutdown");
+    }
+    const alloc = gpa.allocator();
+    
+    try out.print("start\n", .{});
+    
+    // Call the function; error will unwind
+    _ = testAllocFailure(alloc, out) catch |err| {
+        try out.print("caught_error\n", .{});
+    };
+    
+    try out.print("end\n", .{});
+}

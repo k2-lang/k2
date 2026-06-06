@@ -1,0 +1,30 @@
+const std = @import("std");
+
+fn producer(ch: *std.Channel(u64), n: u64) void {
+    var i: u64 = 1;
+    while (i <= n) : (i += 1) {
+        ch.send(i * 10) catch {};
+    }
+    ch.close();
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var exec = std.Thread.Executor.init(sys.heap, .{ .worker_count = 2 });
+    defer exec.deinit();
+    
+    var ch = std.Channel(u64).init(2);
+    
+    // Spawn producer
+    const prod = exec.spawn(producer, .{ &ch, @as(u64, 5) });
+    
+    // Consume values
+    var sum: u64 = 0;
+    while (ch.recv()) |v| {
+        sum += v;
+    }
+    
+    prod.join();
+    try out.print("sum: {d}\n", .{sum});
+}

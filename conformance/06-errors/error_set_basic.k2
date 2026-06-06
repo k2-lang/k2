@@ -1,0 +1,28 @@
+// error_set_basic.k2 — Define an error set and try/catch with capture
+const std = @import("std");
+
+const MyError = error{ BadValue, Empty };
+
+fn validate(x: u32) MyError!u32 {
+    if (x == 0) return MyError.Empty;
+    if (x > 100) return MyError.BadValue;
+    return x * 2;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Success case
+    const ok = validate(5) catch |err| {
+        try out.print("Error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try out.print("validate(5) = {d}\n", .{ok});
+
+    // Failure case with capture
+    const bad = validate(150) catch |err| {
+        try out.print("validate(150) failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try out.print("validate(150) = {d}\n", .{bad});
+}

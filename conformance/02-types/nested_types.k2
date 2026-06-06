@@ -1,0 +1,43 @@
+// nested_types.k2 - Nested structs, arrays of structs
+const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const Shape = struct {
+    center: Point,
+    radius: u32,
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Struct with nested struct
+    const pt1 = Point{ .x = 5, .y = 10 };
+    const sh1 = Shape{ .center = pt1, .radius = 3 };
+    try out.print("shape1: radius={d}\n", .{sh1.radius});
+    
+    // Array of structs
+    const shapes = [_]Shape{
+        Shape{ .center = Point{ .x = 0, .y = 0 }, .radius = 2 },
+        Shape{ .center = Point{ .x = 10, .y = 20 }, .radius = 3 },
+        Shape{ .center = Point{ .x = 5, .y = 5 }, .radius = 1 },
+    };
+    
+    // Sum radii
+    var total_radius: u32 = 0;
+    for (shapes) |sh| {
+        total_radius += sh.radius;
+    }
+    try out.print("total radius={d}\n", .{total_radius});
+    
+    // Nested field access
+    const sh = shapes[1];
+    try out.print("shape[1] center x={d} y={d}\n", .{ sh.center.x, sh.center.y });
+    
+    // Slice of array
+    const subset = shapes[0..2];
+    try out.print("subset length={d}\n", .{subset.len});
+}

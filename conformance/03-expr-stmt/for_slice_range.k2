@@ -1,0 +1,38 @@
+// Test for loops over slices and ranges with index
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Create a simple array and iterate with index
+    const items = [_]i32{ 10, 20, 30, 40, 50 };
+    var sum_items: i32 = 0;
+    var index_sum: i32 = 0;
+    
+    // for over slice with index
+    for (items[0..], 0..) |val, i| {
+        sum_items = sum_items + val;
+        index_sum = index_sum + @intCast(i);
+    }
+    // sum_items = 10+20+30+40+50 = 150
+    // index_sum = 0+1+2+3+4 = 10
+    
+    // for over range (0..) - zip with array
+    var product: i32 = 1;
+    for (items, 0..) |item, idx| {
+        if (idx > 0 and idx < 4) {
+            product = product * item;
+        }
+    }
+    // product = 1*20*30*40 = 24000
+    
+    // for without index
+    var total: i32 = 0;
+    for (items) |val| {
+        total = total + val;
+    }
+    // total = 150
+    
+    try out.print("sum_items={d} index_sum={d} product={d} total={d}\n", 
+        .{ sum_items, index_sum, product, total });
+}

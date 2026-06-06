@@ -1,0 +1,39 @@
+// returning_structs.k2 — Returning structs from functions
+const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const Pair = struct {
+    a: u32,
+    b: u32,
+};
+
+/// Return a struct
+fn makePoint(x: i32, y: i32) Point {
+    return Point{ .x = x, .y = y };
+}
+
+/// Return a different struct type
+fn makePair(a: u32, b: u32) Pair {
+    return Pair{ .a = a, .b = b };
+}
+
+/// Transform a struct
+fn addPoints(p1: Point, p2: Point) Point {
+    return Point{ .x = p1.x + p2.x, .y = p1.y + p2.y };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    const p1 = makePoint(10, 20);
+    const p2 = makePoint(5, 3);
+    const p3 = addPoints(p1, p2);
+    
+    const pair = makePair(7, 11);
+    
+    try out.print("p3=({d},{d}) pair=({d},{d})\n", .{ p3.x, p3.y, pair.a, pair.b });
+}

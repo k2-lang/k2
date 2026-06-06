@@ -1,0 +1,17 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const simple: []const u8 = "hello";
+    const with_escapes: []const u8 = "hello\nworld";
+    const with_quotes: []const u8 = "say \"yes\"";
+    const with_backslash: []const u8 = "C:\\path\\file";
+    const hex_escape: []const u8 = "\x48ello";
+    const unicode_escape: []const u8 = "caf\u{00E9}";
+
+    try out.print("{s}\n", .{simple});
+    try out.print("{d} {d}\n", .{ with_escapes.len, with_quotes.len });
+    try out.print("{d} {d}\n", .{ with_backslash.len, hex_escape.len });
+    try out.print("{d}\n", .{unicode_escape.len});
+}

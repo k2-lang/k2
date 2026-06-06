@@ -1,0 +1,12 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Test various builtins
+    const x: u32 = @as(u32, 42);
+    const y = @intCast(100 + 10);
+    const size = @sizeOf(u32);
+
+    try out.print("{d} {d} {d}\n", .{ x, y, size });
+}

@@ -1,0 +1,32 @@
+// fixed_buffer_alloc.k2 — FixedBufferAllocator allocates from a fixed buffer.
+// Demonstrates successful allocation within a fixed buffer.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Create a fixed buffer of 128 bytes
+    var buffer: [128]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(buffer[0..]);
+    const alloc = fba.allocator();
+    
+    try out.print("fba_init\n", .{});
+    
+    // Allocate 16 bytes
+    const buf1: []u32 = try alloc.alloc(u32, 4);
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i < buf1.len) : (i += 1) {
+        buf1[i] = @intCast(i + 1);
+        sum += buf1[i];
+    }
+    try out.print("alloc_1_ok_sum_{d}\n", .{sum});
+    
+    // Allocate more
+    const buf2: []u8 = try alloc.alloc(u8, 32);
+    buf2[0] = 42;
+    try out.print("alloc_2_ok\n", .{});
+    
+    try out.print("fba_test_ok\n", .{});
+}

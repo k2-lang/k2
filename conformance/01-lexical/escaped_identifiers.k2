@@ -1,0 +1,11 @@
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Escaped identifiers allow keywords as names
+    const @"const" = 42;
+    const @"var" = 100;
+
+    try out.print("{d} {d}\n", .{ @"const", @"var" });
+}

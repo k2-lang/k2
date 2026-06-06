@@ -1,0 +1,19 @@
+// defer_lifo.k2 — Verify defer executes in LIFO order (last-in, first-out).
+// Each defer prints a marker; we prove they execute bottom-to-top.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    try out.print("start\n", .{});
+    
+    {
+        defer out.print("defer_1\n", .{}) catch {};
+        defer out.print("defer_2\n", .{}) catch {};
+        defer out.print("defer_3\n", .{}) catch {};
+        try out.print("body\n", .{});
+    }
+    
+    try out.print("end\n", .{});
+}

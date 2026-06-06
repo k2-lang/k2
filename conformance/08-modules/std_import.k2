@@ -1,0 +1,17 @@
+// std_import.k2 - Basic @import("std") usage and std function calls
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    // Use std.math functions
+    const gcd_result = std.math.gcd(48, 18);
+    const min_result = std.math.min(i32, 100, 42);
+    const max_result = std.math.max(i32, 100, 42);
+    const clamp_result = std.math.clamp(i32, 500, 0, 255);
+    
+    try out.print("gcd={d}\n", .{ gcd_result });
+    try out.print("min={d}\n", .{ min_result });
+    try out.print("max={d}\n", .{ max_result });
+    try out.print("clamp={d}\n", .{ clamp_result });
+}

@@ -1,0 +1,45 @@
+const std = @import("std");
+
+fn producer_range(ch: *std.Channel(u64), start: u64, end: u64) void {
+    var i = start;
+    while (i <= end) : (i += 1) {
+        ch.send(i) catch {};
+    }
+    ch.close();
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var exec = std.Thread.Executor.init(sys.heap, .{ .worker_count = 2 });
+    defer exec.deinit();
+    
+    var ch1 = std.Channel(u64).init(1);
+    var ch2 = std.Channel(u64).init(1);
+    
+    // Spawn two producers on different channels
+    const p1 = exec.spawn(producer_range, .{ &ch1, @as(u64, 1), @as(u64, 3) });
+    const p2 = exec.spawn(producer_range, .{ &ch2, @as(u64, 10), @as(u64, 12) });
+    
+    // Consume from both channels in one loop (alternating)
+    var sum: u64 = 0;
+    var count: u64 = 0;
+    
+    // First collect from ch1
+    while (ch1.recv()) |v| {
+        sum += v;
+        count += 1;
+    }
+    
+    // Then from ch2
+    while (ch2.recv()) |v| {
+        sum += v;
+        count += 1;
+    }
+    
+    p1.join();
+    p2.join();
+    
+    try out.print("count: {d}\n", .{count});
+    try out.print("total: {d}\n", .{sum});
+}

@@ -37,16 +37,16 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | Version | Milestone | State |
 | --- | --- | --- |
 | v0.1 | Lexer + driver | ✅ |
-| v0.2 | Parser → AST | ⬜ |
+| v0.2 | Parser → AST | ✅ |
 | v0.3 | Canonical formatter + AST tooling (finalized in v0.13) | ✅ |
-| v0.4 | Name resolution, scopes & module graph (HIR) | ⬜ |
-| v0.5 | Type system & checker | ⬜ |
-| v0.6 | The comptime engine & generics | ⬜ |
-| v0.7 | MIR, monomorphization & safety checks | ⬜ |
-| v0.8 | Bytecode VM — **programs run** | ⬜ |
-| v0.9 | Optimizer & release mode — **proven fast** | ⬜ |
-| v0.10 | Standard library & the `*System` capabilities | ⬜ |
-| v0.11 | Concurrency: threads, sync & async | ⬜ |
+| v0.4 | Name resolution, scopes & module graph (HIR) | ✅ |
+| v0.5 | Type system & checker | ✅ |
+| v0.6 | The comptime engine & generics | ✅ |
+| v0.7 | MIR, monomorphization & safety checks | ✅ |
+| v0.8 | Bytecode VM — **programs run** | ✅ |
+| v0.9 | Optimizer & release mode — **proven fast** | ✅ |
+| v0.10 | Standard library & the `*System` capabilities | ✅ |
+| v0.11 | Concurrency: threads, sync & async | ✅ |
 | v0.12 | `build.k2` & the package/module system | ✅ |
 | v0.13 | Tooling: formatter polish & language server | ✅ |
 
@@ -244,7 +244,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ not started.
 | v0.27 | Debug info: DWARF in the native backend; gdb-debuggable | tooling |
 | v0.28 | Doc generator (`k2c doc`) + doc-tests ✅ | tooling |
 | v0.29 | Self-hosting groundwork: a k2-written front-end, run by the toolchain ✅ | self-host |
-| v0.30 | 1.0 readiness: conformance suite, stability pass, full integration | maturity |
+| v0.30 | 1.0 readiness: conformance suite, stability pass, full integration ✅ | maturity |
 
 ### Native track (v0.14–v0.18)
 
@@ -298,16 +298,50 @@ and a **documentation generator**.
   fixes live in shared MIR lowering, so the VM and native backend agree. (k2
   still does not *commit* to full self-hosting; the Rust implementation stays the
   reference until a self-hosted one clearly wins on robustness.)
-- **v0.30 — 1.0 readiness.** A spec-**conformance** test suite, a stability
-  pass over the language surface, and a full integration sweep: every example
-  runs on **both** the VM and the native backend, the whole suite is green, and
-  the optimizer's wins are re-verified. This closes the extended roadmap.
+- **v0.30 — 1.0 readiness. ✅** A spec-**conformance** test suite (a committed
+  `conformance/` corpus of small programs spanning lexical structure → the
+  standard library, each run and checked against its captured output on the VM,
+  and on the **native** backend wherever the two agree byte-for-byte); a
+  **stability pass** over the language surface; and a full **integration sweep**
+  (`crates/k2c/tests/integration_examples.rs`) pinning the authoritative
+  example→backend matrix: every runnable example runs deterministically on the
+  VM, the native-capable ones match the VM byte-for-byte, and the rest are
+  *cleanly refused* by the native subset (never miscompiled). The optimizer's
+  wins are re-verified (`bench_baseline.rs`), and the whole suite is green. This
+  closes the extended roadmap.
 
 ## Beyond 0.30
 
 Full multi-platform self-hosting, an LLVM-grade optimizing middle-end,
 Windows/macOS targets, an incremental/cached compilation cache, and a richer
 package ecosystem — pursued once the language surface is stable at 1.0.
+
+A few known limitations are deferred here deliberately, each a *clean refusal*
+today rather than a miscompile:
+
+- **`union(enum)` runtime values.** Tagged (and bare) unions are accepted by the
+  whole front-end — they parse, resolve, type-check, format, and document — but
+  the backends do not yet store/retrieve a union's payload at run time. Rather
+  than silently miscompile (the construction would otherwise lower to a plain
+  struct aggregate and read back `undefined`), constructing a `union` value is a
+  **clean compile-time refusal** today; `k2c check` still accepts the program.
+  Model a sum type as an `enum` tag plus a payload `struct` until the union
+  runtime lands. (`crates/k2c/tests/cli.rs` pins the refusal.)
+- **Runtime `inline for`.** `inline for` unrolls in comptime-forced contexts
+  (array lengths, `const` initializers), but a runtime-effectful `inline for`
+  body — including iterating `@typeInfo(T).Struct.fields` to *print* each field's
+  value at run time — is not yet lowered (it reaches a controlled VM panic-trap).
+  `examples/comptime_reflection.k2` therefore demonstrates the comptime-reflection
+  surface that *does* work (type inspection, `@sizeOf`, compile-time field
+  validation, reflection-driven array sizing); full runtime reflection printing
+  waits on this.
+- **Spec §1.3 lone `\r`.** The lexer treats a lone carriage return as whitespace
+  (a lenient, common choice); the spec calls it a lexical error. The two will be
+  reconciled — most likely by relaxing the spec to match — as part of the
+  conformance work.
+- **Wider native subset.** Generic containers with aggregate elements, fibers,
+  and the fs/net/time syscalls run on the VM and are cleanly refused by the
+  native backend; broadening native coverage is incremental future work.
 
 ## 1.0 goals
 

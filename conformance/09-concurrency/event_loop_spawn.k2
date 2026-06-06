@@ -1,0 +1,28 @@
+const std = @import("std");
+
+fn triple(x: u64) u64 {
+    return x * 3;
+}
+
+fn add(a: u64, b: u64) u64 {
+    return a + b;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    
+    var loop = std.event.Loop.init(sys.heap);
+    defer loop.deinit();
+    
+    // Spawn a task via event loop
+    const f1 = loop.spawn(triple, .{@as(u64, 7)});
+    const r1 = f1.await(&loop, u64);
+    try out.print("triple(7) = {d}\n", .{r1});
+    
+    const f2 = loop.spawn(add, .{@as(u64, 15), @as(u64, 25)});
+    const r2 = f2.await(&loop, u64);
+    try out.print("add(15, 25) = {d}\n", .{r2});
+    
+    const total = r1 + r2;
+    try out.print("total = {d}\n", .{total});
+}
