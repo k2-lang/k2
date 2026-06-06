@@ -67,7 +67,7 @@ outside the pure-`std` rule.
   keywords. Non-panicking error recovery via `Error` tokens.
 - ✅ `k2c lex`/`tokenize` driver subcommand. Extensive unit tests.
 
-## v0.2 — Parser → AST ⬜
+## v0.2 — Parser → AST ✅
 
 - Recursive-descent parser (`k2-parse`) covering the whole grammar in
   [`docs/grammar.ebnf`](docs/grammar.ebnf): items, statements, the full
@@ -86,14 +86,14 @@ outside the pure-`std` rule.
 - ✅ Idempotence and parse-print-parse round-trip tests across every example.
 - ✅ `k2c ast` structured dump for tooling and golden tests.
 
-## v0.4 — Name resolution, scopes & module graph (HIR) ⬜
+## v0.4 — Name resolution, scopes & module graph (HIR) ✅
 
 - Lower the AST to a resolved **HIR**: every identifier bound to a declaration,
   every scope and shadowing rule enforced.
 - `@import` resolution and a project module/namespace graph.
 - Predeclared types and builtins in scope; clear "unresolved name" diagnostics.
 
-## v0.5 — Type system & checker ⬜
+## v0.5 — Type system & checker ✅
 
 - A real type representation and a bidirectional checker with local inference;
   `@TypeOf` resolution.
@@ -101,7 +101,7 @@ outside the pure-`std` rule.
   structs, enums, and the capability types (`*System`, `Allocator`, `sys.*`).
 - `switch` exhaustiveness over enums and error sets. `k2c check <file>`.
 
-## v0.6 — The comptime engine & generics ⬜
+## v0.6 — The comptime engine & generics ✅
 
 The single metaprogramming mechanism, and the heart of generics.
 
@@ -112,7 +112,7 @@ The single metaprogramming mechanism, and the heart of generics.
 - Reflection: `@typeInfo` / `@Type` round-trip, `@hasField`, `@field`,
   `@sizeOf`, `@alignOf`; `@compileError` / `@compileLog`; `inline for`.
 
-## v0.7 — MIR, monomorphization & safety checks ⬜
+## v0.7 — MIR, monomorphization & safety checks ✅
 
 - A backend-agnostic **MIR**: monomorphized and comptime-folded.
 - Safety-check insertion for Debug/ReleaseSafe: bounds, integer overflow,
@@ -120,7 +120,7 @@ The single metaprogramming mechanism, and the heart of generics.
 - First pass of comptime **leak/escape analysis** flagging obvious allocator
   misuse as a compile-time diagnostic.
 
-## v0.8 — Bytecode VM — programs run ⬜
+## v0.8 — Bytecode VM — programs run ✅
 
 - A bytecode compiler lowering MIR to a compact instruction set, and a
   register-based **virtual machine** that executes it — all pure `std`.
@@ -129,7 +129,7 @@ The single metaprogramming mechanism, and the heart of generics.
 
 **This is the milestone where `examples/hello.k2` actually runs and prints.**
 
-## v0.9 — Optimizer & release mode — proven fast ⬜
+## v0.9 — Optimizer & release mode — proven fast ✅
 
 - An optimizing pass over MIR/bytecode: constant folding, dead-code
   elimination, copy propagation, and devirtualization/inlining of monomorphic
@@ -139,7 +139,7 @@ The single metaprogramming mechanism, and the heart of generics.
 - A reproducible **benchmark harness** demonstrating the speedups — the "zero
   waste / fast" pillar, made measurable.
 
-## v0.10 — Standard library & the `*System` capabilities ⬜
+## v0.10 — Standard library & the `*System` capabilities ✅
 
 Tracked against [`docs/spec/10-standard-library.md`](docs/spec/10-standard-library.md);
 the stdlib that *never allocates on your behalf*.
@@ -150,7 +150,7 @@ the stdlib that *never allocates on your behalf*.
 - The capability surfaces behind `*System`: `io`, `heap`, `clock`, `random`,
   `env`. Formatting and `testing` helpers (`expectError`, testing allocator).
 
-## v0.11 — Concurrency: threads, sync & async ⬜
+## v0.11 — Concurrency: threads, sync & async ✅
 
 Library-provided over OS threads; no built-in runtime. See
 [`docs/spec/09-concurrency.md`](docs/spec/09-concurrency.md).
