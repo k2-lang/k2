@@ -1,0 +1,33 @@
+// union_reflection.k2 — @typeInfo over a `union(enum)`: the variant list (each a
+// `StructField` with `.name` + `.type`) and the discriminant `tag_type`. Used in
+// comptime-forced contexts (array sizing, @sizeOf) so the reflected facts fold to
+// runtime constants. Mirrors how struct/enum reflection is consumed.
+const std = @import("std");
+
+const Shape = union(enum) {
+    circle: f64,
+    rect: u32,
+    point,
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // @typeInfo classifies it as a union (a compile error otherwise).
+    if (@typeInfo(Shape) != .Union) {
+        @compileError("expected a union");
+    }
+
+    // The variant count sizes an array, forcing the reflected `.fields.len` to a
+    // comptime constant.
+    var slots: [@typeInfo(Shape).Union.fields.len]u8 = undefined;
+    slots[0] = 0;
+    try out.print("variants = {d}\n", .{slots.len});
+
+    // The discriminant type (an inferred unsigned int) and per-variant payload
+    // sizes, all comptime-folded via @sizeOf.
+    try out.print("tag size = {d}\n", .{@sizeOf(@typeInfo(Shape).Union.tag_type)});
+    try out.print("circle payload = {d}\n", .{@sizeOf(@typeInfo(Shape).Union.fields[0].type)});
+    try out.print("rect payload = {d}\n", .{@sizeOf(@typeInfo(Shape).Union.fields[1].type)});
+    try out.print("point payload = {d}\n", .{@sizeOf(@typeInfo(Shape).Union.fields[2].type)});
+}

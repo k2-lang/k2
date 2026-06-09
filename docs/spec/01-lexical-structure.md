@@ -45,8 +45,10 @@ on Unicode scalar values decoded from that UTF-8 stream.
 
 A line terminator is either a single line feed `U+000A` (`\n`) or a carriage
 return followed by a line feed `U+000D U+000A` (`\r\n`). A lone `\r` not
-followed by `\n` is a lexical error. Line terminators delimit line comments and
-are otherwise treated as whitespace.
+followed by `\n` is treated as **whitespace** — the lenient, common choice — so a
+file with old-style Mac line endings still lexes. (Earlier drafts called a lone
+`\r` a lexical error; the rule was relaxed to match the reference lexer.) Line
+terminators delimit line comments and are otherwise treated as whitespace.
 
 ---
 

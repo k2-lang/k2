@@ -1,0 +1,43 @@
+// union_tagged.k2 — tagged unions `union(enum)`: construction, exhaustive switch
+// with payload capture, payload-less variants, and unions as values flowing
+// through functions. Integer payloads keep this in the native subset, so the
+// emitted x86-64 binary reproduces the VM output byte-for-byte.
+const std = @import("std");
+
+const Shape = union(enum) {
+    circle: u64, // radius
+    square: u64, // side
+    point, // a payload-less (tagless) variant
+
+    pub fn area(self: Shape) u64 {
+        return switch (self) {
+            .circle => |r| 3 * r * r, // integer "π≈3" to stay native-capable
+            .square => |s| s * s,
+            .point => 0,
+        };
+    }
+};
+
+// A union can be returned and re-matched; the `else` arm covers the rest.
+fn classify(s: Shape) []const u8 {
+    return switch (s) {
+        .circle => "round",
+        else => "cornered",
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const c: Shape = .{ .circle = 2 };
+    const q: Shape = .{ .square = 3 };
+    const p: Shape = .point;
+
+    try out.print("circle area = {d}\n", .{c.area()});
+    try out.print("square area = {d}\n", .{q.area()});
+    try out.print("point  area = {d}\n", .{p.area()});
+
+    try out.print("circle is {s}\n", .{classify(c)});
+    try out.print("square is {s}\n", .{classify(q)});
+    try out.print("point  is {s}\n", .{classify(p)});
+}

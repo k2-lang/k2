@@ -1,0 +1,5 @@
+variants = 3
+tag size = 1
+circle payload = 8
+rect payload = 4
+point payload = 0

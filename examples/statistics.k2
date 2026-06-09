@@ -1,0 +1,39 @@
+//! statistics.k2 — a real program: summary statistics over a list of integers.
+//! Sorts the data (for the median), then reports min, max, sum, mean (truncated),
+//! median, and range, using `std.sort` and the `std.math` slice reductions. All
+//! integer arithmetic — `/` truncates toward zero, as k2 specifies.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var data = [_]i64{ 23, 7, 42, 15, 8, 4, 16, 99, 1, 30 };
+    const n = data.len;
+
+    // Sort ascending so the extremes and median are positional.
+    std.sort.Sorter(i64, std.sort.asc(i64)).sort(&data);
+
+    const min = data[0];
+    const max = data[n - 1];
+    const sum = std.math.sumSlice(i64, &data);
+    const count: i64 = @as(i64, @intCast(n));
+    const mean = sum / count; // truncating integer mean
+
+    // Median of a sorted slice: middle element (odd n) or mean of the two middle
+    // elements (even n).
+    const median = if (n % 2 == 1)
+        data[n / 2]
+    else
+        (data[n / 2 - 1] + data[n / 2]) / 2;
+
+    try out.print("n={d} min={d} max={d} range={d}\n", .{ n, min, max, max - min });
+    try out.print("sum={d} mean={d} median={d}\n", .{ sum, mean, median });
+
+    // How many are above the mean?
+    var above: usize = 0;
+    for (data) |x| {
+        if (x > mean) above += 1;
+    }
+    try out.print("above mean: {d}\n", .{above});
+}

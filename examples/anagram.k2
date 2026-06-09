@@ -1,0 +1,37 @@
+//! anagram.k2 — a real program: decide whether two strings are anagrams by
+//! copying each into a scratch buffer, sorting the bytes (`std.sort.Sorter(u8)`),
+//! and comparing with `std.mem.eql`. Case- and space-sensitive. Pure buffer work
+//! (no allocator).
+
+const std = @import("std");
+
+/// `true` if `a` and `b` contain exactly the same bytes (order-independent).
+fn isAnagram(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var ba: [128]u8 = undefined;
+    var bb: [128]u8 = undefined;
+    std.mem.copy(u8, ba[0..a.len], a);
+    std.mem.copy(u8, bb[0..b.len], b);
+    const S = std.sort.Sorter(u8, std.sort.asc(u8));
+    S.sort(ba[0..a.len]);
+    S.sort(bb[0..b.len]);
+    return std.mem.eql(u8, ba[0..a.len], bb[0..b.len]);
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    try out.print("listen/silent: {}\n", .{isAnagram("listen", "silent")});
+    try out.print("elbow/below:   {}\n", .{isAnagram("elbow", "below")});
+    try out.print("hello/world:   {}\n", .{isAnagram("hello", "world")});
+    try out.print("abc/cba:       {}\n", .{isAnagram("abc", "cba")});
+    try out.print("a/aa:          {}\n", .{isAnagram("a", "aa")});
+
+    // Tally how many of a list of candidate pairs are anagrams of "stop".
+    const candidates = [_][]const u8{ "tops", "pots", "opts", "spot", "stops", "post" };
+    var matches: usize = 0;
+    for (candidates) |c| {
+        if (isAnagram("stop", c)) matches += 1;
+    }
+    try out.print("anagrams of \"stop\" among 6 candidates: {d}\n", .{matches});
+}

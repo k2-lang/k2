@@ -704,6 +704,7 @@ impl Rvalue {
             Rvalue::Use(o)
             | Rvalue::MakeSome(o, _)
             | Rvalue::MakeOk(o, _)
+            | Rvalue::MakeUnion { payload: o, .. }
             | Rvalue::Cast { operand: o, .. }
             | Rvalue::Unary { operand: o, .. }
             | Rvalue::Discriminant { operand: o, .. } => o.collect_locals(out),
@@ -1005,6 +1006,23 @@ pub enum Rvalue {
     MakeOk(Operand, TypeId),
     /// Error-union construction `Err(tag)`.
     MakeErr(ErrTag, TypeId),
+
+    /// Tagged-union construction: a `union(enum)` value carrying the active
+    /// variant's declaration index (its tag) and the variant's payload
+    /// (`Const::Void` for a payload-less variant). This is the single runtime
+    /// constructor for every `union(enum)` value — both the payload-carrying
+    /// `.{ .circle = r }` form and the bare `.point` form — parallel to
+    /// `MakeOk`/`MakeSome`. The backends store `{tag, payload}` (the VM as
+    /// `Value::Enum`, native as a tag word + payload area; see
+    /// `k2_codegen::layout`).
+    MakeUnion {
+        /// The active variant's declaration index (its tag value).
+        variant: u32,
+        /// The payload operand (`Const::Void` for a payload-less variant).
+        payload: Operand,
+        /// The union type.
+        ty: TypeId,
+    },
 
     /// Read the discriminant of an optional/error-union/tagged-union (drives the
     /// desugared branches; never hidden).

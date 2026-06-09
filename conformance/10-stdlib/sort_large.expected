@@ -1,0 +1,3 @@
+reverse: sorted=true first=1 last=24
+all-equal: sorted=true first=7 last=7
+random64: sorted=true quick==heap==merge=1 min=12 max=996

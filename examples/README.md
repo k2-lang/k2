@@ -9,11 +9,11 @@ control flow**, **errors as values**, and **comptime as the only
 metaprogramming**.
 
 Every example runs on the bytecode **VM** (`k2c run`, the semantic reference).
-`hello`, `errors`, and `allocators` also run on the **native** x86-64 backend
-(`k2c run-native`) with byte-identical output; the others use capabilities
-outside the current native subset (generic containers with aggregate elements,
-cooperative fibers, fs/net/time syscalls) and are *cleanly refused* by the
-native backend — they never miscompile. `comptime_reflection.k2` is a
+`hello`, `errors`, `allocators`, and `unions` also run on the **native** x86-64
+backend (`k2c run-native`) with byte-identical output; the others use
+capabilities outside the current native subset (generic containers with
+aggregate elements, cooperative fibers, fs/net/time syscalls) and are *cleanly
+refused* by the native backend — they never miscompile. `comptime_reflection.k2` is a
 compile-time-reflection showcase: its compile-time machinery (type inspection,
 sizing, field validation, code generation) is the point; printing each field's
 *runtime* value needs runtime `inline for`, a documented post-1.0 item, so
@@ -71,6 +71,7 @@ through it.
 | [`allocators.k2`](allocators.k2) | `Allocator`, `defer`/`errdefer`, GPA, `ArrayList`, arena | Explicit allocation with leak detection and bulk cleanup. |
 | [`generic_list.k2`](generic_list.k2) | `comptime` generics, `@This()`, `realloc` | A generic container as a function from a type to a type. |
 | [`errors.k2`](errors.k2) | `error` sets, `try`, `catch`, `errdefer`, `\|\|` | Failures are values; cleanup and propagation are visible. |
+| [`unions.k2`](unions.k2) | `union(enum)`, payload capture, exhaustive `switch` | A sum type: one of several variants at a time, matched with payload capture. |
 | [`comptime_reflection.k2`](comptime_reflection.k2) | `@typeInfo`, `inline for`, `@field`, `@compileError` | Generate a struct printer and a serializer at compile time. |
 | [`concurrency.k2`](concurrency.k2) | `Executor`/`Task` spawn-join, `Channel(T)`, `Mutex`, `atomic`, `event.Loop`/`await` | Deterministic cooperative concurrency: capabilities passed, never global. |
 | [`data_structures.k2`](data_structures.k2) | `std.IntHashMap`, `std.sort`, `std.unicode`, `std.math`/`std.Big` | The stdlib containers and algorithms: a resizing hash map, an in-place sort, UTF-8, and a big integer. |

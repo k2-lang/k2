@@ -492,6 +492,21 @@ impl crate::check::Checker<'_> {
             {
                 return false;
             }
+            // A bare ident bound to a TYPE-denoting const (`const S = Sorter(T, …);
+            // S.binarySearch(…)`) is a type alias, so its member call is associated.
+            // Such an ident synths to the DENOTED aggregate (a `struct`), not to
+            // `type`, so the `TypeType` test below would misread it as a value
+            // receiver and drop an argument as a phantom `self`. `item_types`
+            // records exactly the type-denoting consts. This stays a member-call
+            // decision (NOT a blanket `type_valued_spans` record), so `@TypeOf(S)`
+            // still sees the value type `type`.
+            if let Expr::Ident { span: ispan, .. } = &**base {
+                if let Some(k2_resolve::Resolution::Def(id)) = self.resolution_at(*ispan) {
+                    if self.item_types.contains_key(&id) {
+                        return false;
+                    }
+                }
+            }
             let bt = self.synth(base);
             return !matches!(self.arena.get(bt), Type::TypeType);
         }
@@ -674,7 +689,24 @@ impl crate::check::Checker<'_> {
                     (
                         Type::Array { elem: e1, .. } | Type::Slice { elem: e1, .. },
                         Type::Array { elem: e2, .. } | Type::Slice { elem: e2, .. },
-                    ) if e1 == e2 => self.arena.slice(true, e1),
+                    ) if e1 == e2 => {
+                        // Fold a comptime STRING concat and record its bytes at this
+                        // span, so the MIR materializes a `Const::Str` instead of the
+                        // `undef` a `++` would otherwise lower to. (Non-string array
+                        // concats fold to a `Value::Array`, not a `Str`, and are left
+                        // for a later array-materialization pass.)
+                        let lv = self.comptime_eval_value(lhs);
+                        let rv = self.comptime_eval_value(rhs);
+                        if let (Some(lv), Some(rv)) = (lv, rv) {
+                            if let (Some(ls), Some(rs)) = (lv.as_str(), rv.as_str()) {
+                                let mut bytes = ls.as_bytes().to_vec();
+                                bytes.extend_from_slice(rs.as_bytes());
+                                self.comptime_span_strs
+                                    .insert((span.start, span.end), bytes);
+                            }
+                        }
+                        self.arena.slice(true, e1)
+                    }
                     _ => {
                         self.error(
                             span,
@@ -897,6 +929,43 @@ impl crate::check::Checker<'_> {
                     BinOp::Add => a.checked_add(b),
                     BinOp::Sub => a.checked_sub(b),
                     BinOp::Mul => a.checked_mul(b),
+                    // Mirror the comptime engine's `eval_int_binop` so an out-of-range
+                    // result of these operators is range-checked at a sized coercion
+                    // too — e.g. `const x: u8 = 1 << 9;` folds to 512 and is rejected,
+                    // consistent with `255 + 1`. (Division/remainder by zero and an
+                    // out-of-range shift amount fold to `None`; the engine diagnoses
+                    // those itself.)
+                    BinOp::Div => {
+                        if b == 0 {
+                            None
+                        } else {
+                            a.checked_div(b)
+                        }
+                    }
+                    BinOp::Rem => {
+                        if b == 0 {
+                            None
+                        } else {
+                            a.checked_rem(b)
+                        }
+                    }
+                    BinOp::BitAnd => Some(a & b),
+                    BinOp::BitOr => Some(a | b),
+                    BinOp::BitXor => Some(a ^ b),
+                    BinOp::Shl => {
+                        if (0..128).contains(&b) {
+                            a.checked_shl(b as u32)
+                        } else {
+                            None
+                        }
+                    }
+                    BinOp::Shr => {
+                        if (0..128).contains(&b) {
+                            Some(a >> (b as u32))
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 }
             }

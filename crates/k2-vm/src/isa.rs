@@ -553,6 +553,9 @@ pub enum Instr {
     MakeOk { dst: Reg, src: Reg },
     /// `dst = Err(tag)`.
     MakeErr { dst: Reg, tag: u16 },
+    /// `dst = union .tag(src)` — a tagged-union value: the active variant index
+    /// (`tag`) plus its payload register (`Unit` for a payload-less variant).
+    MakeUnion { dst: Reg, tag: u32, src: Reg },
     /// `dst = aggregate(kind, fields...)`.
     Aggregate {
         /// Destination register.

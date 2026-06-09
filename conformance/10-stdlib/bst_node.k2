@@ -1,0 +1,35 @@
+// bst_node.k2 — `std.BstNode(T)`, a self-referential binary-search-tree node.
+// Exercises three things together: a recursive `?*@This()` field, heap-allocating
+// child nodes through the GPA and freeing them recursively (no leak), and the
+// leak analysis correctly treating an allocation stored into a child link as
+// escaping. VM case (generic container + node allocation).
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    var root = std.BstNode(i64).leaf(50);
+    defer root.freeChildren(alloc);
+
+    // Insert a balanced-ish set (the duplicate 40 is ignored).
+    const vals = [_]i64{ 30, 70, 20, 40, 60, 80, 10, 40 };
+    for (vals) |v| try root.insert(alloc, v);
+
+    try out.print("count={d} height={d} min={d} max={d}\n", .{
+        root.count(), root.height(), root.min(), root.max(),
+    });
+
+    // Membership for present and absent keys.
+    var present: usize = 0;
+    const probes = [_]i64{ 10, 25, 40, 55, 80, 100 };
+    for (probes) |p| {
+        if (root.contains(p)) present += 1;
+    }
+    try out.print("present={d}/6\n", .{present});
+}

@@ -1,0 +1,38 @@
+// mathf_edge.k2 — edge cases that earlier broke `std.mathf` (found by review):
+// sqrt of very large / very small magnitudes (Newton now scales into [1,4)),
+// round's double-rounding defect at 0.49999999999999994, and hypot overflow on the
+// squares. Tolerance-checked (printed 1/0) so the golden is stable. Native-capable.
+const std = @import("std");
+
+fn near(a: f64, b: f64) u8 {
+    const tol = 0.0000001 * std.mathf.abs(b) + 0.0000001;
+    return if (std.mathf.abs(a - b) < tol) 1 else 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // sqrt across a huge magnitude range — must stay accurate, not diverge.
+    try out.print("sqrt: 1e300={d} 1e-300={d} 1e100={d} 4e0={d}\n", .{
+        near(std.mathf.sqrt(1e300), 1e150),
+        near(std.mathf.sqrt(1e-300), 1e-150),
+        near(std.mathf.sqrt(1e100), 1e50),
+        near(std.mathf.sqrt(4.0), 2.0),
+    });
+
+    // round: the double-rounding case returns 0 (not 1); ties go away from zero.
+    try out.print("round: 0.4999...94={d} 0.5={d} 2.5={d} neg2.5={d} 2.4={d}\n", .{
+        @as(i64, @intFromFloat(std.mathf.round(0.49999999999999994))),
+        @as(i64, @intFromFloat(std.mathf.round(0.5))),
+        @as(i64, @intFromFloat(std.mathf.round(2.5))),
+        @as(i64, @intFromFloat(std.mathf.round(-2.5))),
+        @as(i64, @intFromFloat(std.mathf.round(2.4))),
+    });
+
+    // hypot: huge and tiny operands stay representable (no inf/NaN/0 surprise).
+    try out.print("hypot: big={d} small={d} 3-4-5={d}\n", .{
+        near(std.mathf.hypot(1e200, 1e200), 1.4142135623730951e200),
+        near(std.mathf.hypot(3e-200, 4e-200), 5e-200),
+        near(std.mathf.hypot(3.0, 4.0), 5.0),
+    });
+}

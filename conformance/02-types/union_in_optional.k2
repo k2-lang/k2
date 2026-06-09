@@ -1,0 +1,46 @@
+// union_in_optional.k2 — a `union(enum)` value carried inside an optional and an
+// error union, constructed directly from a `.{ .variant = … }` literal at the
+// coerced target type. A union is NOT transparent through an optional the way a
+// struct is (its `.payload` reads the active variant, not the whole union), so the
+// compiler must wrap it explicitly. With a scalar payload this stays native-capable.
+const std = @import("std");
+
+const Cmd = union(enum) {
+    set: i64,
+    clear,
+};
+
+const Fail = error{Bad};
+
+fn apply(prev: i64, cmd: ?Cmd) i64 {
+    if (cmd) |c| {
+        return switch (c) {
+            .set => |v| v,
+            .clear => 0,
+        };
+    }
+    return prev; // null command leaves the value unchanged
+}
+
+fn parse(ok: bool) Fail!Cmd {
+    if (ok) return Cmd{ .set = 7 };
+    return Fail.Bad;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // A union literal built directly at the optional target type.
+    const a = apply(99, .{ .set = 42 });
+    const b = apply(99, .clear);
+    const c = apply(99, null);
+    try out.print("set={d} clear={d} null={d}\n", .{ a, b, c });
+
+    // A union literal built directly at the error-union target type.
+    const ok = parse(true) catch Cmd.clear;
+    const v = switch (ok) {
+        .set => |x| x,
+        .clear => -1,
+    };
+    try out.print("parsed set = {d}\n", .{v});
+}

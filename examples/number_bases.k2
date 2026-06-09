@@ -1,0 +1,47 @@
+//! number_bases.k2 — a small, real program: convert integers between bases using
+//! `std.fmt`. It formats a value into several radixes (`formatUintRadix`), parses
+//! strings written in a given base back to a number (`parseUintRadix`), and shows
+//! the decimal↔base round-trip is exact. Pure formatting into caller buffers — no
+//! allocator.
+
+const std = @import("std");
+
+/// Print `value` in `radix` followed by a space (a fresh buffer per call avoids
+/// the aliasing you'd get from reusing one buffer across several `formatUintRadix`
+/// results in a single `print`).
+fn emit(out: anytype, value: u64, radix: u8) !void {
+    var buf: [64]u8 = undefined;
+    try out.print("{s} ", .{std.fmt.formatUintRadix(&buf, value, radix)});
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // 1) One value across bases 16, 8, 2, 36.
+    const v: u64 = 255;
+    try out.print("255 in base 16/8/2/36: ", .{});
+    try emit(out, v, 16);
+    try emit(out, v, 8);
+    try emit(out, v, 2);
+    try emit(out, v, 36);
+    try out.print("\n", .{});
+
+    // 2) Parse strings written in different bases back to decimal.
+    const hex = std.fmt.parseUintRadix("dead", 16) orelse 0;
+    const oct = std.fmt.parseUintRadix("777", 8) orelse 0;
+    const bin = std.fmt.parseUintRadix("101010", 2) orelse 0;
+    const b36 = std.fmt.parseUintRadix("rust", 36) orelse 0;
+    try out.print("parsed: dead16={d} 777o={d} 101010b={d} rust36={d}\n", .{ hex, oct, bin, b36 });
+
+    // 3) Round-trip: decimal -> base 16 string -> back to decimal, for several
+    //    values including u64's maximum.
+    const samples = [_]u64{ 0, 1, 1000, 4294967295, 18446744073709551615 };
+    var all_ok: u32 = 1;
+    for (samples) |n| {
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.formatUintRadix(&buf, n, 16);
+        const back = std.fmt.parseUintRadix(s, 16) orelse (n + 1);
+        if (back != n) all_ok = 0;
+    }
+    try out.print("hex round-trip exact: {d}\n", .{all_ok});
+}

@@ -1,0 +1,34 @@
+// type_alias_methods.k2 — binding a generic type to a `const` and calling its
+// "static" (associated) methods through that alias (`const S = Sorter(…);
+// S.binarySearch(…)`) now resolves the same as the inline `Sorter(…).method(…)`.
+// Previously the alias dropped an argument as a phantom `self`. Also confirms a
+// value receiver (an ArrayList instance) still uses method-call sugar.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    // Alias a generic container type, then build and fill an instance through it.
+    const IntList = std.ArrayList(i64);
+    var list = IntList.init(alloc); // associated call via the alias
+    defer list.deinit();
+    try list.append(30); // instance method (value receiver) — sugar still works
+    try list.append(10);
+    try list.append(20);
+
+    // Alias a generic Sorter, then sort + search through the alias.
+    const Srt = std.sort.Sorter(i64, std.sort.asc(i64));
+    Srt.sort(list.items); // associated call via the alias
+    const at20 = Srt.binarySearch(list.items, 20); // associated, 2 explicit args
+    const lb20 = Srt.lowerBound(list.items, 20);
+    try out.print("sorted: {d} {d} {d}\n", .{ list.get(0).?, list.get(1).?, list.get(2).? });
+    try out.print("search20={d} lowerBound20={d} isSorted={}\n", .{
+        at20.?, lb20, Srt.isSorted(list.items),
+    });
+}

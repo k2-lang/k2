@@ -11,6 +11,143 @@ use k2_syntax::{Expr, Span};
 
 use crate::ty::{IntBits, Type, TypeId};
 
+/// Every builtin name the toolchain implements — the union of those typed here in
+/// [`Checker::synth_builtin`] and the "raw"/intrinsic builtins whose result type is
+/// supplied by the `check` direction and which the MIR lowerer turns straight into
+/// an `Rvalue::Intrinsic`. A `@name` outside this set is a typo or an unimplemented
+/// Zig-ism (e.g. `@divTrunc`, which k2 spells `/`); it is reported at the call site
+/// instead of silently lowering to `undef` (which prints as `<int>` — a
+/// miscompile). Keep in sync when adding a builtin.
+pub(crate) const KNOWN_BUILTINS: &[&str] = &[
+    "@alignOf",
+    "@allocHandle",
+    "@allocId",
+    "@allocRaw",
+    "@arenaDeinit",
+    "@as",
+    "@atomicCas",
+    "@atomicFetchAdd",
+    "@atomicLoad",
+    "@atomicMake",
+    "@atomicStore",
+    "@atomicSwap",
+    "@bitCast",
+    "@bitSizeOf",
+    "@bufPrint",
+    // The build-graph intrinsics (`std/build.k2`), consumed by the build crate.
+    "@build",
+    "@buildAddExecutable",
+    "@buildAddLibrary",
+    "@buildAddRun",
+    "@buildAddTest",
+    "@buildArtifactForwardArgs",
+    "@buildArtifactModule",
+    "@buildArtifactModuleSelf",
+    "@buildArtifactOption",
+    "@buildDependency",
+    "@buildDependencyModule",
+    "@buildInstall",
+    "@buildOption",
+    "@buildStdOptimize",
+    "@buildStdTarget",
+    "@buildStep",
+    "@buildStepDependOn",
+    "@chanClose",
+    "@chanLen",
+    "@chanMake",
+    "@chanRecv",
+    "@chanSend",
+    "@clockNow",
+    "@clockSleep",
+    "@compileError",
+    "@compileLog",
+    "@createRaw",
+    "@destroyRaw",
+    "@embedFile",
+    "@enumFromInt",
+    "@envGet",
+    "@errorName",
+    "@errorReturnTrace",
+    "@field",
+    "@FieldType",
+    "@floatCast",
+    "@floatFromInt",
+    "@freeRaw",
+    "@fsClose",
+    "@fsCreate",
+    "@fsDelete",
+    "@fsExists",
+    "@fsFstat",
+    "@fsListDir",
+    "@fsMkdir",
+    "@fsOpenRead",
+    "@fsOpenReadWrite",
+    "@fsRead",
+    "@fsRmdir",
+    "@fsStat",
+    "@fsWrite",
+    "@fuzzNextU64",
+    "@fuzzSeed",
+    "@gpaDeinit",
+    "@hasDecl",
+    "@hasField",
+    "@import",
+    "@intCast",
+    "@intFromEnum",
+    "@intFromFloat",
+    "@intFromPtr",
+    "@max",
+    "@min",
+    "@mutexLock",
+    "@mutexMake",
+    "@mutexUnlock",
+    "@netAccept",
+    "@netClose",
+    "@netConnect",
+    "@netListen",
+    "@netLocalPort",
+    "@netRecv",
+    "@netSend",
+    "@offsetOf",
+    "@osArg",
+    "@osArgCount",
+    "@osArgs",
+    "@osExit",
+    "@osGetpid",
+    "@panic",
+    "@ptrCast",
+    "@ptrFromInt",
+    "@randomBytes",
+    "@randomInt",
+    "@reduce",
+    "@reallocRaw",
+    "@schedAwait",
+    "@schedRun",
+    "@schedSpawn",
+    "@schedYield",
+    "@sizeOf",
+    "@splat",
+    "@tagName",
+    "@testFail",
+    "@testFailEq",
+    "@testFailErr",
+    "@testFailSlice",
+    "@This",
+    "@timeMonoReal",
+    "@timeSleepReal",
+    "@timeWallReal",
+    "@truncate",
+    "@Type",
+    "@typeInfo",
+    "@typeName",
+    "@TypeOf",
+    "@Vector",
+    "@wgAdd",
+    "@wgDone",
+    "@wgMake",
+    "@wgWait",
+];
+
 impl crate::check::Checker<'_> {
     /// Synthesizes a builtin call by name.
     pub(crate) fn synth_builtin(&mut self, name: &str, args: &[Expr], span: Span) -> TypeId {
@@ -252,9 +389,16 @@ impl crate::check::Checker<'_> {
             // `@randomBytes`/`@envGet`/`@bufPrint`) carry their result type from
             // context (the `![]T`/`!*T`/`void`/`?[]const u8` the method annotates),
             // so they synth to Deferred and let the `check` direction supply it.
-            // Unknown builtin: conservative Deferred, still synth args.
+            // A builtin not typed above: a "raw"/intrinsic builtin whose type the
+            // `check` direction supplies (Deferred), OR a genuinely unknown name.
+            // Report the latter — a `@divTrunc`/typo would otherwise synth Deferred
+            // and lower to a silent `undef` (`<int>`).
             _ => {
                 self.synth_all(args);
+                if !KNOWN_BUILTINS.contains(&name) {
+                    self.error(span, format!("unknown builtin `{name}`"));
+                    return self.arena.t_error();
+                }
                 self.arena.t_deferred()
             }
         }

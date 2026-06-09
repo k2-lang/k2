@@ -1,0 +1,36 @@
+// mathf_extra.k2 — the rest of `std.mathf`: log10/log2, cbrt (incl. negatives),
+// trunc, signf, minf/maxf, clampf, lerp, deg/rad conversion, and atan (half-angle
+// reduced so it's accurate even at x=1). Tolerance-checked (1/0) for transcendental
+// results, exact for the algebraic ones. Native-capable.
+const std = @import("std");
+
+fn near(a: f64, b: f64) u8 {
+    return if (std.mathf.abs(a - b) < 0.0000001) 1 else 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    try out.print("log10(1e6)={d} log2(256)={d} cbrt(64)={d} cbrt(-27)={d}\n", .{
+        near(std.mathf.log10(1000000.0), 6.0),
+        near(std.mathf.log2(256.0), 8.0),
+        near(std.mathf.cbrt(64.0), 4.0),
+        near(std.mathf.cbrt(-27.0), -3.0),
+    });
+
+    // Algebraic helpers are exact.
+    try out.print("trunc(3.9)={d} trunc(-3.9)={d} sign(-2)={d} min={d} max={d} clamp_lo={d} clamp_hi={d} lerp={d}\n", .{
+        std.mathf.trunc(3.9), std.mathf.trunc(-3.9), std.mathf.signf(-2.0),
+        std.mathf.minf(5.0, 2.0), std.mathf.maxf(5.0, 2.0),
+        std.mathf.clampf(-1.0, 0.0, 10.0), std.mathf.clampf(99.0, 0.0, 10.0),
+        std.mathf.lerp(100.0, 200.0, 0.25),
+    });
+
+    // Angles and arctangent (atan(tan(θ)) round-trips; atan accurate at 1).
+    try out.print("deg2rad(90)~pi/2={d} rad2deg(pi)~180={d} atan1={d} atanRT={d}\n", .{
+        near(std.mathf.degToRad(90.0), std.mathf.pi / 2.0),
+        near(std.mathf.radToDeg(std.mathf.pi), 180.0),
+        near(std.mathf.atan(1.0), std.mathf.pi / 4.0),
+        near(std.mathf.tan(std.mathf.atan(2.5)), 2.5),
+    });
+}

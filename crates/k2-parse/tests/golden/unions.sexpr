@@ -1,0 +1,591 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (const Shape
+    (container union
+      (tag-enum)
+      (field circle
+        (ty
+          (ident u64)
+        )
+      )
+      (field square
+        (ty
+          (ident u64)
+        )
+      )
+      (field point
+      )
+      (decl
+        (fn :pub area
+          (params
+            (param self
+              (ident Shape)
+            )
+          )
+          (ret
+            (ident u64)
+          )
+          (block
+            (return
+              (switch
+                (on
+                  (ident self)
+                )
+                (arm
+                  (pattern
+                    (enum-lit circle)
+                  )
+                  (capture r)
+                  (body
+                    (binary mul
+                      (binary mul
+                        (int 3)
+                        (ident r)
+                      )
+                      (ident r)
+                    )
+                  )
+                )
+                (arm
+                  (pattern
+                    (enum-lit square)
+                  )
+                  (capture s)
+                  (body
+                    (binary mul
+                      (ident s)
+                      (ident s)
+                    )
+                  )
+                )
+                (arm
+                  (pattern
+                    (enum-lit point)
+                  )
+                  (body
+                    (int 0)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (decl
+        (fn :pub corners
+          (params
+            (param self
+              (ident Shape)
+            )
+          )
+          (ret
+            (ident u64)
+          )
+          (block
+            (return
+              (switch
+                (on
+                  (ident self)
+                )
+                (arm
+                  (pattern
+                    (enum-lit square)
+                  )
+                  (body
+                    (int 4)
+                  )
+                )
+                (arm
+                  (else)
+                  (body
+                    (int 0)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn name
+    (params
+      (param s
+        (ident Shape)
+      )
+    )
+    (ret
+      (slice :const
+        (ident u8)
+      )
+    )
+    (block
+      (return
+        (switch
+          (on
+            (ident s)
+          )
+          (arm
+            (pattern
+              (enum-lit circle)
+            )
+            (body
+              (str "\"circle\"")
+            )
+          )
+          (arm
+            (pattern
+              (enum-lit square)
+            )
+            (body
+              (str "\"square\"")
+            )
+          )
+          (arm
+            (pattern
+              (enum-lit point)
+            )
+            (body
+              (str "\"point\"")
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const shapes
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident Shape)
+            )
+          )
+          (tuple
+            (init
+              (ty)
+              (fields
+                (field-init circle
+                  (int 2)
+                )
+              )
+            )
+            (init
+              (ty)
+              (fields
+                (field-init square
+                  (int 3)
+                )
+              )
+            )
+            (enum-lit point)
+          )
+        )
+      )
+      (for
+        (operands
+          (ident shapes)
+        )
+        (capture s)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"{s:>6}: area={d} corners={d}\\n\"")
+                  (init
+                    (ty)
+                    (tuple
+                      (call
+                        (ident name)
+                        (ident s)
+                      )
+                      (call
+                        (field area
+                          (ident s)
+                        )
+                      )
+                      (call
+                        (field corners
+                          (ident s)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var total
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident shapes)
+        )
+        (capture s)
+        (body
+          (block
+            (assign +=
+              (ident total)
+              (call
+                (field area
+                  (ident s)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"total area = {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident total)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"area captures the active variant's payload\""
+    (block
+      (const c
+        (ty
+          (ident Shape)
+        )
+        (init
+          (ty)
+          (fields
+            (field-init circle
+              (int 2)
+            )
+          )
+        )
+      )
+      (const q
+        (ty
+          (ident Shape)
+        )
+        (init
+          (ty)
+          (fields
+            (field-init square
+              (int 3)
+            )
+          )
+        )
+      )
+      (const p
+        (ty
+          (ident Shape)
+        )
+        (enum-lit point)
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 12)
+            )
+            (call
+              (field area
+                (ident c)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 9)
+            )
+            (call
+              (field area
+                (ident q)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 0)
+            )
+            (call
+              (field area
+                (ident p)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"corners uses an else arm to cover the remaining variants\""
+    (block
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 4)
+            )
+            (call
+              (field corners
+                (init
+                  (ty
+                    (ident Shape)
+                  )
+                  (fields
+                    (field-init square
+                      (int 1)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 0)
+            )
+            (call
+              (field corners
+                (init
+                  (ty
+                    (ident Shape)
+                  )
+                  (fields
+                    (field-init circle
+                      (int 1)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const p
+        (ty
+          (ident Shape)
+        )
+        (enum-lit point)
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u64)
+              (int 0)
+            )
+            (call
+              (field corners
+                (ident p)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (test "\"a union flows through a function as an ordinary value\""
+    (block
+      (const c
+        (ty
+          (ident Shape)
+        )
+        (init
+          (ty)
+          (fields
+            (field-init circle
+              (int 5)
+            )
+          )
+        )
+      )
+      (const cn
+        (call
+          (ident name)
+          (ident c)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 6)
+            )
+            (field len
+              (ident cn)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (char "'c'")
+            )
+            (index
+              (ident cn)
+              (int 0)
+            )
+          )
+        )
+      )
+      (const p
+        (ty
+          (ident Shape)
+        )
+        (enum-lit point)
+      )
+      (const pn
+        (call
+          (ident name)
+          (ident p)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident usize)
+              (int 5)
+            )
+            (field len
+              (ident pn)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field expectEqual
+              (field testing
+                (ident std)
+              )
+            )
+            (builtin @as
+              (ident u8)
+              (char "'p'")
+            )
+            (index
+              (ident pn)
+              (int 0)
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -401,7 +401,9 @@ fn collect_rvalue_places<'a>(rvalue: &'a Rvalue, out: &mut Vec<&'a Place>) {
             push_op(offset, out);
             push_op(len, out);
         }
-        Rvalue::MakeSome(op, _) | Rvalue::MakeOk(op, _) => push_op(op, out),
+        Rvalue::MakeSome(op, _) | Rvalue::MakeOk(op, _) | Rvalue::MakeUnion { payload: op, .. } => {
+            push_op(op, out)
+        }
         Rvalue::MakeNull(_) | Rvalue::MakeErr(_, _) => {}
     }
 }
@@ -558,7 +560,8 @@ fn forced_home_locals(
                 | Rvalue::MakeSome(_, ty)
                 | Rvalue::MakeNull(ty)
                 | Rvalue::MakeOk(_, ty)
-                | Rvalue::MakeErr(_, ty) => {
+                | Rvalue::MakeErr(_, ty)
+                | Rvalue::MakeUnion { ty, .. } => {
                     if frame::is_memory_aggregate(arena, *ty) {
                         forced[di] = true;
                         home_ty[di] = Some(*ty);
@@ -715,6 +718,7 @@ fn rvalue_uses(rv: &Rvalue, out: &mut Vec<LocalId>) {
         Rvalue::Use(o)
         | Rvalue::MakeSome(o, _)
         | Rvalue::MakeOk(o, _)
+        | Rvalue::MakeUnion { payload: o, .. }
         | Rvalue::Cast { operand: o, .. }
         | Rvalue::Unary { operand: o, .. }
         | Rvalue::Discriminant { operand: o, .. } => operand_uses(o, out),

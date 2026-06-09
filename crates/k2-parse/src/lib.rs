@@ -588,6 +588,27 @@ mod tests {
     }
 
     #[test]
+    fn union_enum_allows_a_tagless_variant() {
+        // A `union(enum)` variant may omit its payload type — a payload-less
+        // (tagless) variant, like the spec's `point,`. Before tagged-union support
+        // the union body went through the struct-field parser and this was rejected
+        // with "expected `:` after a field name".
+        let f = ok("const Shape = union(enum) { circle: f64, square: f64, point };\n");
+        assert_eq!(f.items.len(), 1);
+        // A mix of trailing-comma and no-comma tagless variants also parses.
+        ok("const E = union(enum) { a: u8, b, c: u32, d };\n");
+    }
+
+    #[test]
+    fn struct_field_still_requires_a_type() {
+        // The relaxed (optional) payload type is a UNION-only rule; a struct field
+        // must still be `name : type`. This guards against the union change leaking
+        // into struct parsing.
+        let res = parse("const S = struct { x };\n");
+        assert!(!res.is_ok(), "a struct field must have a `: type`");
+    }
+
+    #[test]
     fn malformed_input_never_hangs() {
         // A pile of stray tokens must terminate with diagnostics, not a hang.
         let res = parse("} ] ) | & ^ => ... :: const");

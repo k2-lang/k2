@@ -1,0 +1,4 @@
+banner=[== k2 ==] len=8
+inline=[foobar] empty=[x]
+doc.len=16 head=[alpha]
+lines=3

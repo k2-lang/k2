@@ -622,10 +622,20 @@ impl FnBuilder<'_, '_> {
             self.cur = arm_bb;
             // Bind a payload capture (tagged-union arm) if present.
             if let Some(cap) = &arm.capture {
-                // The payload type is the scrutinee for an error/enum; for a
-                // tagged union it is the variant payload. Use the arm type.
-                let payload_ty = self.type_at(arm.body.span());
-                self.bind_capture(cap, scrut.clone(), payload_ty, *span);
+                // For a `union(enum)` arm `.circle => |r| …`, the capture binds the
+                // ACTIVE VARIANT'S PAYLOAD, extracted from the union via a
+                // `Proj::Payload` at the variant's payload type — NOT the whole
+                // union value. (Reusing the optional/error-union payload-extraction
+                // machinery, generalized to N variants.)
+                if let Some(payload_ty) = self.union_arm_payload_ty(scrut_ty, arm) {
+                    let payload = self.operand_payload(scrut.clone(), payload_ty, DiscrKind::Union);
+                    self.bind_capture(cap, payload, payload_ty, *span);
+                } else {
+                    // A non-union capture (or an unresolved variant): bind the
+                    // scrutinee at the arm's type, as before.
+                    let payload_ty = self.type_at(arm.body.span());
+                    self.bind_capture(cap, scrut.clone(), payload_ty, *span);
+                }
             }
             self.lower_branch_value(&arm.body, dst.clone());
             if !self.terminated() {
@@ -731,6 +741,32 @@ impl FnBuilder<'_, '_> {
         }
     }
 
+    /// The payload type of the `union(enum)` variant a switch arm matches, for an
+    /// arm with a payload capture (`.circle => |r| …`). `None` when the scrutinee
+    /// is not a union, or the arm is an `else`/range/multi-item pattern that does
+    /// not name exactly one variant (those bind no per-variant payload).
+    fn union_arm_payload_ty(
+        &mut self,
+        scrut_ty: TypeId,
+        arm: &k2_syntax::SwitchArm,
+    ) -> Option<TypeId> {
+        let uid = match self.lo.typed.arena.get(scrut_ty) {
+            Type::Union(uid) => *uid,
+            _ => return None,
+        };
+        if let SwitchPattern::Items(items) = &arm.pattern {
+            // A capture is only meaningful for a single-variant arm.
+            if let [it] = items.as_slice() {
+                if it.hi.is_none() {
+                    let idx = self.switch_item_value(&it.lo, scrut_ty)?;
+                    let info = &self.lo.typed.arena.unions[uid.0 as usize];
+                    return info.variants.get(idx as usize).map(|v| v.payload);
+                }
+            }
+        }
+        None
+    }
+
     /// The integer value of a switch item pattern (an int literal, char, or
     /// `error.X`/`.Variant` whose tag/index is known).
     fn switch_item_value(&mut self, e: &Expr, scrut_ty: TypeId) -> Option<i128> {
@@ -744,13 +780,20 @@ impl FnBuilder<'_, '_> {
                     return Some(self.lo.err_tag(field).0 as i128);
                 }
                 match self.member_at(*span) {
-                    Some(MemberRes::Variant(idx)) => Some(idx as i128),
+                    // An enum prong matches the variant's tag VALUE (explicit `= N`);
+                    // a union prong matches its variant INDEX. `enum_variant_value`
+                    // returns the value for an enum scrutinee and the index otherwise.
+                    Some(MemberRes::Variant(idx)) => {
+                        Some(self.enum_variant_value(scrut_ty, idx) as i128)
+                    }
                     Some(MemberRes::ErrorMember) => Some(self.lo.err_tag(field).0 as i128),
                     _ => None,
                 }
             }
             Expr::EnumLiteral { span, .. } => match self.member_at(*span) {
-                Some(MemberRes::Variant(idx)) => Some(idx as i128),
+                Some(MemberRes::Variant(idx)) => {
+                    Some(self.enum_variant_value(scrut_ty, idx) as i128)
+                }
                 _ => None,
             },
             // A negative literal parses as `-(<literal>)`; recurse on the operand

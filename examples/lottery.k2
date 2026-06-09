@@ -1,0 +1,44 @@
+//! lottery.k2 — a real program: lottery and card combinatorics with
+//! `std.math.binomial`/`permutations`. Counts the ways to win a 6-from-49 lottery
+//! at each prize tier, the size of the sample space, and a couple of card-deck
+//! facts — exact integer arithmetic, no floating point.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // A 6-from-49 lottery: C(49,6) equally-likely tickets.
+    const total = std.math.binomial(49, 6);
+    try out.print("6/49 lottery: {d} possible tickets\n", .{total});
+
+    // Ways to match exactly m of the 6 drawn numbers: C(6,m) · C(43, 6-m).
+    // (Choose m winners from the 6 drawn, the other 6-m from the 43 non-drawn.)
+    var m: u64 = 6;
+    try out.print("match counts (6..3): ", .{});
+    while (m >= 3) : (m -= 1) {
+        const ways = std.math.binomial(6, m) * std.math.binomial(43, 6 - m);
+        try out.print("{d} ", .{ways});
+    }
+    try out.print("\n", .{});
+
+    // Sanity: the match counts plus all-lower tiers sum to the whole space.
+    var sum: u64 = 0;
+    var j: u64 = 0;
+    while (j <= 6) : (j += 1) sum += std.math.binomial(6, j) * std.math.binomial(43, 6 - j);
+    try out.print("all tiers sum to total: {}\n", .{sum == total});
+
+    // Card-deck facts.
+    const poker_hands = std.math.binomial(52, 5);
+    const bridge_hands = std.math.binomial(52, 13);
+    const orderings_of_5 = std.math.permutations(52, 5);
+    try out.print("poker(5)={d} bridge(13)={d} ordered5={d}\n", .{
+        poker_hands, bridge_hands, orderings_of_5,
+    });
+
+    // Pascal's triangle row 10 (C(10,0)..C(10,10)).
+    try out.print("Pascal row 10: ", .{});
+    var k: u64 = 0;
+    while (k <= 10) : (k += 1) try out.print("{d} ", .{std.math.binomial(10, k)});
+    try out.print("\n", .{});
+}

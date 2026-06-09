@@ -1,0 +1,354 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn emit
+    (params
+      (param out
+        (anytype)
+      )
+      (param value
+        (ident u64)
+      )
+      (param radix
+        (ident u8)
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (var buf
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"{s} \"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field formatUintRadix
+                    (field fmt
+                      (ident std)
+                    )
+                  )
+                  (unary addrof
+                    (ident buf)
+                  )
+                  (ident value)
+                  (ident radix)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const v
+        (ty
+          (ident u64)
+        )
+        (int 255)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"255 in base 16/8/2/36: \"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident emit)
+            (ident out)
+            (ident v)
+            (int 16)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident emit)
+            (ident out)
+            (ident v)
+            (int 8)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident emit)
+            (ident out)
+            (ident v)
+            (int 2)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (ident emit)
+            (ident out)
+            (ident v)
+            (int 36)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (const hex
+        (binary orelse
+          (call
+            (field parseUintRadix
+              (field fmt
+                (ident std)
+              )
+            )
+            (str "\"dead\"")
+            (int 16)
+          )
+          (int 0)
+        )
+      )
+      (const oct
+        (binary orelse
+          (call
+            (field parseUintRadix
+              (field fmt
+                (ident std)
+              )
+            )
+            (str "\"777\"")
+            (int 8)
+          )
+          (int 0)
+        )
+      )
+      (const bin
+        (binary orelse
+          (call
+            (field parseUintRadix
+              (field fmt
+                (ident std)
+              )
+            )
+            (str "\"101010\"")
+            (int 2)
+          )
+          (int 0)
+        )
+      )
+      (const b36
+        (binary orelse
+          (call
+            (field parseUintRadix
+              (field fmt
+                (ident std)
+              )
+            )
+            (str "\"rust\"")
+            (int 36)
+          )
+          (int 0)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"parsed: dead16={d} 777o={d} 101010b={d} rust36={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident hex)
+                (ident oct)
+                (ident bin)
+                (ident b36)
+              )
+            )
+          )
+        )
+      )
+      (const samples
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident u64)
+            )
+          )
+          (tuple
+            (int 0)
+            (int 1)
+            (int 1000)
+            (int 4294967295)
+            (int 18446744073709551615)
+          )
+        )
+      )
+      (var all_ok
+        (ty
+          (ident u32)
+        )
+        (int 1)
+      )
+      (for
+        (operands
+          (ident samples)
+        )
+        (capture n)
+        (body
+          (block
+            (var buf
+              (ty
+                (array-type
+                  (len
+                    (int 64)
+                  )
+                  (ident u8)
+                )
+              )
+              (undefined)
+            )
+            (const s
+              (call
+                (field formatUintRadix
+                  (field fmt
+                    (ident std)
+                  )
+                )
+                (unary addrof
+                  (ident buf)
+                )
+                (ident n)
+                (int 16)
+              )
+            )
+            (const back
+              (binary orelse
+                (call
+                  (field parseUintRadix
+                    (field fmt
+                      (ident std)
+                    )
+                  )
+                  (ident s)
+                  (int 16)
+                )
+                (binary add
+                  (ident n)
+                  (int 1)
+                )
+              )
+            )
+            (if
+              (cond
+                (binary ne
+                  (ident back)
+                  (ident n)
+                )
+              )
+              (then
+                (block
+                  (assign =
+                    (ident all_ok)
+                    (int 0)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"hex round-trip exact: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident all_ok)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

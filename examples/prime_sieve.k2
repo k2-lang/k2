@@ -1,0 +1,62 @@
+//! prime_sieve.k2 — the Sieve of Eratosthenes over a `std.BitSet`, cross-checked
+//! against `std.math.isPrime`. A real use of the dense bit array (one bit per
+//! candidate marks "composite") plus the integer-`math` primality test, and the
+//! `not` keyword for boolean negation (k2 reserves `!` for error-union types).
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    const n: usize = 100;
+
+    // bit i set == i is composite. Bits 0/1 are marked non-prime up front.
+    var composite = try std.BitSet.init(alloc, n + 1);
+    defer composite.deinit();
+    composite.set(0);
+    composite.set(1);
+
+    var i: usize = 2;
+    while (i * i <= n) : (i += 1) {
+        if (not composite.isSet(i)) {
+            var j: usize = i * i;
+            while (j <= n) : (j += i) composite.set(j);
+        }
+    }
+
+    // Count primes <= n and capture the largest, and verify each against isPrime.
+    var count: usize = 0;
+    var largest: usize = 0;
+    var mismatches: usize = 0;
+    var k: usize = 2;
+    while (k <= n) : (k += 1) {
+        const sieve_says_prime = not composite.isSet(k);
+        if (sieve_says_prime) {
+            count += 1;
+            largest = k;
+        }
+        if (sieve_says_prime != std.math.isPrime(@as(u64, k))) mismatches += 1;
+    }
+
+    try out.print("primes <= {d}: count={d} largest={d}\n", .{ n, count, largest });
+    try out.print("sieve agrees with isPrime: {d} mismatches\n", .{mismatches});
+
+    // The first ten primes, in order.
+    try out.print("first ten: ", .{});
+    var printed: usize = 0;
+    var p: usize = 2;
+    while (printed < 10 and p <= n) : (p += 1) {
+        if (not composite.isSet(p)) {
+            try out.print("{d} ", .{p});
+            printed += 1;
+        }
+    }
+    try out.print("\n", .{});
+}

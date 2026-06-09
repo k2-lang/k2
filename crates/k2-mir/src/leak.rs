@@ -175,6 +175,7 @@ fn collect_rvalue_locals(rv: &Rvalue, set: &mut HashSet<LocalId>) {
         Rvalue::Use(o)
         | Rvalue::MakeSome(o, _)
         | Rvalue::MakeOk(o, _)
+        | Rvalue::MakeUnion { payload: o, .. }
         | Rvalue::Cast { operand: o, .. }
         | Rvalue::Unary { operand: o, .. }
         | Rvalue::Discriminant { operand: o, .. } => collect_operand_locals(o, set),
@@ -257,6 +258,7 @@ fn pattern_a_missing_free(
                             || returned.contains(l)
                             || freed_inline.contains(l)
                             || passed_to_call(func, *l)
+                            || stored_through_pointer(func, *l)
                     });
                     if !handled {
                         diags.push(Diagnostic::error(
@@ -505,6 +507,26 @@ fn inline_released_locals(func: &MirFunction) -> HashSet<LocalId> {
 
 /// `true` if `local` is passed as an argument to any call/intrinsic (which could
 /// take ownership), so we conservatively do not flag it as leaked.
+/// `true` if `local` is stored INTO a place that writes through a pointer (a
+/// [`Proj::Deref`] step) — e.g. `(*self).left = node`. The allocation then escapes
+/// via that pointer: it is reachable through the parameter / heap structure, so
+/// freeing it is the owning structure's responsibility (a tree's recursive
+/// teardown), NOT a leak at this allocation site. Mirrors `passed_to_call`'s
+/// ownership-transfer reasoning for a store target instead of a call argument.
+fn stored_through_pointer(func: &MirFunction, local: LocalId) -> bool {
+    for b in &func.blocks {
+        for s in &b.stmts {
+            if let Statement::Assign { place, rvalue, .. } = s {
+                let src_is_local = matches!(rvalue, Rvalue::Use(op) if operand_mentions(op, local));
+                if src_is_local && place.proj.iter().any(|p| matches!(p, Proj::Deref)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn passed_to_call(func: &MirFunction, local: LocalId) -> bool {
     for b in &func.blocks {
         for s in &b.stmts {

@@ -1,0 +1,37 @@
+// mathf_float.k2 — `std.mathf`, floating-point math by numerical approximation:
+// sqrt (Newton), floor/ceil/round, powi, and the range-reduced exp/sin/cos. Exact
+// results are printed directly; transcendental results are checked WITHIN a
+// tolerance (printed 1/0) so the golden is stable across rounding. Native-capable.
+const std = @import("std");
+
+/// 1 if `a` and `b` agree to ~1e-9, else 0.
+fn near(a: f64, b: f64) u8 {
+    return if (std.mathf.abs(a - b) < 0.000000001) 1 else 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Exact (or exactly-representable) results.
+    try out.print("sqrt4={d} hypot345={d} floor={d} ceil={d} round={d} rneg={d} powi={d}\n", .{
+        std.mathf.sqrt(4.0), std.mathf.hypot(3.0, 4.0),
+        std.mathf.floor(2.7), std.mathf.ceil(2.1), std.mathf.round(2.5), std.mathf.round(-2.5),
+        std.mathf.powi(2.0, 10),
+    });
+
+    // Transcendental identities, checked within tolerance.
+    try out.print("sqrt2={d} exp0={d} exp1e={d}\n", .{
+        near(std.mathf.sqrt(2.0), 1.4142135623730951),
+        near(std.mathf.exp(0.0), 1.0),
+        near(std.mathf.exp(1.0), std.mathf.e),
+    });
+    const half_pi = std.mathf.pi / 2.0;
+    try out.print("sin0={d} sinHalfPi={d} cos0={d} cosPi={d} pythagorean={d}\n", .{
+        near(std.mathf.sin(0.0), 0.0),
+        near(std.mathf.sin(half_pi), 1.0),
+        near(std.mathf.cos(0.0), 1.0),
+        near(std.mathf.cos(std.mathf.pi), -1.0),
+        // sin^2 + cos^2 == 1 at an arbitrary angle.
+        near(std.mathf.sin(1.0) * std.mathf.sin(1.0) + std.mathf.cos(1.0) * std.mathf.cos(1.0), 1.0),
+    });
+}

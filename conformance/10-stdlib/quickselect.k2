@@ -1,0 +1,42 @@
+// quickselect.k2 — `std.sort.Sorter.quickselect` (k-th smallest in O(n) average)
+// and `median`. Verified against a full sort: quickselect(arr, k) must equal the
+// k-th element of the sorted copy, for several k. VM case.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const S = std.sort.Sorter(i64, std.sort.asc(i64));
+
+    // Reference: a sorted copy of the data.
+    var sorted = [_]i64{ 42, 7, 13, 99, 1, 64, 28, 5, 88, 33, 17, 50, 3, 71, 9 };
+    S.sort(&sorted);
+
+    // For each k, quickselect on a fresh copy must match sorted[k].
+    var ok: u8 = 1;
+    var k: usize = 0;
+    while (k < 15) : (k += 1) {
+        var copy = [_]i64{ 42, 7, 13, 99, 1, 64, 28, 5, 88, 33, 17, 50, 3, 71, 9 };
+        const sel = S.quickselect(&copy, k).?;
+        if (sel != sorted[k]) ok = 0;
+    }
+    try out.print("quickselect matches sort for all k: {d}\n", .{ok});
+
+    // Spot values and the median.
+    var c1 = [_]i64{ 42, 7, 13, 99, 1, 64, 28, 5, 88, 33, 17, 50, 3, 71, 9 };
+    var c2 = [_]i64{ 42, 7, 13, 99, 1, 64, 28, 5, 88, 33, 17, 50, 3, 71, 9 };
+    var c3 = [_]i64{ 42, 7, 13, 99, 1, 64, 28, 5, 88, 33, 17, 50, 3, 71, 9 };
+    try out.print("min={d} max={d} median={d}\n", .{
+        S.quickselect(&c1, 0).?,
+        S.quickselect(&c2, 14).?,
+        S.median(&c3).?,
+    });
+
+    // Edge cases: single element, out of range, empty.
+    var single = [_]i64{77};
+    var empty = [_]i64{};
+    try out.print("single={d} oob={} emptyMedian={}\n", .{
+        S.quickselect(&single, 0).?,
+        S.quickselect(&single, 5) == null,
+        S.median(&empty) == null,
+    });
+}

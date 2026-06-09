@@ -289,6 +289,12 @@ impl StructInfo {
 pub struct EnumVariant {
     /// The variant name.
     pub name: String,
+    /// The variant's integer tag value: an explicit `= N`, or the previous
+    /// variant's value + 1 (the first defaults to 0). This is what `@intFromEnum`
+    /// yields and what a `switch` prong matches — distinct from the variant's
+    /// *declaration index* (used for reflection ordering), which differ only when
+    /// explicit values are given.
+    pub value: i128,
     /// Source span of the variant.
     pub span: Span,
 }

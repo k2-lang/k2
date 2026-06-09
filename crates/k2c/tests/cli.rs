@@ -584,6 +584,275 @@ fn run_generic_list_example_exact_output() {
     );
 }
 
+/// The `word_count.k2` example (StringHashMap + `str.splitScalar` over a literal's
+/// sub-slices + `getOrPut` + iterator) runs to completion with its exact stdout.
+#[test]
+fn run_word_count_example_exact_output() {
+    let path = examples_dir().join("word_count.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "word_count.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "total words: 12\n\
+         unique words: 7\n\
+         the=4 quick=2 fox=2 dog=1 missing=0\n\
+         max frequency: 4\n\
+         words seen once: 4\n"
+    );
+}
+
+/// The `number_bases.k2` example (`std.fmt.formatUintRadix`/`parseUintRadix`,
+/// decimal↔base round-trip incl. `u64::MAX`) runs with its exact stdout.
+#[test]
+fn run_number_bases_example_exact_output() {
+    let path = examples_dir().join("number_bases.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "number_bases.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "255 in base 16/8/2/36: ff 377 11111111 73 \n\
+         parsed: dead16=57005 777o=511 101010b=42 rust36=1299629\n\
+         hex round-trip exact: 1\n"
+    );
+}
+
+/// The `prime_sieve.k2` example (Sieve of Eratosthenes over `std.BitSet`,
+/// cross-checked against `std.math.isPrime`) runs with its exact stdout.
+#[test]
+fn run_prime_sieve_example_exact_output() {
+    let path = examples_dir().join("prime_sieve.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "prime_sieve.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "primes <= 100: count=25 largest=97\n\
+         sieve agrees with isPrime: 0 mismatches\n\
+         first ten: 2 3 5 7 11 13 17 19 23 29 \n"
+    );
+}
+
+/// The `run_length.k2` example (RLE encode→decode round-trip into caller buffers)
+/// runs with its exact stdout.
+#[test]
+fn run_run_length_example_exact_output() {
+    let path = examples_dir().join("run_length.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "run_length.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "original=66 encoded=12 decoded=66 roundtrip=true\n\
+         ratio (x10): 2\n"
+    );
+}
+
+/// The `caesar_cipher.k2` example (Caesar shift encrypt→decrypt round-trip, plus
+/// ROT13-is-its-own-inverse) runs with its exact stdout.
+#[test]
+fn run_caesar_cipher_example_exact_output() {
+    let path = examples_dir().join("caesar_cipher.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "caesar_cipher.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "plain:     Attack at Dawn, k2!\n\
+         encrypted: Dwwdfn dw Gdzq, n2!\n\
+         decrypted: Attack at Dawn, k2!\n\
+         round-trip ok: true\n\
+         rot13 twice == plain: true\n"
+    );
+}
+
+/// The `statistics.k2` example (sort + `std.math` reductions → min/max/mean/median)
+/// runs with its exact stdout.
+#[test]
+fn run_statistics_example_exact_output() {
+    let path = examples_dir().join("statistics.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "statistics.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "n=10 min=1 max=99 range=98\n\
+         sum=245 mean=24 median=15\n\
+         above mean: 3\n"
+    );
+}
+
+/// The `anagram.k2` example (byte-sort + `std.mem.eql` anagram test) runs with its
+/// exact stdout.
+#[test]
+fn run_anagram_example_exact_output() {
+    let path = examples_dir().join("anagram.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "anagram.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "listen/silent: true\n\
+         elbow/below:   true\n\
+         hello/world:   false\n\
+         abc/cba:       true\n\
+         a/aa:          false\n\
+         anagrams of \"stop\" among 6 candidates: 5\n"
+    );
+}
+
+/// The `geometry.k2` example (`std.mathf` hypot/sqrt/sin/cos plane geometry) runs
+/// with its exact stdout — `f64` results are deterministic.
+#[test]
+fn run_geometry_example_exact_output() {
+    let path = examples_dir().join("geometry.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "geometry.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "dist (0,0)->(3,4): 5\n\
+         circle r=2: area=12.566370614359172 circumference=12.566370614359172\n\
+         unit vector length (rounded): 1\n\
+         sqrt(144)=12 sqrt(625)=25\n"
+    );
+}
+
+/// The `config_parser.k2` example (`splitScalar`/`trim`/`indexOf` over a literal
+/// into a `StringHashMap`) runs with its exact stdout.
+#[test]
+fn run_config_parser_example_exact_output() {
+    let path = examples_dir().join("config_parser.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "config_parser.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "parsed=4 skipped=4 entries=4\n\
+         name=k2 version=0.39 debug=true port=8080\n\
+         missing key 'host': (default)\n"
+    );
+}
+
+/// The `projectile.k2` example (`std.mathf` trig: projectile range/height/flight,
+/// `atan` angle recovery) runs with its exact, deterministic float stdout.
+#[test]
+fn run_projectile_example_exact_output() {
+    let path = examples_dir().join("projectile.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "projectile.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "v=20 angle=30deg: range=35.348m peak=5.102m flight=2.041s\n\
+         max range (at 45deg): 40.816m\n\
+         recovered angle from (vx,vy): 30deg\n"
+    );
+}
+
+/// The `lottery.k2` example (`std.math.binomial`/`permutations` lottery & card
+/// combinatorics, Vandermonde sum check) runs with its exact stdout.
+#[test]
+fn run_lottery_example_exact_output() {
+    let path = examples_dir().join("lottery.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "lottery.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "6/49 lottery: 13983816 possible tickets\n\
+         match counts (6..3): 1 258 13545 246820 \n\
+         all tiers sum to total: true\n\
+         poker(5)=2598960 bridge(13)=635013559600 ordered5=311875200\n\
+         Pascal row 10: 1 10 45 120 210 252 210 120 45 10 1 \n"
+    );
+}
+
+/// The `roman_numerals.k2` example (int↔Roman, round-tripping every value 1..3999)
+/// runs with its exact stdout.
+#[test]
+fn run_roman_numerals_example_exact_output() {
+    let path = examples_dir().join("roman_numerals.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "roman_numerals.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "to roman: IV IX XIV XL XC MMXXIV MMMDCCCLXXXVIII MCMXCIV \n\
+         from roman: MMXXIV=2024 MCMXCIV=1994 MMMDCCCLXXXVIII=3888\n\
+         round-trip 1..1000 mismatches: 0\n"
+    );
+}
+
+/// The `percentiles.k2` example (order statistics via `quickselect`/`median`,
+/// cross-checked against a sort) runs with its exact stdout.
+#[test]
+fn run_percentiles_example_exact_output() {
+    let path = examples_dir().join("percentiles.k2");
+    let out = k2c().arg("run").arg(&path).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "percentiles.k2 must exit 0; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "n=20 min=1 max=99\n\
+         p25=19 p50=42 p75=75 p90=91\n\
+         median=37 matches_sorted=true\n"
+    );
+}
+
 /// The v0.22 `data_structures.k2` example (HashMap + sort + unicode + math/
 /// bignum) runs to completion with its exact expected stdout and exit 0.
 #[test]
@@ -2216,12 +2485,12 @@ pub fn main(sys: *System) !void {
     );
 }
 
-/// `union`/`union(enum)` is accepted by the front-end (`k2c check` succeeds) but
-/// its runtime payload storage is unimplemented; constructing one must be a
-/// **clean compile-time refusal** on BOTH backends — never a silent miscompile
-/// that reads back `undefined`. This pins that contract (see ROADMAP Beyond 0.30).
+/// `union(enum)` runtime values (v0.31): a SCALAR-payload union constructs,
+/// switches with payload capture, and runs identically on the VM and the native
+/// x86-64 backend. This pins that both backends agree on the `{tag, payload}`
+/// representation.
 #[test]
-fn union_construction_is_cleanly_refused_not_miscompiled() {
+fn union_scalar_payload_runs_on_both_backends() {
     let src = br#"
 const std = @import("std");
 const Shape = union(enum) { circle: u32, square: u32 };
@@ -2232,26 +2501,307 @@ pub fn main(sys: *System) !void {
     try out.print("{d}\n", .{a});
 }
 "#;
-    // The front-end accepts it — only running/compiling is refused.
     let (check_code, _co, _ce) = run_with_code(&["check", "-"], src);
-    assert_eq!(check_code, 0, "union(enum) must still type-check");
+    assert_eq!(check_code, 0, "union(enum) must type-check");
 
     for backend in ["run", "run-native"] {
         let (code, out, err) = run_with_code(&[backend, "-"], src);
-        assert_ne!(
+        assert_eq!(
             code, 0,
-            "`{backend}` must refuse union construction, not run it"
+            "`{backend}` must run the union program, got err: {err}"
         );
-        assert!(
-            err.contains("union"),
-            "`{backend}` union refusal must name the unsupported feature, got: {err}"
-        );
-        // Crucially, it must NOT have silently produced the (wrong) `7`/garbage.
-        assert!(
-            out.is_empty(),
-            "`{backend}` must emit no output for a refused union program, got: {out:?}"
+        assert_eq!(
+            out, "7\n",
+            "`{backend}` must capture the active variant's payload (7)"
         );
     }
+}
+
+/// An AGGREGATE-payload `union(enum)` (a `struct` variant) runs on the VM but is
+/// OUTSIDE the native subset: native must **cleanly refuse** it — never a silent
+/// miscompile or crash — naming the feature and the VM fallback. (Broadening
+/// native to aggregate union payloads is incremental future work; see ROADMAP.)
+#[test]
+fn union_aggregate_payload_runs_on_vm_native_refuses_cleanly() {
+    let src = br#"
+const std = @import("std");
+const Op = union(enum) {
+    imm: u32,
+    pair: struct { a: u32, b: u32 },
+};
+fn eval(o: Op) u32 {
+    return switch (o) { .imm => |v| v, .pair => |p| p.a + p.b };
+}
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const o = Op{ .pair = .{ .a = 10, .b = 20 } };
+    try out.print("{d}\n", .{eval(o)});
+}
+"#;
+    // The front-end accepts it, and the VM runs it correctly.
+    let (check_code, _co, _ce) = run_with_code(&["check", "-"], src);
+    assert_eq!(check_code, 0, "aggregate-payload union must type-check");
+    let (vm_code, vm_out, vm_err) = run_with_code(&["run", "-"], src);
+    assert_eq!(
+        vm_code, 0,
+        "VM must run the aggregate-payload union, got: {vm_err}"
+    );
+    assert_eq!(vm_out, "30\n", "VM must sum the struct payload (10+20=30)");
+
+    // Native cleanly refuses — no output, names the feature.
+    let (nc, no, ne) = run_with_code(&["run-native", "-"], src);
+    assert_ne!(
+        nc, 0,
+        "native must refuse the aggregate-payload union, not run it"
+    );
+    assert!(
+        ne.contains("union") && ne.contains("aggregate"),
+        "native refusal must name the unsupported feature, got: {ne}"
+    );
+    assert!(
+        no.is_empty(),
+        "native must emit no output for a refused program, got: {no:?}"
+    );
+}
+
+/// **NEVER MISCOMPILE**: a `union(enum)` literal coerced directly into an optional
+/// (`?U`) or error-union (`E!U`) target must construct the union and wrap it
+/// explicitly — both the payload-carrying `.{ .v = … }` form and the bare
+/// `.variant` form. A union is not transparent through an optional (its `.payload`
+/// reads the active variant, not the whole union), so an earlier build silently
+/// lowered these to a tagless struct / `undef`-as-`null` — a miscompile. This pins
+/// the correct result on the VM.
+#[test]
+fn union_literal_coerced_into_optional_is_not_miscompiled() {
+    let src = br#"
+const std = @import("std");
+const Cmd = union(enum) { set: i64, clear };
+fn apply(prev: i64, cmd: ?Cmd) i64 {
+    if (cmd) |c| {
+        return switch (c) { .set => |v| v, .clear => 0 };
+    }
+    return prev;
+}
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    // payload-carrying literal at `?Cmd`, payload-less literal at `?Cmd`, and null.
+    try out.print("{d} {d} {d}\n", .{ apply(99, .{ .set = 42 }), apply(99, .clear), apply(99, null) });
+}
+"#;
+    let (vm_code, vm_out, vm_err) = run_with_code(&["run", "-"], src);
+    assert_eq!(
+        vm_code, 0,
+        "VM must run the optional-union program: {vm_err}"
+    );
+    // set -> 42, clear -> 0, null -> 99 (the previous value). Any of `<int>`/garbage
+    // here means the union was mis-lowered through the optional.
+    assert_eq!(vm_out, "42 0 99\n", "optional-union coercion must be exact");
+}
+
+/// **NEVER MISCOMPILE**: a `union(enum)` literal nested as another union's variant
+/// payload (`.{ .nested = .{ .b = 3 } }`) must build the INNER union, not a tagless
+/// struct. The inner literal's type comes from the outer variant's declared payload
+/// type — not its own span — so construction must use the destination type. An
+/// earlier build lowered the inner literal to `Struct { 3 }`, so the nested switch
+/// read garbage. This pins the correct VM result.
+#[test]
+fn nested_union_literal_is_not_miscompiled() {
+    let src = br#"
+const std = @import("std");
+const Inner = union(enum) { pos: i64, neg: i64 };
+const Outer = union(enum) { nested: Inner, none };
+fn ev(o: Outer) i64 {
+    return switch (o) {
+        .nested => |i| switch (i) { .pos => |x| x, .neg => |x| -x },
+        .none => 0,
+    };
+}
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try out.print("{d} {d}\n", .{ ev(.{ .nested = .{ .neg = 3 } }), ev(.none) });
+}
+"#;
+    let (vm_code, vm_out, vm_err) = run_with_code(&["run", "-"], src);
+    assert_eq!(vm_code, 0, "VM must run the nested-union program: {vm_err}");
+    assert_eq!(
+        vm_out, "-3 0\n",
+        "nested union must build the inner union, not a struct"
+    );
+}
+
+/// **NEVER MISCOMPILE**: an `enum` literal coerced into an optional (`?E`) or error
+/// union (`E!E`) must be wrapped explicitly — like a union, an enum value is not
+/// transparent through an optional (its payload is empty), so a transparent store
+/// reads back as `null` / the wrong variant. This was a *pre-existing* VM
+/// miscompile, fixed by the same destination-driven, explicit-wrap construction as
+/// unions. Asserted on the VM (the semantic reference). (Native's narrow-enum
+/// -through-optional path passed to a function is a separate, fragile subset
+/// matter; the conformance corpus covers the native-stable shapes.)
+#[test]
+fn enum_literal_coerced_into_optional_is_not_miscompiled() {
+    let src = br#"
+const std = @import("std");
+const Color = enum { red, green, blue };
+const E = error{Bad};
+fn code(c: Color) u8 { return switch (c) { .red => 1, .green => 2, .blue => 3 }; }
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const a: ?Color = .green;
+    const e: E!Color = .blue;
+    const av: u8 = if (a) |x| code(x) else 0;
+    const ev: u8 = if (e) |x| code(x) else |_| 0;
+    try out.print("{d} {d}\n", .{ av, ev });
+}
+"#;
+    let (code, out, err) = run_with_code(&["run", "-"], src);
+    assert_eq!(code, 0, "VM must run the enum-coercion program: {err}");
+    assert_eq!(
+        out, "2 3\n",
+        "enum-in-optional (.green->2) + enum-in-error-union (.blue->3) must be exact"
+    );
+}
+
+/// **NEVER MISCOMPILE**: a `struct` field with a `= default` must be filled in when
+/// an initializer omits it — both an empty `C{}` (every field defaulted; this
+/// faulted with "field index out of range" because `{}` parses as an empty tuple)
+/// and a partial `C{ .a = … }` (the omitted field read back `undefined`). The
+/// default is now lowered from the struct's declaration. Runs identically on the VM
+/// and native.
+#[test]
+fn struct_field_defaults_are_filled_in() {
+    let src = br#"
+const std = @import("std");
+const C = struct { w: u32 = 80, h: u32 = 24, on: bool = true };
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const a = C{};
+    const b = C{ .w = 100 };
+    try out.print("{d} {d} {} {d} {d} {}\n", .{ a.w, a.h, a.on, b.w, b.h, b.on });
+}
+"#;
+    for backend in ["run", "run-native"] {
+        let (code, out, err) = run_with_code(&[backend, "-"], src);
+        assert_eq!(
+            code, 0,
+            "`{backend}` must run the struct-defaults program: {err}"
+        );
+        assert_eq!(
+            out, "80 24 true 100 24 true\n",
+            "`{backend}`: empty `C{{}}` defaults all; `C{{ .w = 100 }}` defaults the rest"
+        );
+    }
+}
+
+/// **NEVER MISCOMPILE**: an `enum(u8) { a = N }` must honor its explicit integer
+/// values (spec §9) — `@intFromEnum` yields the value, `switch` matches by value,
+/// and `@enumFromInt` recovers the variant — while a bare enum still numbers its
+/// variants 0, 1, 2. Previously the explicit value was dropped and the declaration
+/// index used instead. Runs identically on the VM and native.
+#[test]
+fn explicit_enum_values_are_honored() {
+    let src = br#"
+const std = @import("std");
+const S = enum(u8) { ok = 0, busy = 10, gone = 200 };
+const P = enum { x, y, z };
+fn c(s: S) u8 { return switch (s) { .ok => 1, .busy => 2, .gone => 3 }; }
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const a: S = .busy;
+    const r: S = @enumFromInt(@as(u8, 200));
+    const p: P = .z;
+    try out.print("{d} {d} {d} {d}\n", .{ @intFromEnum(a), c(a), c(r), @intFromEnum(p) });
+}
+"#;
+    for backend in ["run", "run-native"] {
+        let (code, out, err) = run_with_code(&[backend, "-"], src);
+        assert_eq!(
+            code, 0,
+            "`{backend}` must run the enum-values program: {err}"
+        );
+        assert_eq!(
+            out, "10 2 3 2\n",
+            "`{backend}`: @intFromEnum(.busy)=10, switch(.busy)=2, @enumFromInt(200)=3, .z=2"
+        );
+    }
+}
+
+/// **NEVER MISCOMPILE**: an unknown / unimplemented builtin (`@divTrunc` — k2
+/// spells truncating division `/`; or any typo) is a clear compile error at the
+/// call site, NOT a silent `undef` that would run and print `<int>`.
+#[test]
+fn unknown_builtin_is_reported_not_silently_undef() {
+    let src = br#"
+const std = @import("std");
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var x: i64 = 10;
+    if (x > 0) x = 10;
+    try out.print("{d}\n", .{@divTrunc(x, 3)});
+}
+"#;
+    let (code, out, err) = run_with_code(&["run", "-"], src);
+    assert_ne!(code, 0, "an unknown builtin must fail to compile, not run");
+    assert!(
+        err.contains("unknown builtin") && err.contains("@divTrunc"),
+        "expected a clear unknown-builtin error naming `@divTrunc`, got: {err}"
+    );
+    assert!(
+        !out.contains("<int>"),
+        "must not lower to a silent `<int>` undef; stdout was: {out}"
+    );
+}
+
+/// A narrowing `@intCast` of a NEGATIVE value to `u128` must TRAP in the VM, exactly
+/// as the native backend already does — a `u128` cannot be negative. The VM's
+/// i128-backed range check previously let it through, silently yielding `2^128 - n`
+/// (a "never miscompile" violation and a VM/native divergence).
+#[test]
+fn negative_to_u128_cast_traps_not_silently_wraps() {
+    let src = br#"
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const n: i64 = -5;
+    const u: u128 = @intCast(n);
+    try out.print("{d}\n", .{u});
+}
+"#;
+    let (code, out, err) = run_with_code(&["run", "-"], src);
+    assert_ne!(
+        code, 0,
+        "a negative -> u128 cast must trap, not produce a value"
+    );
+    assert!(
+        err.contains("cast truncated value"),
+        "expected a 'cast truncated value' trap; stderr: {err}"
+    );
+    assert!(
+        !out.contains("340282366920938463463374607431768211451"),
+        "must not silently yield 2^128 - 5; stdout: {out}"
+    );
+}
+
+/// A compile-time-known SHIFT/bitwise result that overflows its sized target is a
+/// compile error (spec §02), exactly like an overflowing `+`. `const x: u8 = 1 << 9`
+/// (512) must be rejected, not silently coerced — previously only `+`/`-`/`*` were
+/// range-checked at the coercion, so shifts slipped through.
+#[test]
+fn out_of_range_comptime_shift_is_a_coercion_error() {
+    let src = br#"
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const x: u8 = 1 << 9;
+    try out.print("{d}\n", .{x});
+}
+"#;
+    let (code, _out, err) = run_with_code(&["run", "-"], src);
+    assert_ne!(
+        code, 0,
+        "an out-of-range comptime shift must be a compile error"
+    );
+    assert!(
+        err.contains("512") && err.contains("out of range") && err.contains("u8"),
+        "expected a clear out-of-range diagnostic naming 512 and u8; stderr: {err}"
+    );
 }
 
 /// **HARD ACCEPTANCE**: `k2c run-native` in `--debug`, `--release-safe`, and

@@ -1,0 +1,37 @@
+// arraylist_extended.k2 — the v0.36 `ArrayList` methods beyond append/get:
+// appendSlice, insert, removeAt (order-preserving), swapRemove (O(1)), pop,
+// getLast, set, clear. Under the leak-checking GPA; a VM container case.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    var list = std.ArrayList(i64).init(alloc);
+    defer list.deinit();
+
+    try list.appendSlice(&[_]i64{ 10, 20, 30, 40 }); // [10,20,30,40]
+    try list.insert(0, 5); // [5,10,20,30,40]
+    try list.insert(list.len(), 50); // [5,10,20,30,40,50]
+    const ra = list.removeAt(1).?; // 10 -> [5,20,30,40,50]
+    const sr = list.swapRemove(0).?; // 5, last(50)->slot0 -> [50,20,30,40]
+    const gl = list.getLast().?; // 40
+    const pp = list.pop().?; // 40 -> [50,20,30]
+    list.set(1, 99); // [50,99,30]
+
+    // Sum the survivors.
+    var sum: i64 = 0;
+    var i: usize = 0;
+    while (i < list.len()) : (i += 1) sum += list.get(i).?;
+    try out.print("removeAt={d} swapRemove={d} getLast={d} pop={d} len={d} sum={d}\n", .{
+        ra, sr, gl, pp, list.len(), sum,
+    });
+
+    list.clear();
+    try out.print("cleared: len={d} getLast={}\n", .{ list.len(), list.getLast() == null });
+}

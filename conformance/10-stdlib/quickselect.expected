@@ -1,0 +1,3 @@
+quickselect matches sort for all k: 1
+min=1 max=99 median=28
+single=77 oob=true emptyMedian=true

@@ -1,0 +1,40 @@
+// mathf_transcendental.k2 — `std.mathf` logarithms and powers: ln (atanh series,
+// e-reduced), logBase, the general pow (`exp(y·ln x)`), and tan. Checked WITHIN a
+// tolerance against identities so the golden is stable. Native-capable.
+const std = @import("std");
+
+fn near(a: f64, b: f64) u8 {
+    return if (std.mathf.abs(a - b) < 0.000001) 1 else 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Logarithm identities.
+    try out.print("ln: e->1={d} 1->0={d} e2->2={d} eInv->-1={d}\n", .{
+        near(std.mathf.ln(std.mathf.e), 1.0),
+        near(std.mathf.ln(1.0), 0.0),
+        near(std.mathf.ln(std.mathf.e * std.mathf.e), 2.0),
+        near(std.mathf.ln(1.0 / std.mathf.e), -1.0),
+    });
+
+    // Base-10 and base-2 logs of exact powers.
+    try out.print("logBase: 1000@10->3={d} 1024@2->10={d}\n", .{
+        near(std.mathf.logBase(1000.0, 10.0), 3.0),
+        near(std.mathf.logBase(1024.0, 2.0), 10.0),
+    });
+
+    // General power via exp/ln, cross-checked with the exact integer power.
+    try out.print("pow: 2^10->1024={d} 9^0.5->3={d} 2^-1->0.5={d} agrees_powi={d}\n", .{
+        near(std.mathf.pow(2.0, 10.0), 1024.0),
+        near(std.mathf.pow(9.0, 0.5), 3.0),
+        near(std.mathf.pow(2.0, -1.0), 0.5),
+        near(std.mathf.pow(3.0, 5.0), std.mathf.powi(3.0, 5)),
+    });
+
+    // tan = sin/cos at a few angles.
+    try out.print("tan: 0->0={d} pi/4->1={d}\n", .{
+        near(std.mathf.tan(0.0), 0.0),
+        near(std.mathf.tan(std.mathf.pi / 4.0), 1.0),
+    });
+}

@@ -1,0 +1,29 @@
+// random_xorshift.k2 — `std.Random`, the seedable xorshift64 PRNG. Deterministic:
+// a fixed seed yields a fixed sequence on every target, so its output is pinned.
+// Pure integer ops (no allocator), and only `{d}` formatting — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var rng = std.Random.init(12345);
+    // The first few bounded draws (deterministic for this seed).
+    const a = rng.below(1000);
+    const b = rng.below(1000);
+    const c = rng.intRange(100, 200);
+    try out.print("draws: {d} {d} {d}\n", .{ a, b, c });
+
+    // Reseeding reproduces the exact sequence.
+    var rng2 = std.Random.init(12345);
+    const a2 = rng2.below(1000);
+    try out.print("reproducible: {d}\n", .{@as(u8, if (a == a2) 1 else 0)});
+
+    // A histogram of 1000 coin flips is well within a sane band (not 0, not 1000).
+    var heads: u32 = 0;
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        if (rng.boolean()) heads += 1;
+    }
+    const balanced: u8 = if (heads > 350 and heads < 650) 1 else 0;
+    try out.print("coin_balanced: {d}\n", .{balanced});
+}

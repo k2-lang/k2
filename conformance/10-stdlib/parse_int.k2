@@ -1,0 +1,27 @@
+// parse_int.k2 — `std.fmt.parseUint`/`parseInt`/`parseUintRadix`: string-to-integer
+// parsing with overflow checks (never traps) and full `i64` range including its
+// minimum. Pure (no allocator), `{d}` only — native-capable.
+const std = @import("std");
+
+fn pu(s: []const u8) u64 {
+    return std.fmt.parseUint(s) orelse 9999;
+}
+fn pi(s: []const u8) i64 {
+    return std.fmt.parseInt(s) orelse -1;
+}
+fn pr(s: []const u8, radix: u8) u64 {
+    return std.fmt.parseUintRadix(s, radix) orelse 8888;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    // Unsigned: value, leading zeros, u64 max, and a rejected non-digit.
+    try out.print("uint: {d} {d} {d} {d}\n", .{ pu("12345"), pu("0042"), pu("18446744073709551615"), pu("9z") });
+    // Signed: negative, explicit plus, i64 max and min, and a rejected overflow.
+    try out.print("int: {d} {d} {d}\n", .{ pi("-987"), pi("+987"), pi("9223372036854775807") });
+    try out.print("min: {d} over: {d} empty: {d}\n", .{ pi("-9223372036854775808"), pi("99999999999999999999"), pi("") });
+    // Radix 2 / 8 / 16 / 36, and a digit out of range for the base.
+    try out.print("radix: {d} {d} {d} {d} {d}\n", .{
+        pr("11111111", 2), pr("777", 8), pr("dead", 16), pr("rust", 36), pr("8", 8),
+    });
+}

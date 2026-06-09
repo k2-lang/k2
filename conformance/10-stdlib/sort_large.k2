@@ -1,0 +1,56 @@
+// sort_large.k2 — exercises `std.sort.Sorter.sort`'s QUICKSORT partition path,
+// which only runs for inputs >= 16 elements (smaller fall to insertion sort). The
+// other conformance sort cases are all small, so this locks in the Hoare partition
+// on the adversarial inputs (reverse-sorted, all-equal) plus agreement with the
+// O(n log n)-guaranteed heapSort/mergeSort. VM case.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+    const S = std.sort.Sorter(i64, std.sort.asc(i64));
+
+    // 1) Reverse-sorted, 24 elements (worst case for a naive pivot).
+    var rev: [24]i64 = undefined;
+    var i: usize = 0;
+    while (i < 24) : (i += 1) rev[i] = @as(i64, @intCast(24 - i));
+    S.sort(&rev);
+    try out.print("reverse: sorted={} first={d} last={d}\n", .{ S.isSorted(&rev), rev[0], rev[rev.len - 1] });
+
+    // 2) All-equal, 32 elements (partition must not loop forever or unbalance).
+    var eq: [32]i64 = undefined;
+    i = 0;
+    while (i < 32) : (i += 1) eq[i] = 7;
+    S.sort(&eq);
+    try out.print("all-equal: sorted={} first={d} last={d}\n", .{ S.isSorted(&eq), eq[0], eq[eq.len - 1] });
+
+    // 3) A pseudo-random 64-element array: quicksort must agree with heapSort and
+    //    a mergeSort of the same data, element for element.
+    var rng = std.Random.init(98765);
+    var a: [64]i64 = undefined;
+    var b: [64]i64 = undefined;
+    var c: [64]i64 = undefined;
+    i = 0;
+    while (i < 64) : (i += 1) {
+        const v = @as(i64, @intCast(rng.below(1000)));
+        a[i] = v;
+        b[i] = v;
+        c[i] = v;
+    }
+    S.sort(&a);
+    S.heapSort(&b);
+    try S.mergeSort(&c, alloc);
+    var agree: u8 = 1;
+    i = 0;
+    while (i < 64) : (i += 1) {
+        if (a[i] != b[i] or a[i] != c[i]) agree = 0;
+    }
+    try out.print("random64: sorted={} quick==heap==merge={d} min={d} max={d}\n", .{
+        S.isSorted(&a), agree, a[0], a[a.len - 1],
+    });
+}

@@ -1,0 +1,366 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var gpa
+        (call
+          (field init
+            (field GeneralPurposeAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident sys)
+        )
+      )
+      (defer
+        (block
+          (const leaked
+            (call
+              (field deinit
+                (ident gpa)
+              )
+            )
+          )
+          (if
+            (cond
+              (ident leaked)
+            )
+            (then
+              (block
+                (expr
+                  (builtin @panic
+                    (str "\"memory leak detected\"")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const alloc
+        (call
+          (field allocator
+            (ident gpa)
+          )
+        )
+      )
+      (const config
+        (str "\"# k2 demo config\\nname = k2\\nversion = 0.39\\n\\n  debug = true  \\n# a comment line\\nport = 8080\\n\"")
+      )
+      (var map
+        (call
+          (field init
+            (call
+              (field StringHashMap
+                (ident std)
+              )
+              (slice :const
+                (ident u8)
+              )
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident map)
+            )
+          )
+        )
+      )
+      (var parsed
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var skipped
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var lines
+        (call
+          (field splitScalar
+            (field str
+              (ident std)
+            )
+          )
+          (ident config)
+          (char "'\\n'")
+        )
+      )
+      (while
+        (cond
+          (call
+            (field next
+              (ident lines)
+            )
+          )
+        )
+        (capture raw)
+        (body
+          (block
+            (const line
+              (call
+                (field trim
+                  (field str
+                    (ident std)
+                  )
+                )
+                (ident raw)
+              )
+            )
+            (if
+              (cond
+                (binary or
+                  (binary eq
+                    (field len
+                      (ident line)
+                    )
+                    (int 0)
+                  )
+                  (binary eq
+                    (index
+                      (ident line)
+                      (int 0)
+                    )
+                    (char "'#'")
+                  )
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident skipped)
+                    (int 1)
+                  )
+                  (continue)
+                )
+              )
+            )
+            (const eq
+              (call
+                (field indexOf
+                  (field str
+                    (ident std)
+                  )
+                )
+                (ident line)
+                (str "\"=\"")
+              )
+            )
+            (if
+              (cond
+                (binary eq
+                  (ident eq)
+                  (null)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident skipped)
+                    (int 1)
+                  )
+                  (continue)
+                )
+              )
+            )
+            (const key
+              (call
+                (field trim
+                  (field str
+                    (ident std)
+                  )
+                )
+                (slice-expr
+                  (ident line)
+                  (lo
+                    (int 0)
+                  )
+                  (hi
+                    (unwrap
+                      (ident eq)
+                    )
+                  )
+                )
+              )
+            )
+            (const value
+              (call
+                (field trim
+                  (field str
+                    (ident std)
+                  )
+                )
+                (slice-expr
+                  (ident line)
+                  (lo
+                    (binary add
+                      (unwrap
+                        (ident eq)
+                      )
+                      (int 1)
+                    )
+                  )
+                  (hi
+                    (field len
+                      (ident line)
+                    )
+                  )
+                )
+              )
+            )
+            (expr
+              (unary try
+                (call
+                  (field put
+                    (ident map)
+                  )
+                  (ident key)
+                  (ident value)
+                )
+              )
+            )
+            (assign +=
+              (ident parsed)
+              (int 1)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"parsed={d} skipped={d} entries={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident parsed)
+                (ident skipped)
+                (call
+                  (field count
+                    (ident map)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"name={s} version={s} debug={s} port={s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary orelse
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (str "\"name\"")
+                  )
+                  (str "\"?\"")
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (str "\"version\"")
+                  )
+                  (str "\"?\"")
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (str "\"debug\"")
+                  )
+                  (str "\"?\"")
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (str "\"port\"")
+                  )
+                  (str "\"?\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"missing key 'host': {s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary orelse
+                  (call
+                    (field get
+                      (ident map)
+                    )
+                    (str "\"host\"")
+                  )
+                  (str "\"(default)\"")
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

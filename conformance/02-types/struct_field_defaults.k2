@@ -1,0 +1,28 @@
+// struct_field_defaults.k2 — a `struct` field with a `= default` value is filled
+// in when an initializer omits it: an empty `C{}` defaults every field, and a
+// partial `C{ .a = … }` defaults the rest. Integer/bool defaults keep this in the
+// native subset. (Previously an omitted field read back `undefined`, and an empty
+// initializer faulted.)
+const std = @import("std");
+
+const Opts = struct {
+    width: u32 = 80,
+    height: u32 = 24,
+    verbose: bool = false,
+    level: i64 = -1,
+};
+
+fn area(o: Opts) u32 {
+    return o.width * o.height;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const all = Opts{}; // every field defaulted
+    const some = Opts{ .width = 100, .verbose = true }; // override two, default two
+
+    try out.print("all: {d}x{d} v={} lvl={d}\n", .{ all.width, all.height, all.verbose, all.level });
+    try out.print("some: {d}x{d} v={} lvl={d}\n", .{ some.width, some.height, some.verbose, some.level });
+    try out.print("areas: {d} {d}\n", .{ area(all), area(some) });
+}

@@ -310,6 +310,184 @@ and a **documentation generator**.
   wins are re-verified (`bench_baseline.rs`), and the whole suite is green. This
   closes the extended roadmap.
 
+---
+
+## v0.31 — Tagged-union runtime values `union(enum)` ✅
+
+The single largest item carried in *Beyond 0.30* — the only language construct
+the front-end fully understood but the backends *cleanly refused* — is now a
+running feature. A `union(enum)` is a **sum type**: a value that is exactly one
+of its variants at a time, with a discriminating tag. This milestone makes such
+values **construct, flow, and `switch` at run time**, end to end, on both
+backends.
+
+- **Layout (single source of truth).** A union is laid out like a generalized
+  error union: a discriminant (the inferred enum tag — `enum_tag_bits(n)` bits,
+  unsigned, so a 1-byte tag for ≤256 variants) at `+0`, then a payload area sized
+  to the **largest** variant and aligned to the **strictest**. The rule lives in
+  `k2_types::reflect::layout_depth` (which feeds `@sizeOf`/`@alignOf`/`@offsetOf`)
+  and is mirrored byte-for-byte in `k2_codegen::layout`, so the comptime-folded
+  constants and the native byte image agree.
+- **One constructor.** All construction — the payload-carrying `.{ .circle = r }`
+  and the bare `.point` form — lowers to a single MIR rvalue, `MakeUnion { variant,
+  payload, ty }` (parallel to `MakeOk`/`MakeSome`). The VM realizes it as
+  `Value::Enum { tag, payload }`; native writes the tag word plus the payload.
+- **Switch with payload capture.** `switch (u) { .circle => |r| …, .point => … }`
+  reads the union's tag into the existing `SwitchInt`, then binds each arm's
+  capture to the **active variant's payload** (a `Proj::Payload` at the variant
+  type) — reusing the optional/error-union capture machinery, generalized to N
+  variants. Exhaustiveness is enforced by the type checker; an `else` arm covers
+  the rest.
+- **Tagless variants.** The parser now accepts a payload-less union variant
+  (`point,`), matching the spec's `union(enum)` example; its payload is `void`.
+- **Backends & the honest boundary.** The **VM** supports scalar *and* aggregate
+  (`struct`) payloads. The **native x86-64** backend supports scalar and `void`
+  payloads with output byte-identical to the VM (verified across Debug,
+  ReleaseSafe, and ReleaseFast); a variant with an **aggregate** payload, or a
+  bare untagged `union {…}`, is **cleanly refused** by native (a non-zero exit
+  naming the VM fallback), never miscompiled. Broadening native to aggregate
+  union payloads (the by-register SysV-ABI spill) is incremental future work.
+- **Coverage.** `examples/unions.k2` (native-capable, in the integration
+  parity set); `conformance/02-types/union_tagged.k2` (native-marked) and
+  `union_payload_struct.k2` (VM-only, aggregate payload); unit tests for the
+  layout formula (`k2_codegen::layout`), the tagless-variant parse
+  (`k2-parse`), and the both-backends / native-refusal contracts
+  (`crates/k2c/tests/cli.rs`). Implementing this also confirmed the existing
+  enum-`switch` dispatch and `DiscrKind::Union` discriminant read were already
+  union-ready — only payload storage and capture were missing.
+- **Pre-existing bugs flushed out (and fixed) along the way** — real miscompiles
+  that only a feature exercising aggregate layout and value coercion surfaces:
+  1. **A 9–15 byte aggregate passed BY VALUE corrupted an adjacent frame slot.**
+     Such a value is passed in a SysV register pair and received with two 8-byte
+     stores; the home was reserved at `max(size, 8)`, so the second store spilled
+     past it. Now padded to `round_up(size, 8)`. This fixes plain `struct`
+     parameters too — pinned by `conformance/02-types/struct_by_value_abi.k2`.
+  2. **Union-literal construction relied on the literal's span type, not its
+     destination.** Three miscompiles shared this root cause: a union coerced into
+     `?U`/`E!U` (a union is not transparent through an optional, so it needs an
+     explicit `MakeSome`/`MakeOk` wrap); a payload-less `.variant` coerced the same
+     way (read back as `null`); and a union literal NESTED as another union's
+     variant payload (its type comes from the outer variant, so it lowered to a
+     tagless struct). Construction now derives the union target from the
+     DESTINATION type first, then the span — fixing all three uniformly. Pinned by
+     `conformance/02-types/union_in_optional.k2` and `union_nested.k2`, and the
+     `*_is_not_miscompiled` cli tests. Found by systematic edge-case testing of the
+     new feature, exactly as the v0.29 self-hosting work flushed out latent bugs.
+
+---
+
+## v0.32 — `union(enum)` reflection ✅
+
+`@typeInfo(U).Union` now reports a union's **`tag_type`** (its inferred
+discriminant integer) and **`fields`** — one descriptor per variant carrying the
+variant's `name` and payload `type` (reusing the `StructField` descriptor, since
+a variant *is* `name : type`; a payload-less variant's `type` is `void`).
+Previously the union descriptor was empty. It composes with the rest of the
+comptime surface exactly as struct/enum reflection does — `@typeInfo(U) != .Union`,
+`inline for (…Union.fields)`, `@sizeOf(field.type)`, sizing an array by
+`…fields.len` — and folds to runtime constants, so it is native-capable. Pinned
+by `conformance/07-comptime/union_reflection.k2` (native-marked). This makes a
+union introspectable by the same generic code that already walks structs and
+enums (serializers, ABI shims, trait-style checks).
+
+---
+
+## v0.33 — Lexical reconciliation ✅
+
+Spec §1.3 relaxed so a lone `\r` (an old-style Mac line ending) is **whitespace**,
+matching the reference lexer (it was previously called a lexical error). Closes the
+one deferred lexical gap; pinned by `k2-lexer`'s
+`lone_carriage_return_is_whitespace`.
+
+## v0.34 — `struct` field defaults ✅
+
+A `struct` field with a `= default` is now honored when an initializer omits it,
+where it previously read back `undefined` (and an empty `C{}` — which parses as an
+empty tuple — *faulted*). Construction indexes each struct's declared field
+defaults (keyed by its defining span, mirroring the existing value-const index) and
+lowers the default expression into any omitted field; an empty struct initializer
+takes the same all-defaults path. Every default kind works (int, bool, float,
+`[]const u8`), VM and native. Pinned by
+`conformance/02-types/struct_field_defaults.k2` (native-marked) and a cli test.
+This was a pre-existing silent miscompile, surfaced by the post-v0.31 systematic
+edge-case sweep.
+
+## v0.35 — Explicit `enum` values ✅
+
+`enum(u8) { ok = 0, busy = 10, gone = 200 }` now honors its explicit integer values
+(spec §9): each `EnumVariant` carries its tag VALUE (an explicit `= N`, else the
+previous + 1), and that value — not the declaration index — flows through
+construction, `switch` dispatch, `@intFromEnum`/`@enumFromInt` (runtime and
+comptime), and `@typeInfo` reflection. A bare enum is unchanged (0, 1, 2 …). The
+declaration *index* stays distinct (it still orders reflection and tags a
+`union(enum)`); the two diverge only under explicit values. Pinned by
+`conformance/02-types/enum_explicit_values.k2` (native-marked) and a cli test. The
+last sibling of the v0.31 edge-case sweep; both this and v0.34 were pre-existing
+silent miscompiles a real feature exercise flushed out.
+
+## v0.40 — Standard-library depth + `++` strings ✅
+
+A broad, verified `std` expansion — all pure or single-allocator, each pinned by a
+`conformance/10-stdlib` case and (for the algorithmic ones) checked against
+published vectors or identities: integer⇄string `std.fmt` (parse/format, radix,
+`i64::MIN`), `std.ascii` classifiers, generic `std.mem` search, more `std.math`
+(`isPrime`/`modPow`/alignment/digit ops), `std.str` case/search, **`std.hash`**
+(CRC-32/Adler-32/FNV-1a, vector-checked), **`std.sort`** `heapSort`/`mergeSort`,
+**`std.mathf`** (`sqrt`/`exp`/`sin`/`cos`/`tan`/`ln`/`pow` from scratch, ≈1e-12),
+and **`std.bits`** (byte-swap/rotate/single-bit). Eight new end-to-end example
+programs (word-count, base conversion, prime sieve, RLE, Caesar cipher, statistics,
+anagram, geometry, config parser) each have an exact-output test. Alongside,
+**`++` string concatenation** is fixed — it folded to `undef` and trapped on use;
+the checker now records the folded bytes by span and the MIR materializes a
+`Const::Str`.
+
+## v0.39 — No silent builtins ✅
+
+Every `@builtin` is validated against a `KNOWN_BUILTINS` allowlist (the typed
+builtins plus the raw/intrinsic and `@build*` graph builtins the std and build
+system use). An unimplemented name — a typo, or a Zig-ism k2 spells differently
+(`@divTrunc`/`@rem` → `/`, `%`; `@divFloor`/`@mod` → `std.math.divFloor`/`mod`) —
+is now `unknown builtin \`@…\`` at the call site, where it used to type-check as
+`Deferred` and lower to a silent `undef` that ran and printed `<int>`. Closes a
+"never miscompile" gap; pinned by a cli test.
+
+## v0.38 — Recursive containers (leak analysis + first BST) ✅
+
+The conservative leak pass now treats an allocation stored THROUGH a pointer
+(`(*self).left = node`) as an ownership transfer — previously only `return`, a
+paired free, and passing to a call counted, so a node-based structure tripped a
+false "never freed". With that and the v0.37 `?*@This()` fix, the first recursive
+container lands: **`std.BstNode(T)`**, a self-referential binary-search-tree node
+(`insert`/`contains`/`count`/`height`/`min`/`max`/`freeChildren`). Genuine leaks
+are still caught (verified). A clean generic *wrapper* (`root: ?*Node`) still
+awaits memoizing a generic struct's nested type-const, so today's API is
+node-based (the caller owns the root). Pinned by `conformance/10-stdlib/bst_node.k2`.
+
+## v0.37 — Self-referential struct types ✅
+
+A struct field may now point to its own type with `?*@This()` — the foundation for
+linked lists, trees, and graphs — for both a top-level `struct` (also reachable by
+its bare name, `?*Node`) and a generic node `Node(T)`. The type evaluator was
+made two-phase on both the static (`eval_struct`) and the generic
+(`eval_struct_comptime`) paths: a field-less shell is interned and exposed first,
+the fields are evaluated against it, then patched in. Previously such a field
+resolved to `?*deferred` and could not hold a real node pointer. Pinned by
+`conformance/02-types/recursive_types.k2`; full suite green. A field naming a
+*sibling* type const (`head: ?*Node`) is a separate decl-ordering gap, still open.
+
+## v0.36 — Standard-library breadth ✅
+
+A pure (or single-allocator) expansion of `std`, all VM-verified by the
+`conformance/10-stdlib` corpus: **`std.str`** (byte-string search/trim/compare),
+**`std.math`** (integer `isqrt`/`log2Int`/`popcount`/`clz`/`ctz`/`divFloor`/`mod`/
+saturating add-sub), **`std.mem`** (`fill`/`reverse`/`swap`/`indexOfScalar`/`count`/
+…), **`std.hex`** (encode/decode), and two allocator-owned containers,
+**`std.RingBuffer(T)`** (circular FIFO) and **`std.BitSet`** (dense bit array).
+Bringing up `std.str` flushed out a VM bug — slicing a string LITERAL
+(`"x"[1..]`) produced a null-pointer slice — now fixed (native was already
+correct). The container `init`s, like the other generics, are cleanly refused by
+the native subset and run on the VM.
+
 ## Beyond 0.30
 
 Full multi-platform self-hosting, an LLVM-grade optimizing middle-end,
@@ -319,14 +497,15 @@ package ecosystem — pursued once the language surface is stable at 1.0.
 A few known limitations are deferred here deliberately, each a *clean refusal*
 today rather than a miscompile:
 
-- **`union(enum)` runtime values.** Tagged (and bare) unions are accepted by the
-  whole front-end — they parse, resolve, type-check, format, and document — but
-  the backends do not yet store/retrieve a union's payload at run time. Rather
-  than silently miscompile (the construction would otherwise lower to a plain
-  struct aggregate and read back `undefined`), constructing a `union` value is a
-  **clean compile-time refusal** today; `k2c check` still accepts the program.
-  Model a sum type as an `enum` tag plus a payload `struct` until the union
-  runtime lands. (`crates/k2c/tests/cli.rs` pins the refusal.)
+- **`union(enum)` runtime values — landed in v0.31.** Tagged unions now store and
+  retrieve their payload at run time on the VM (scalar AND aggregate payloads)
+  and on the native x86-64 backend (scalar/`void` payloads). A union is a tag
+  word plus a payload area sized to its largest variant; `switch` reads the tag
+  and binds each arm's capture to the active payload. The one remaining gap is a
+  *clean refusal*, never a miscompile: a variant with an **aggregate** (`struct`/
+  array/slice) payload runs on the VM but is outside the native subset, so native
+  refuses it. Bare untagged `union {…}` construction is likewise refused (no
+  runtime discriminant). See the v0.31 milestone below.
 - **Runtime `inline for`.** `inline for` unrolls in comptime-forced contexts
   (array lengths, `const` initializers), but a runtime-effectful `inline for`
   body — including iterating `@typeInfo(T).Struct.fields` to *print* each field's
@@ -335,13 +514,10 @@ today rather than a miscompile:
   surface that *does* work (type inspection, `@sizeOf`, compile-time field
   validation, reflection-driven array sizing); full runtime reflection printing
   waits on this.
-- **Spec §1.3 lone `\r`.** The lexer treats a lone carriage return as whitespace
-  (a lenient, common choice); the spec calls it a lexical error. The two will be
-  reconciled — most likely by relaxing the spec to match — as part of the
-  conformance work.
 - **Wider native subset.** Generic containers with aggregate elements, fibers,
-  and the fs/net/time syscalls run on the VM and are cleanly refused by the
-  native backend; broadening native coverage is incremental future work.
+  the fs/net/time syscalls, and `union(enum)` variants with an **aggregate**
+  payload run on the VM and are cleanly refused by the native backend;
+  broadening native coverage is incremental future work.
 
 ## 1.0 goals
 

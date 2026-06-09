@@ -1,0 +1,46 @@
+// string_math_hex.k2 — the pure (allocation-free) stdlib additions: `std.str`
+// byte-string search/trim, `std.hex` codecs, `std.mem` slice utilities, and the
+// integer-`std.math` functions. All operate on caller-owned buffers / slices, so
+// this stays in the native subset and runs byte-identically on both backends.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // std.str — search and trimming over byte strings.
+    const s = "  hello, world  ";
+    const t = std.str.trim(s);
+    try out.print("trim=[{s}] len={d}\n", .{ t, t.len });
+    try out.print("indexOf(world)={d} starts={} ends={} count(l)={d}\n", .{
+        std.str.indexOf(t, "world").?,
+        std.str.startsWith(t, "hello"),
+        std.str.endsWith(t, "world"),
+        std.str.countSubstr(t, "l"),
+    });
+    try out.print("cmp(abc,abd)={d} less(ab,abc)={}\n", .{
+        std.str.compare("abc", "abd"),
+        std.str.lessThan("ab", "abc"),
+    });
+
+    // std.math — integer bit / arithmetic functions.
+    try out.print("isqrt(1000)={d} log2(1024)={d} pop(255)={d} ctz(40)={d}\n", .{
+        std.math.isqrt(1000), std.math.log2Int(1024), std.math.popcount(255), std.math.ctz(40),
+    });
+    try out.print("divFloor(-7,2)={d} mod(-1,3)={d} pow2(128)={} satSub(3,9)={d}\n", .{
+        std.math.divFloor(-7, 2), std.math.mod(-1, 3), std.math.isPowerOfTwo(128), std.math.satSubU64(3, 9),
+    });
+
+    // std.hex — encode round-trips through decode.
+    var hbuf: [16]u8 = undefined;
+    const enc = std.hex.encode(&hbuf, "k2!");
+    var dbuf: [8]u8 = undefined;
+    const n = std.hex.decode(&dbuf, enc).?;
+    try out.print("hex(k2!)={s} decode=[{s}] n={d}\n", .{ enc, dbuf[0..n], n });
+
+    // std.mem — in-place slice utilities.
+    var arr = [_]i64{ 3, 1, 4, 1, 5, 9 };
+    std.mem.reverse(i64, &arr);
+    try out.print("rev[0]={d} idxOf(4)={d} count(1)={d} contains(2)={}\n", .{
+        arr[0], std.mem.indexOfScalar(i64, &arr, 4).?, std.mem.count(i64, &arr, 1), std.mem.contains(i64, &arr, 2),
+    });
+}

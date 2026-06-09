@@ -1,0 +1,45 @@
+//! projectile.k2 — a real program: projectile motion (no air resistance) computed
+//! with the verified `std.mathf` trigonometry. For launch speed `v` and angle `θ`,
+//! it reports the range, peak height, and flight time, plus the angle that
+//! maximizes range (45°). Results are rounded to 3 decimals so the float output
+//! reads cleanly and deterministically.
+
+const std = @import("std");
+
+const g: f64 = 9.8; // m/s²
+
+/// Round `x` to 3 decimal places.
+fn r3(x: f64) f64 {
+    return std.mathf.round(x * 1000.0) / 1000.0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const v: f64 = 20.0; // m/s
+    const deg: f64 = 30.0;
+    const theta = std.mathf.degToRad(deg);
+
+    const s = std.mathf.sin(theta);
+    const c = std.mathf.cos(theta);
+
+    // Standard projectile formulae.
+    const range = (v * v * 2.0 * s * c) / g; // v²·sin(2θ)/g
+    const peak = (v * v * s * s) / (2.0 * g); // v²·sin²θ/(2g)
+    const flight = (2.0 * v * s) / g; // 2v·sinθ/g
+
+    try out.print("v={d} angle={d}deg: range={d}m peak={d}m flight={d}s\n", .{
+        v, deg, r3(range), r3(peak), r3(flight),
+    });
+
+    // The range is maximized at 45 degrees (sin(2θ)=1).
+    const best = std.mathf.degToRad(45.0);
+    const max_range = (v * v * 2.0 * std.mathf.sin(best) * std.mathf.cos(best)) / g;
+    try out.print("max range (at 45deg): {d}m\n", .{r3(max_range)});
+
+    // Recover the launch angle from a velocity vector (vx, vy) via atan.
+    const vx = v * c;
+    const vy = v * s;
+    const recovered_deg = std.mathf.radToDeg(std.mathf.atan(vy / vx));
+    try out.print("recovered angle from (vx,vy): {d}deg\n", .{r3(recovered_deg)});
+}

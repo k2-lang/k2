@@ -1,0 +1,63 @@
+//! run_length.k2 — a real round-trip: run-length-encode a byte string into a
+//! caller buffer and decode it back, checking the result matches and reporting the
+//! compression ratio. Pure buffer work (no allocator); demonstrates `@intCast`,
+//! slicing, and `std.str.equal` over the decoded output.
+
+const std = @import("std");
+
+/// Encode `src` into `dst` as (run-length, byte) pairs; runs are capped at 255.
+/// Returns the number of bytes written. `dst` needs up to `2 * src.len`.
+fn rleEncode(dst: []u8, src: []const u8) usize {
+    var di: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const b = src[i];
+        var run: usize = 1;
+        while (i + run < src.len and src[i + run] == b and run < 255) run += 1;
+        dst[di] = @as(u8, @intCast(run));
+        dst[di + 1] = b;
+        di += 2;
+        i += run;
+    }
+    return di;
+}
+
+/// Decode `src` (a stream of (run-length, byte) pairs) into `dst`, returning the
+/// number of bytes written.
+fn rleDecode(dst: []u8, src: []const u8) usize {
+    var di: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < src.len) {
+        const run: usize = @as(usize, src[i]);
+        const b = src[i + 1];
+        var k: usize = 0;
+        while (k < run) : (k += 1) {
+            dst[di] = b;
+            di += 1;
+        }
+        i += 2;
+    }
+    return di;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const text = "aaaaabbbcccccccdddddddddddddddddddddeeeeeeeeeeffffffffffffffffffff";
+
+    var enc: [256]u8 = undefined;
+    const elen = rleEncode(&enc, text);
+
+    var dec: [256]u8 = undefined;
+    const dlen = rleDecode(&dec, enc[0..elen]);
+
+    const ok = std.str.equal(text, dec[0..dlen]);
+    try out.print("original={d} encoded={d} decoded={d} roundtrip={}\n", .{
+        text.len, elen, dlen, ok,
+    });
+
+    // Compression ratio in tenths (encoded*10 / original), so "highly run-heavy"
+    // text compresses below 10.
+    const ratio_tenths = std.math.divCeil(@as(u64, elen) * 10, @as(u64, text.len));
+    try out.print("ratio (x10): {d}\n", .{ratio_tenths});
+}

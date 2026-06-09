@@ -1,0 +1,2 @@
+letters=52 digits=10 hex=22 punct=32 upper=26
+ctrl(0,31,127)=3 print(0x20,0x7e)=2 hexValue(a..f sum)=75

@@ -1,0 +1,29 @@
+// mem_search.k2 — the generic `std.mem` slice predicates `startsWith`/`endsWith`/
+// `indexOf` (sub-slice search over any element type) and `allInRange`. Exercised
+// over `i64` slices. VM case (slice-of-slice args fall outside the native subset).
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const data = [_]i64{ 10, 20, 30, 40, 50, 30, 40, 99 };
+    const head = [_]i64{ 10, 20 };
+    const tail = [_]i64{ 40, 99 };
+    const pat = [_]i64{ 30, 40 };
+    const empty = [_]i64{};
+
+    try out.print("starts={} ends={} startsBad={}\n", .{
+        std.mem.startsWith(i64, &data, &head),
+        std.mem.endsWith(i64, &data, &tail),
+        std.mem.startsWith(i64, &data, &tail),
+    });
+    try out.print("indexOf={d} emptyNeedle={d} missing={}\n", .{
+        std.mem.indexOf(i64, &data, &pat).?,
+        std.mem.indexOf(i64, &data, &empty).?,
+        std.mem.indexOf(i64, &data, &[_]i64{ 99, 99 }) == null,
+    });
+    try out.print("inRange[10,99]={} inRange[10,50]={}\n", .{
+        std.mem.allInRange(i64, &data, 10, 99),
+        std.mem.allInRange(i64, &data, 10, 50),
+    });
+}

@@ -1,0 +1,35 @@
+// combinatorics.k2 — `std.math.binomial` (n choose k) and `permutations` (falling
+// factorial). Checked against classic values (C(52,5)=2598960 poker hands) and
+// identities (symmetry C(n,k)=C(n,n-k); Pascal's rule; row sum = 2^n). Pure
+// integer math, `{d}` only — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Known values, edges, and the k>n case.
+    try out.print("C: 5,2={d} 10,3={d} 52,5={d} nn={d} n0={d} kn={d}\n", .{
+        std.math.binomial(5, 2),
+        std.math.binomial(10, 3),
+        std.math.binomial(52, 5),
+        std.math.binomial(9, 9),
+        std.math.binomial(9, 0),
+        std.math.binomial(3, 8),
+    });
+    try out.print("P: 5,2={d} 10,3={d} 6,6={d} kn={d}\n", .{
+        std.math.permutations(5, 2),
+        std.math.permutations(10, 3),
+        std.math.permutations(6, 6),
+        std.math.permutations(3, 8),
+    });
+
+    // Symmetry: C(20,7) == C(20,13).
+    const sym: u8 = if (std.math.binomial(20, 7) == std.math.binomial(20, 13)) 1 else 0;
+    // Pascal's rule: C(15,6) == C(14,5) + C(14,6).
+    const pascal: u8 = if (std.math.binomial(15, 6) == std.math.binomial(14, 5) + std.math.binomial(14, 6)) 1 else 0;
+    // Row sum: sum_k C(10,k) == 2^10 == 1024.
+    var row: u64 = 0;
+    var k: u64 = 0;
+    while (k <= 10) : (k += 1) row += std.math.binomial(10, k);
+    try out.print("symmetry={d} pascal={d} row10={d}\n", .{ sym, pascal, row });
+}

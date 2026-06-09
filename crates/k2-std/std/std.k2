@@ -41,6 +41,558 @@ pub const mem = struct {
         }
         return true;
     }
+
+    /// Set every element of `slice` to `value`.
+    pub fn fill(comptime T: type, slice: []T, value: T) void {
+        var i: usize = 0;
+        while (i < slice.len) : (i += 1) slice[i] = value;
+    }
+
+    /// Reverse `slice` in place.
+    pub fn reverse(comptime T: type, slice: []T) void {
+        if (slice.len == 0) return;
+        var i: usize = 0;
+        var j: usize = slice.len - 1;
+        while (i < j) {
+            const t = slice[i];
+            slice[i] = slice[j];
+            slice[j] = t;
+            i += 1;
+            j -= 1;
+        }
+    }
+
+    /// Swap the elements at indices `i` and `j` (must both be in bounds).
+    pub fn swap(comptime T: type, slice: []T, i: usize, j: usize) void {
+        const t = slice[i];
+        slice[i] = slice[j];
+        slice[j] = t;
+    }
+
+    /// The index of the first element equal to `needle`, or `null`.
+    pub fn indexOfScalar(comptime T: type, slice: []const T, needle: T) ?usize {
+        var i: usize = 0;
+        while (i < slice.len) : (i += 1) {
+            if (slice[i] == needle) return i;
+        }
+        return null;
+    }
+
+    /// The index of the LAST element equal to `needle`, or `null`.
+    pub fn lastIndexOfScalar(comptime T: type, slice: []const T, needle: T) ?usize {
+        var i: usize = slice.len;
+        while (i > 0) {
+            i -= 1;
+            if (slice[i] == needle) return i;
+        }
+        return null;
+    }
+
+    /// `true` if `slice` contains an element equal to `needle`.
+    pub fn contains(comptime T: type, slice: []const T, needle: T) bool {
+        return indexOfScalar(T, slice, needle) != null;
+    }
+
+    /// The number of elements of `slice` equal to `needle`.
+    pub fn count(comptime T: type, slice: []const T, needle: T) usize {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < slice.len) : (i += 1) {
+            if (slice[i] == needle) n += 1;
+        }
+        return n;
+    }
+
+    /// The number of leading elements for which `a` and `b` agree (the common
+    /// prefix length). Stops at the shorter length.
+    pub fn commonPrefixLen(comptime T: type, a: []const T, b: []const T) usize {
+        const n = if (a.len < b.len) a.len else b.len;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (a[i] != b[i]) return i;
+        }
+        return n;
+    }
+
+    /// `true` if `slice` begins with `prefix` (element-wise).
+    pub fn startsWith(comptime T: type, slice: []const T, prefix: []const T) bool {
+        if (prefix.len > slice.len) return false;
+        var i: usize = 0;
+        while (i < prefix.len) : (i += 1) {
+            if (slice[i] != prefix[i]) return false;
+        }
+        return true;
+    }
+
+    /// `true` if `slice` ends with `suffix` (element-wise).
+    pub fn endsWith(comptime T: type, slice: []const T, suffix: []const T) bool {
+        if (suffix.len > slice.len) return false;
+        const off = slice.len - suffix.len;
+        var i: usize = 0;
+        while (i < suffix.len) : (i += 1) {
+            if (slice[off + i] != suffix[i]) return false;
+        }
+        return true;
+    }
+
+    /// The index of the first occurrence of the sub-slice `needle` in `haystack`,
+    /// or `null`. An empty needle matches at 0. Naive O(n*m) scan.
+    pub fn indexOf(comptime T: type, haystack: []const T, needle: []const T) ?usize {
+        if (needle.len == 0) return 0;
+        if (needle.len > haystack.len) return null;
+        const last = haystack.len - needle.len;
+        var i: usize = 0;
+        while (i <= last) : (i += 1) {
+            var j: usize = 0;
+            while (j < needle.len and haystack[i + j] == needle[j]) j += 1;
+            if (j == needle.len) return i;
+        }
+        return null;
+    }
+
+    /// `true` if `min <= x <= max` for the slice's elements all within `[lo, hi]`.
+    /// (Convenience: every element in range.)
+    pub fn allInRange(comptime T: type, slice: []const T, lo: T, hi: T) bool {
+        var i: usize = 0;
+        while (i < slice.len) : (i += 1) {
+            if (slice[i] < lo or slice[i] > hi) return false;
+        }
+        return true;
+    }
+};
+
+// =========================================================================
+//  str — byte-string (`[]const u8`) search and trimming
+// =========================================================================
+
+/// Pure, allocation-free operations over byte strings. Search returns scalar
+/// byte indices; trimming returns sub-slices (no copy). These build on `mem`
+/// but specialize to `u8` for the common text-processing path.
+pub const str = struct {
+    /// `true` if `a` and `b` are byte-for-byte equal.
+    pub fn equal(a: []const u8, b: []const u8) bool {
+        return mem.eql(u8, a, b);
+    }
+
+    /// `true` if `s` begins with `prefix`.
+    pub fn startsWith(s: []const u8, prefix: []const u8) bool {
+        if (prefix.len > s.len) return false;
+        var i: usize = 0;
+        while (i < prefix.len) : (i += 1) {
+            if (s[i] != prefix[i]) return false;
+        }
+        return true;
+    }
+
+    /// `true` if `s` ends with `suffix`.
+    pub fn endsWith(s: []const u8, suffix: []const u8) bool {
+        if (suffix.len > s.len) return false;
+        const off = s.len - suffix.len;
+        var i: usize = 0;
+        while (i < suffix.len) : (i += 1) {
+            if (s[off + i] != suffix[i]) return false;
+        }
+        return true;
+    }
+
+    /// The index of the first occurrence of `needle` in `haystack`, or `null`. An
+    /// empty needle matches at 0. Naive O(n*m) scan (fine for short patterns).
+    pub fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
+        if (needle.len == 0) return 0;
+        if (needle.len > haystack.len) return null;
+        const last = haystack.len - needle.len;
+        var i: usize = 0;
+        while (i <= last) : (i += 1) {
+            var j: usize = 0;
+            while (j < needle.len and haystack[i + j] == needle[j]) j += 1;
+            if (j == needle.len) return i;
+        }
+        return null;
+    }
+
+    /// `true` if `needle` occurs anywhere in `haystack`.
+    pub fn contains(haystack: []const u8, needle: []const u8) bool {
+        return indexOf(haystack, needle) != null;
+    }
+
+    /// The number of NON-overlapping occurrences of `needle` in `haystack`.
+    pub fn countSubstr(haystack: []const u8, needle: []const u8) usize {
+        if (needle.len == 0) return 0;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) {
+            var j: usize = 0;
+            while (j < needle.len and haystack[i + j] == needle[j]) j += 1;
+            if (j == needle.len) {
+                n += 1;
+                i += needle.len;
+            } else {
+                i += 1;
+            }
+        }
+        return n;
+    }
+
+    /// `s` with leading ASCII whitespace removed (a sub-slice, no copy).
+    pub fn trimLeft(s: []const u8) []const u8 {
+        var i: usize = 0;
+        while (i < s.len and ascii.isWhitespace(s[i])) i += 1;
+        return s[i..s.len];
+    }
+
+    /// `s` with trailing ASCII whitespace removed (a sub-slice, no copy).
+    pub fn trimRight(s: []const u8) []const u8 {
+        var j: usize = s.len;
+        while (j > 0 and ascii.isWhitespace(s[j - 1])) j -= 1;
+        return s[0..j];
+    }
+
+    /// `s` with both leading and trailing ASCII whitespace removed.
+    pub fn trim(s: []const u8) []const u8 {
+        return trimRight(trimLeft(s));
+    }
+
+    /// Lexicographic byte comparison: `< 0` if `a < b`, `0` if equal, `> 0` if
+    /// `a > b`. A shorter prefix sorts before its extension.
+    pub fn compare(a: []const u8, b: []const u8) i32 {
+        const n = if (a.len < b.len) a.len else b.len;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (a[i] < b[i]) return -1;
+            if (a[i] > b[i]) return 1;
+        }
+        if (a.len < b.len) return -1;
+        if (a.len > b.len) return 1;
+        return 0;
+    }
+
+    /// `true` if `a` sorts strictly before `b` lexicographically.
+    pub fn lessThan(a: []const u8, b: []const u8) bool {
+        return compare(a, b) < 0;
+    }
+
+    /// `true` if `a` and `b` are equal ignoring ASCII letter case.
+    pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        var i: usize = 0;
+        while (i < a.len) : (i += 1) {
+            if (ascii.toLower(a[i]) != ascii.toLower(b[i])) return false;
+        }
+        return true;
+    }
+
+    /// `true` if `s` contains the single byte `c`.
+    pub fn containsScalar(s: []const u8, c: u8) bool {
+        return mem.indexOfScalar(u8, s, c) != null;
+    }
+
+    /// Count the non-overlapping fields of `s` split on the single byte `sep`
+    /// (`"a,,b"` split on `,` is 3 fields). An empty string is one field.
+    pub fn countSplit(s: []const u8, sep: u8) usize {
+        var n: usize = 1;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            if (s[i] == sep) n += 1;
+        }
+        return n;
+    }
+
+    /// A forward iterator over the `sep`-separated fields of a string. Each `next`
+    /// returns the next field as a SUB-SLICE of the original (no copy, no
+    /// allocation); the count matches `countSplit`. Drained when `next` returns
+    /// `null`.
+    pub const SplitIterator = struct {
+        s: []const u8,
+        sep: u8,
+        pos: usize,
+        done: bool,
+
+        /// The next field, or `null` once every field has been yielded.
+        pub fn next(self: *@This()) ?[]const u8 {
+            if (self.done) return null;
+            const start = self.pos;
+            var i = self.pos;
+            while (i < self.s.len and self.s[i] != self.sep) i += 1;
+            const field = self.s[start..i];
+            if (i < self.s.len) {
+                self.pos = i + 1;
+            } else {
+                self.done = true;
+            }
+            return field;
+        }
+    };
+
+    /// A `SplitIterator` over `s` divided on the single byte `sep`. `"a,b,c"` split
+    /// on `,` yields `"a"`, `"b"`, `"c"`; a trailing/leading `sep` yields an empty
+    /// field, exactly as `countSplit` counts.
+    pub fn splitScalar(s: []const u8, sep: u8) SplitIterator {
+        return SplitIterator{ .s = s, .sep = sep, .pos = 0, .done = false };
+    }
+
+    /// Concatenate `parts` with `sep` between them into a freshly allocated buffer
+    /// (the caller owns and frees it). `join(a, &.{}, sep)` is an empty string.
+    pub fn join(alloc: Allocator, parts: []const []const u8, sep: []const u8) ![]u8 {
+        var total: usize = 0;
+        var i: usize = 0;
+        while (i < parts.len) : (i += 1) total += parts[i].len;
+        if (parts.len > 1) total += sep.len * (parts.len - 1);
+        const out = try alloc.alloc(u8, total);
+        var pos: usize = 0;
+        i = 0;
+        while (i < parts.len) : (i += 1) {
+            if (i > 0) {
+                mem.copy(u8, out[pos .. pos + sep.len], sep);
+                pos += sep.len;
+            }
+            mem.copy(u8, out[pos .. pos + parts[i].len], parts[i]);
+            pos += parts[i].len;
+        }
+        return out;
+    }
+
+    /// Copy `s` into `dst` (at least `s.len` long), lowercasing ASCII letters, and
+    /// return the written sub-slice.
+    pub fn toLowerInto(dst: []u8, s: []const u8) []u8 {
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) dst[i] = ascii.toLower(s[i]);
+        return dst[0..s.len];
+    }
+
+    /// Copy `s` into `dst` (at least `s.len` long), uppercasing ASCII letters, and
+    /// return the written sub-slice.
+    pub fn toUpperInto(dst: []u8, s: []const u8) []u8 {
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) dst[i] = ascii.toUpper(s[i]);
+        return dst[0..s.len];
+    }
+
+    /// The index of the LAST occurrence of the sub-slice `needle` in `haystack`, or
+    /// `null`. An empty needle matches at `haystack.len`.
+    pub fn lastIndexOf(haystack: []const u8, needle: []const u8) ?usize {
+        if (needle.len == 0) return haystack.len;
+        if (needle.len > haystack.len) return null;
+        var i: usize = haystack.len - needle.len + 1;
+        while (i > 0) {
+            i -= 1;
+            var j: usize = 0;
+            while (j < needle.len and haystack[i + j] == needle[j]) j += 1;
+            if (j == needle.len) return i;
+        }
+        return null;
+    }
+
+    /// The index of the first occurrence of `needle` in `haystack` at or after
+    /// `start`, or `null`.
+    pub fn indexOfPos(haystack: []const u8, needle: []const u8, start: usize) ?usize {
+        if (start > haystack.len) return null;
+        const rel = indexOf(haystack[start..haystack.len], needle);
+        if (rel == null) return null;
+        return start + rel.?;
+    }
+};
+
+// =========================================================================
+//  hex — hexadecimal encode / decode (no allocation; caller supplies buffers)
+// =========================================================================
+
+/// Lowercase hexadecimal codecs over caller-provided buffers — no allocation.
+/// Encoding needs `2 * src.len` output bytes; decoding needs `src.len / 2`.
+pub const hex = struct {
+    const digits = "0123456789abcdef";
+
+    /// Writes the lowercase hex of `src` into `dst` (which must be at least
+    /// `2 * src.len` long) and returns the written sub-slice.
+    pub fn encode(dst: []u8, src: []const u8) []u8 {
+        var i: usize = 0;
+        while (i < src.len) : (i += 1) {
+            const b = src[i];
+            dst[i * 2] = digits[@as(usize, b >> 4)];
+            dst[i * 2 + 1] = digits[@as(usize, b & 0x0F)];
+        }
+        return dst[0 .. src.len * 2];
+    }
+
+    /// The value `0..=15` of a single hex digit, or `null` if `c` is not one.
+    pub fn nibble(c: u8) ?u8 {
+        if (c >= '0' and c <= '9') return c - '0';
+        if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+        return null;
+    }
+
+    /// Decodes hex `src` (even length, valid digits) into `dst` (at least
+    /// `src.len / 2` long). Returns the number of bytes written, or `null` on an
+    /// odd length or a non-hex digit.
+    pub fn decode(dst: []u8, src: []const u8) ?usize {
+        if (src.len % 2 != 0) return null;
+        const n = src.len / 2;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const hi = nibble(src[i * 2]);
+            const lo = nibble(src[i * 2 + 1]);
+            if (hi == null or lo == null) return null;
+            dst[i] = (hi.? << 4) | lo.?;
+        }
+        return n;
+    }
+};
+
+// =========================================================================
+//  base64 — standard RFC 4648 base64 (with `=` padding), caller buffers
+// =========================================================================
+
+/// Standard base64 (`A–Z a–z 0–9 + /`, `=`-padded), encoding/decoding through
+/// caller-provided buffers — no allocation. `encodedLen`/`decodedLen` size the
+/// output. Decoding rejects a wrong length or a non-alphabet byte with `null`.
+pub const base64 = struct {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// The exact encoded length for `n` input bytes: `4 * ceil(n / 3)`.
+    pub fn encodedLen(n: usize) usize {
+        return ((n + 2) / 3) * 4;
+    }
+
+    /// An upper bound on the decoded length for `n` base64 bytes: `3 * (n / 4)`.
+    pub fn decodedLen(n: usize) usize {
+        return (n / 4) * 3;
+    }
+
+    /// Encodes `src` into `dst` (at least `encodedLen(src.len)` long) and returns
+    /// the written sub-slice. The final group is `=`-padded.
+    pub fn encode(dst: []u8, src: []const u8) []u8 {
+        var di: usize = 0;
+        var si: usize = 0;
+        // Whole 3-byte groups -> 4 chars.
+        while (si + 3 <= src.len) {
+            const n = (@as(u32, src[si]) << 16) | (@as(u32, src[si + 1]) << 8) | @as(u32, src[si + 2]);
+            dst[di] = alphabet[@as(usize, (n >> 18) & 0x3F)];
+            dst[di + 1] = alphabet[@as(usize, (n >> 12) & 0x3F)];
+            dst[di + 2] = alphabet[@as(usize, (n >> 6) & 0x3F)];
+            dst[di + 3] = alphabet[@as(usize, n & 0x3F)];
+            si += 3;
+            di += 4;
+        }
+        // A trailing 1- or 2-byte group, padded with `=`.
+        const rem = src.len - si;
+        if (rem == 1) {
+            const n = @as(u32, src[si]) << 16;
+            dst[di] = alphabet[@as(usize, (n >> 18) & 0x3F)];
+            dst[di + 1] = alphabet[@as(usize, (n >> 12) & 0x3F)];
+            dst[di + 2] = '=';
+            dst[di + 3] = '=';
+            di += 4;
+        } else if (rem == 2) {
+            const n = (@as(u32, src[si]) << 16) | (@as(u32, src[si + 1]) << 8);
+            dst[di] = alphabet[@as(usize, (n >> 18) & 0x3F)];
+            dst[di + 1] = alphabet[@as(usize, (n >> 12) & 0x3F)];
+            dst[di + 2] = alphabet[@as(usize, (n >> 6) & 0x3F)];
+            dst[di + 3] = '=';
+            di += 4;
+        }
+        return dst[0..di];
+    }
+
+    /// The 0..=63 value of a base64 alphabet byte, or `null` (`=` is not a value).
+    fn sextet(c: u8) ?u32 {
+        if (c >= 'A' and c <= 'Z') return @as(u32, c - 'A');
+        if (c >= 'a' and c <= 'z') return @as(u32, c - 'a' + 26);
+        if (c >= '0' and c <= '9') return @as(u32, c - '0' + 52);
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return null;
+    }
+
+    /// Decodes base64 `src` (length a multiple of 4) into `dst`, returning the
+    /// number of bytes written, or `null` on a bad length or non-alphabet byte.
+    pub fn decode(dst: []u8, src: []const u8) ?usize {
+        if (src.len % 4 != 0) return null;
+        if (src.len == 0) return 0;
+        var di: usize = 0;
+        var si: usize = 0;
+        while (si < src.len) {
+            const c0 = sextet(src[si]);
+            const c1 = sextet(src[si + 1]);
+            if (c0 == null or c1 == null) return null;
+            var n = (c0.? << 18) | (c1.? << 12);
+            var out: usize = 1;
+            // The third character: `=` ends the data after one output byte.
+            if (src[si + 2] != '=') {
+                const c2 = sextet(src[si + 2]);
+                if (c2 == null) return null;
+                n = n | (c2.? << 6);
+                out = 2;
+                if (src[si + 3] != '=') {
+                    const c3 = sextet(src[si + 3]);
+                    if (c3 == null) return null;
+                    n = n | c3.?;
+                    out = 3;
+                }
+            }
+            dst[di] = @as(u8, @intCast((n >> 16) & 0xFF));
+            if (out >= 2) dst[di + 1] = @as(u8, @intCast((n >> 8) & 0xFF));
+            if (out >= 3) dst[di + 2] = @as(u8, @intCast(n & 0xFF));
+            di += out;
+            si += 4;
+        }
+        return di;
+    }
+};
+
+// =========================================================================
+//  hash — non-cryptographic checksums and digests (pure, no allocation)
+// =========================================================================
+
+/// Pure, allocation-free hashes and checksums over a byte slice. None is a
+/// cryptographic hash. Each avoids a wrapping multiply (k2 has none) — FNV-1a is
+/// masked to 32 bits each step, CRC-32 uses only XOR/shift, Adler-32 only add/mod.
+pub const hash = struct {
+    /// 32-bit FNV-1a. Masking to 32 bits each step keeps `h * prime` below 2^56, so
+    /// the multiply never overflows a `u64`.
+    pub fn fnv1a32(data: []const u8) u32 {
+        var h: u64 = 2166136261;
+        const prime: u64 = 16777619;
+        const m: u64 = 0xFFFFFFFF;
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            h = h ^ @as(u64, data[i]);
+            h = (h * prime) & m;
+        }
+        return @as(u32, @intCast(h));
+    }
+
+    /// CRC-32 (IEEE 802.3, reflected polynomial `0xEDB88320`), computed bit by bit
+    /// — XOR and shifts only.
+    pub fn crc32(data: []const u8) u32 {
+        var crc: u32 = 0xFFFF_FFFF;
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            crc = crc ^ @as(u32, data[i]);
+            var k: u32 = 0;
+            while (k < 8) : (k += 1) {
+                if (crc & 1 == 1) {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc = crc >> 1;
+                }
+            }
+        }
+        return crc ^ 0xFFFF_FFFF;
+    }
+
+    /// Adler-32 (RFC 1950): two rolling sums mod 65521, packed `(b << 16) | a`. Each
+    /// running sum stays below the modulus, so add and `%` never overflow `u32`.
+    pub fn adler32(data: []const u8) u32 {
+        const md: u32 = 65521;
+        var a: u32 = 1;
+        var b: u32 = 0;
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            a = (a + @as(u32, data[i])) % md;
+            b = (b + a) % md;
+        }
+        return (b << 16) | a;
+    }
 };
 
 // =========================================================================
@@ -272,6 +824,74 @@ pub fn ArrayList(comptime T: type) type {
         pub fn get(self: *const Self, index: usize) ?T {
             if (index >= self.items.len) return null;
             return self.items[index];
+        }
+
+        /// Overwrite the element at `index` (must be in bounds).
+        pub fn set(self: *Self, index: usize, value: T) void {
+            self.items[index] = value;
+        }
+
+        /// The last element, or `null` if empty.
+        pub fn getLast(self: *const Self) ?T {
+            if (self.items.len == 0) return null;
+            return self.items[self.items.len - 1];
+        }
+
+        /// Remove and return the last element, or `null` if empty (O(1)).
+        pub fn pop(self: *Self) ?T {
+            const n = self.items.len;
+            if (n == 0) return null;
+            const v = self.items[n - 1];
+            self.items = self.store[0 .. n - 1];
+            return v;
+        }
+
+        /// Append every element of `slice`, growing once to fit.
+        pub fn appendSlice(self: *Self, slice: []const T) !void {
+            const n = self.items.len;
+            try self.ensureCapacity(n + slice.len);
+            self.items = self.store[0 .. n + slice.len];
+            var i: usize = 0;
+            while (i < slice.len) : (i += 1) self.items[n + i] = slice[i];
+        }
+
+        /// Insert `value` at `index` (`0..=len`), shifting later elements right by
+        /// one. O(n) in the number of shifted elements.
+        pub fn insert(self: *Self, index: usize, value: T) !void {
+            const n = self.items.len;
+            try self.ensureCapacity(n + 1);
+            self.items = self.store[0 .. n + 1];
+            var i: usize = n;
+            while (i > index) : (i -= 1) self.items[i] = self.items[i - 1];
+            self.items[index] = value;
+        }
+
+        /// Remove and return the element at `index`, shifting later elements left
+        /// (order-preserving, O(n)). `null` if `index` is out of bounds.
+        pub fn removeAt(self: *Self, index: usize) ?T {
+            const n = self.items.len;
+            if (index >= n) return null;
+            const v = self.items[index];
+            var i: usize = index;
+            while (i + 1 < n) : (i += 1) self.items[i] = self.items[i + 1];
+            self.items = self.store[0 .. n - 1];
+            return v;
+        }
+
+        /// Remove the element at `index` by swapping the LAST element into its slot
+        /// (O(1), does NOT preserve order). `null` if `index` is out of bounds.
+        pub fn swapRemove(self: *Self, index: usize) ?T {
+            const n = self.items.len;
+            if (index >= n) return null;
+            const v = self.items[index];
+            self.items[index] = self.items[n - 1];
+            self.items = self.store[0 .. n - 1];
+            return v;
+        }
+
+        /// Drop all elements (capacity is retained; the storage is not freed).
+        pub fn clear(self: *Self) void {
+            self.items = self.store[0..0];
         }
     };
 }
@@ -754,6 +1374,95 @@ pub const sort = struct {
                 insertionRange(arr, 0, arr.len - 1);
             }
 
+            /// An in-place heap sort: O(n log n) WORST case and no extra memory (the
+            /// guarantee `sort`'s quicksort can't make on an adversarial input).
+            /// Builds a max-heap, then repeatedly moves the root to the shrinking
+            /// tail.
+            pub fn heapSort(arr: []T) void {
+                const n = arr.len;
+                if (n < 2) return;
+                // Heapify: sift down every internal node, last parent first.
+                var start: usize = n / 2;
+                while (start > 0) {
+                    start -= 1;
+                    siftDown(arr, start, n);
+                }
+                // Extract: swap the max (root) to the end, then restore the heap.
+                var end: usize = n;
+                while (end > 1) {
+                    end -= 1;
+                    const t = arr[0];
+                    arr[0] = arr[end];
+                    arr[end] = t;
+                    siftDown(arr, 0, end);
+                }
+            }
+
+            /// Restore the max-heap property at `start` within `arr[0..end]`.
+            fn siftDown(arr: []T, start: usize, end: usize) void {
+                var root = start;
+                while (2 * root + 1 < end) {
+                    var child = 2 * root + 1;
+                    if (child + 1 < end and Context.lessThan(arr[child], arr[child + 1])) {
+                        child += 1;
+                    }
+                    if (Context.lessThan(arr[root], arr[child])) {
+                        const t = arr[root];
+                        arr[root] = arr[child];
+                        arr[child] = t;
+                        root = child;
+                    } else {
+                        return;
+                    }
+                }
+            }
+
+            /// A STABLE merge sort using one allocator-owned scratch buffer of
+            /// `arr.len` elements (freed before return). O(n log n) guaranteed, and
+            /// — unlike `sort`/`heapSort` — equal elements keep their input order.
+            /// Fails only if the allocator is exhausted.
+            pub fn mergeSort(arr: []T, alloc: Allocator) !void {
+                if (arr.len < 2) return;
+                const scratch = try alloc.alloc(T, arr.len);
+                defer alloc.free(scratch);
+                mergeRange(arr, scratch, 0, arr.len);
+            }
+
+            /// Sort `arr[lo..hi]` in place, merging through `scratch`.
+            fn mergeRange(arr: []T, scratch: []T, lo: usize, hi: usize) void {
+                if (hi - lo < 2) return;
+                const mid = lo + (hi - lo) / 2;
+                mergeRange(arr, scratch, lo, mid);
+                mergeRange(arr, scratch, mid, hi);
+                // Merge the two sorted halves into scratch (left wins ties → stable).
+                var i: usize = lo;
+                var j: usize = mid;
+                var k: usize = lo;
+                while (i < mid and j < hi) {
+                    if (Context.lessThan(arr[j], arr[i])) {
+                        scratch[k] = arr[j];
+                        j += 1;
+                    } else {
+                        scratch[k] = arr[i];
+                        i += 1;
+                    }
+                    k += 1;
+                }
+                while (i < mid) {
+                    scratch[k] = arr[i];
+                    i += 1;
+                    k += 1;
+                }
+                while (j < hi) {
+                    scratch[k] = arr[j];
+                    j += 1;
+                    k += 1;
+                }
+                // Copy the merged run back.
+                k = lo;
+                while (k < hi) : (k += 1) arr[k] = scratch[k];
+            }
+
             /// `true` if `arr` is already in non-decreasing `Context` order.
             pub fn isSorted(arr: []const T) bool {
                 var i: usize = 1;
@@ -781,7 +1490,489 @@ pub const sort = struct {
                 }
                 return null;
             }
+
+            /// The first index `i` in the sorted `arr` where `target` could be
+            /// inserted to keep it sorted — i.e. the count of elements strictly
+            /// LESS than `target` (`std::lower_bound`). In `[0, arr.len]`.
+            pub fn lowerBound(arr: []const T, target: T) usize {
+                var lo: usize = 0;
+                var hi: usize = arr.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (Context.lessThan(arr[mid], target)) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                return lo;
+            }
+
+            /// The first index `i` in the sorted `arr` strictly PAST every element
+            /// `<= target` — i.e. the count of elements not greater than `target`
+            /// (`std::upper_bound`). `upperBound - lowerBound` is the multiplicity
+            /// of `target`.
+            pub fn upperBound(arr: []const T, target: T) usize {
+                var lo: usize = 0;
+                var hi: usize = arr.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (Context.lessThan(target, arr[mid])) {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                return lo;
+            }
+
+            /// Lomuto partition of `arr[lo..=hi]` around `arr[hi]`: moves smaller
+            /// elements left, returns the pivot's final index.
+            fn lomuto(arr: []T, lo: usize, hi: usize) usize {
+                const pivot = arr[hi];
+                var i = lo;
+                var j = lo;
+                while (j < hi) : (j += 1) {
+                    if (Context.lessThan(arr[j], pivot)) {
+                        const t = arr[i];
+                        arr[i] = arr[j];
+                        arr[j] = t;
+                        i += 1;
+                    }
+                }
+                const t = arr[i];
+                arr[i] = arr[hi];
+                arr[hi] = t;
+                return i;
+            }
+
+            /// The `k`-th smallest element (0-indexed) of `arr`, found in O(n)
+            /// average time by Hoare's quickselect — partitioning in place toward
+            /// the target rank without a full sort. `null` if `k >= arr.len`. NOTE:
+            /// `arr` is PARTIALLY reordered (everything `< result` ends up before
+            /// index `k`); pass a scratch copy if you need the original order.
+            pub fn quickselect(arr: []T, k: usize) ?T {
+                if (k >= arr.len) return null;
+                var lo: usize = 0;
+                var hi: usize = arr.len - 1;
+                while (true) {
+                    if (lo == hi) return arr[lo];
+                    const p = lomuto(arr, lo, hi);
+                    if (p == k) return arr[k];
+                    if (k < p) {
+                        hi = p - 1; // p > k >= 0, so p >= 1, no underflow
+                    } else {
+                        lo = p + 1;
+                    }
+                }
+            }
+
+            /// The lower median of `arr` (the `(len-1)/2`-th smallest), by
+            /// quickselect. `null` for an empty slice. Reorders `arr`.
+            pub fn median(arr: []T) ?T {
+                if (arr.len == 0) return null;
+                return quickselect(arr, (arr.len - 1) / 2);
+            }
         };
+    }
+};
+
+// =========================================================================
+//  RingBuffer — a fixed-capacity circular FIFO queue
+// =========================================================================
+
+/// A bounded first-in-first-out queue over a single allocator-owned buffer of
+/// `capacity + 1` slots (one slot is kept empty to distinguish full from empty).
+/// `push`/`pop` are O(1) with no per-element allocation; the whole buffer is freed
+/// once in `deinit`. Allocator-owned, like `ArrayList`.
+pub fn RingBuffer(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buf: []T,
+        head: usize, // index of the front element
+        tail: usize, // index one past the back element
+        alloc: Allocator,
+
+        /// A ring holding up to `capacity` elements (one extra slot is reserved).
+        pub fn init(alloc: Allocator, capacity: usize) !Self {
+            const slots = try alloc.alloc(T, capacity + 1);
+            return Self{ .buf = slots, .head = 0, .tail = 0, .alloc = alloc };
+        }
+
+        /// Free the backing buffer.
+        pub fn deinit(self: *Self) void {
+            if (self.buf.len != 0) self.alloc.free(self.buf);
+        }
+
+        /// The number of buffered elements.
+        pub fn len(self: *const Self) usize {
+            if (self.tail >= self.head) return self.tail - self.head;
+            return self.buf.len - self.head + self.tail;
+        }
+
+        /// `true` if no elements are buffered.
+        pub fn isEmpty(self: *const Self) bool {
+            return self.head == self.tail;
+        }
+
+        /// `true` if the ring cannot hold another element.
+        pub fn isFull(self: *const Self) bool {
+            return (self.tail + 1) % self.buf.len == self.head;
+        }
+
+        /// Enqueue `value` at the back; returns `error.NoSpaceLeft`-style refusal as
+        /// `false` (the ring is full) or `true` on success.
+        pub fn push(self: *Self, value: T) bool {
+            if (self.isFull()) return false;
+            self.buf[self.tail] = value;
+            self.tail = (self.tail + 1) % self.buf.len;
+            return true;
+        }
+
+        /// Dequeue the front element, or `null` if empty.
+        pub fn pop(self: *Self) ?T {
+            if (self.isEmpty()) return null;
+            const v = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len;
+            return v;
+        }
+
+        /// The front element without removing it, or `null` if empty.
+        pub fn peek(self: *const Self) ?T {
+            if (self.isEmpty()) return null;
+            return self.buf[self.head];
+        }
+    };
+}
+
+// =========================================================================
+//  BitSet — a dense, allocator-owned bit array
+// =========================================================================
+
+/// A dense bit array of a fixed bit-count, packed into allocator-owned `u64`
+/// words. `set`/`clear`/`isSet` are O(1); `popcount` scans the words. The whole
+/// word array is freed once in `deinit`.
+pub const BitSet = struct {
+    const Self = @This();
+
+    words: []u64,
+    bits: usize,
+    alloc: Allocator,
+
+    /// A bit set of `bit_count` bits, all initially clear.
+    pub fn init(alloc: Allocator, bit_count: usize) !Self {
+        const n = (bit_count + 63) / 64;
+        const words = try alloc.alloc(u64, n);
+        var i: usize = 0;
+        while (i < n) : (i += 1) words[i] = 0;
+        return Self{ .words = words, .bits = bit_count, .alloc = alloc };
+    }
+
+    /// Free the backing words.
+    pub fn deinit(self: *Self) void {
+        if (self.words.len != 0) self.alloc.free(self.words);
+    }
+
+    /// Set bit `i` (must be `< bits`).
+    pub fn set(self: *Self, i: usize) void {
+        self.words[i / 64] = self.words[i / 64] | (@as(u64, 1) << @as(u6, @intCast(i % 64)));
+    }
+
+    /// Clear bit `i`.
+    pub fn clear(self: *Self, i: usize) void {
+        self.words[i / 64] = self.words[i / 64] & ~(@as(u64, 1) << @as(u6, @intCast(i % 64)));
+    }
+
+    /// `true` if bit `i` is set.
+    pub fn isSet(self: *const Self, i: usize) bool {
+        return (self.words[i / 64] >> @as(u6, @intCast(i % 64))) & 1 == 1;
+    }
+
+    /// The number of set bits.
+    pub fn popcount(self: *const Self) usize {
+        var n: usize = 0;
+        var w: usize = 0;
+        while (w < self.words.len) : (w += 1) {
+            n += @as(usize, math.popcount(self.words[w]));
+        }
+        return n;
+    }
+};
+
+// =========================================================================
+//  Deque — a growable double-ended queue (ring buffer with wrap-around)
+// =========================================================================
+
+/// A double-ended queue: amortized-O(1) push/pop at BOTH ends, backed by a
+/// growable ring buffer that doubles (from a floor of 8) when full. Allocator-
+/// owned, like `ArrayList`; `deinit` frees the one backing buffer.
+pub fn Deque(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buf: []T,
+        head: usize, // index of the front element
+        count: usize, // number of live elements
+        alloc: Allocator,
+
+        /// An empty deque bound to `alloc`.
+        pub fn init(alloc: Allocator) Self {
+            return Self{ .buf = &.{}, .head = 0, .count = 0, .alloc = alloc };
+        }
+
+        /// Free the backing buffer.
+        pub fn deinit(self: *Self) void {
+            if (self.buf.len != 0) self.alloc.free(self.buf);
+        }
+
+        /// The number of buffered elements.
+        pub fn len(self: *const Self) usize {
+            return self.count;
+        }
+
+        /// `true` if empty.
+        pub fn isEmpty(self: *const Self) bool {
+            return self.count == 0;
+        }
+
+        /// Grow to at least `need` capacity, copying the live elements into logical
+        /// order at the front of the new buffer (head reset to 0).
+        fn ensureCapacity(self: *Self, need: usize) !void {
+            if (need <= self.buf.len) return;
+            var new_cap: usize = if (self.buf.len == 0) 8 else self.buf.len * 2;
+            if (new_cap < need) new_cap = need;
+            const fresh = try self.alloc.alloc(T, new_cap);
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                fresh[i] = self.buf[(self.head + i) % self.buf.len];
+            }
+            if (self.buf.len != 0) self.alloc.free(self.buf);
+            self.buf = fresh;
+            self.head = 0;
+        }
+
+        /// Append `value` at the back.
+        pub fn pushBack(self: *Self, value: T) !void {
+            try self.ensureCapacity(self.count + 1);
+            self.buf[(self.head + self.count) % self.buf.len] = value;
+            self.count += 1;
+        }
+
+        /// Prepend `value` at the front.
+        pub fn pushFront(self: *Self, value: T) !void {
+            try self.ensureCapacity(self.count + 1);
+            self.head = (self.head + self.buf.len - 1) % self.buf.len;
+            self.buf[self.head] = value;
+            self.count += 1;
+        }
+
+        /// Remove and return the front element, or `null` if empty.
+        pub fn popFront(self: *Self) ?T {
+            if (self.count == 0) return null;
+            const v = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len;
+            self.count -= 1;
+            return v;
+        }
+
+        /// Remove and return the back element, or `null` if empty.
+        pub fn popBack(self: *Self) ?T {
+            if (self.count == 0) return null;
+            self.count -= 1;
+            return self.buf[(self.head + self.count) % self.buf.len];
+        }
+
+        /// The front element without removing it, or `null` if empty.
+        pub fn front(self: *const Self) ?T {
+            if (self.count == 0) return null;
+            return self.buf[self.head];
+        }
+
+        /// The back element without removing it, or `null` if empty.
+        pub fn back(self: *const Self) ?T {
+            if (self.count == 0) return null;
+            return self.buf[(self.head + self.count - 1) % self.buf.len];
+        }
+
+        /// Bounds-checked access by logical index (`0` is the front), or `null`.
+        pub fn get(self: *const Self, index: usize) ?T {
+            if (index >= self.count) return null;
+            return self.buf[(self.head + index) % self.buf.len];
+        }
+    };
+}
+
+// =========================================================================
+//  BstNode — a self-referential binary-search-tree node
+// =========================================================================
+
+/// A binary-search-tree NODE for an ordered, comparable `T` (uses `<`/`>`). The
+/// recursive children are `?*@This()`; child nodes are heap-allocated through the
+/// passed allocator. This is the node, not a wrapper: the caller owns the ROOT (on
+/// the stack or the heap) and frees the heap-allocated descendants with
+/// `freeChildren`. A clean generic *wrapper* (`root: ?*Node`) awaits the
+/// nested-type-const fix; the node API is fully usable today.
+pub fn BstNode(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        value: T,
+        left: ?*@This(),
+        right: ?*@This(),
+
+        /// A leaf node holding `value` (no children).
+        pub fn leaf(value: T) Self {
+            return Self{ .value = value, .left = null, .right = null };
+        }
+
+        /// Insert `value` into the subtree rooted at `self` (duplicates ignored),
+        /// allocating one node for it. The allocation escapes into a child link, so
+        /// `freeChildren` must eventually release it.
+        pub fn insert(self: *Self, alloc: Allocator, value: T) !void {
+            if (value < self.value) {
+                if (self.left) |l| {
+                    try l.insert(alloc, value);
+                } else {
+                    const n = try alloc.create(Self);
+                    n.* = Self.leaf(value);
+                    self.left = n;
+                }
+            } else if (value > self.value) {
+                if (self.right) |r| {
+                    try r.insert(alloc, value);
+                } else {
+                    const n = try alloc.create(Self);
+                    n.* = Self.leaf(value);
+                    self.right = n;
+                }
+            }
+        }
+
+        /// `true` if `value` is present in the subtree.
+        pub fn contains(self: *const Self, value: T) bool {
+            if (value == self.value) return true;
+            if (value < self.value) {
+                if (self.left) |l| return l.contains(value);
+                return false;
+            }
+            if (self.right) |r| return r.contains(value);
+            return false;
+        }
+
+        /// The number of nodes in the subtree (including `self`).
+        pub fn count(self: *const Self) usize {
+            var n: usize = 1;
+            if (self.left) |l| n += l.count();
+            if (self.right) |r| n += r.count();
+            return n;
+        }
+
+        /// The height of the subtree (a single leaf has height 1).
+        pub fn height(self: *const Self) usize {
+            const hl: usize = if (self.left) |l| l.height() else 0;
+            const hr: usize = if (self.right) |r| r.height() else 0;
+            return 1 + (if (hl > hr) hl else hr);
+        }
+
+        /// The smallest value in the subtree (the leftmost node).
+        pub fn min(self: *const Self) T {
+            var cur = self;
+            while (cur.left) |l| cur = l;
+            return cur.value;
+        }
+
+        /// The largest value in the subtree (the rightmost node).
+        pub fn max(self: *const Self) T {
+            var cur = self;
+            while (cur.right) |r| cur = r;
+            return cur.value;
+        }
+
+        /// Free every heap-allocated DESCENDANT (not `self`, which the caller owns).
+        /// After this the node is a leaf again.
+        pub fn freeChildren(self: *Self, alloc: Allocator) void {
+            if (self.left) |l| {
+                l.freeChildren(alloc);
+                alloc.destroy(l);
+            }
+            if (self.right) |r| {
+                r.freeChildren(alloc);
+                alloc.destroy(r);
+            }
+            self.left = null;
+            self.right = null;
+        }
+    };
+}
+
+// =========================================================================
+//  rand — a small seedable pseudo-random generator (xorshift64)
+// =========================================================================
+
+/// A deterministic, seedable PRNG (Marsaglia `xorshift64`) for non-cryptographic
+/// uses: shuffling, sampling, randomized tests. Same seed → same sequence on every
+/// target. Pure XOR/shift (no wrapping multiply), so it never traps. NOT for
+/// security. (The testing module's `fuzzInput` is the host-driven fuzz source;
+/// this is an in-program generator you control.)
+pub const Random = struct {
+    const Self = @This();
+
+    state: u64,
+
+    /// A generator seeded with `seed` (a `0` seed is nudged to avoid the
+    /// xorshift fixed point).
+    pub fn init(seed: u64) Self {
+        return Self{ .state = if (seed == 0) 0x9E3779B97F4A7C15 else seed };
+    }
+
+    /// The next 64-bit value, advancing the state (`xorshift64`). Only XOR and
+    /// shifts — bits shifted past the width are discarded, never an overflow trap.
+    pub fn next(self: *Self) u64 {
+        var x = self.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        self.state = x;
+        return x;
+    }
+
+    /// A value in `[0, bound)` (uniform enough for non-crypto use; `bound == 0`
+    /// returns `0`).
+    pub fn below(self: *Self, bound: u64) u64 {
+        if (bound == 0) return 0;
+        return self.next() % bound;
+    }
+
+    /// A value in the inclusive range `[lo, hi]` (`lo <= hi`).
+    pub fn intRange(self: *Self, lo: u64, hi: u64) u64 {
+        return lo + self.below(hi - lo + 1);
+    }
+
+    /// A fair coin: `true` or `false`.
+    pub fn boolean(self: *Self) bool {
+        return self.next() & 1 == 1;
+    }
+
+    /// Shuffle `slice` in place with the Fisher–Yates algorithm (every permutation
+    /// equally likely, modulo the generator's quality). O(n).
+    pub fn shuffle(self: *Self, comptime T: type, slice: []T) void {
+        if (slice.len < 2) return;
+        var i: usize = slice.len;
+        while (i > 1) {
+            i -= 1;
+            const j = @as(usize, @intCast(self.below(@as(u64, i) + 1)));
+            const t = slice[i];
+            slice[i] = slice[j];
+            slice[j] = t;
+        }
+    }
+
+    /// A uniformly-random element of `slice`, or `null` if it is empty.
+    pub fn choice(self: *Self, comptime T: type, slice: []const T) ?T {
+        if (slice.len == 0) return null;
+        const i = @as(usize, @intCast(self.below(@as(u64, slice.len))));
+        return slice[i];
     }
 };
 
@@ -823,6 +2014,44 @@ pub const ascii = struct {
     pub fn toUpper(c: u8) u8 {
         if (c >= 'a' and c <= 'z') return c - 32;
         return c;
+    }
+
+    /// `true` for an uppercase ASCII letter `'A'..='Z'`.
+    pub fn isUpper(c: u8) bool {
+        return c >= 'A' and c <= 'Z';
+    }
+
+    /// `true` for a lowercase ASCII letter `'a'..='z'`.
+    pub fn isLower(c: u8) bool {
+        return c >= 'a' and c <= 'z';
+    }
+
+    /// `true` for a hexadecimal digit `'0'..='9' 'a'..='f' 'A'..='F'`.
+    pub fn isHexDigit(c: u8) bool {
+        return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+    }
+
+    /// `true` for an ASCII control byte (`0x00..=0x1F` or `0x7F`).
+    pub fn isControl(c: u8) bool {
+        return c < 0x20 or c == 0x7F;
+    }
+
+    /// `true` for a printable ASCII byte (space through `~`, `0x20..=0x7E`).
+    pub fn isPrint(c: u8) bool {
+        return c >= 0x20 and c <= 0x7E;
+    }
+
+    /// `true` for ASCII punctuation: a printable non-space, non-alphanumeric byte.
+    pub fn isPunct(c: u8) bool {
+        return isPrint(c) and c != ' ' and not isAlphanumeric(c);
+    }
+
+    /// The hexadecimal value `0..=15` of a hex digit, or `null` if `c` is not one.
+    pub fn hexValue(c: u8) ?u8 {
+        if (c >= '0' and c <= '9') return c - '0';
+        if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+        return null;
     }
 };
 
@@ -950,6 +2179,29 @@ pub const unicode = struct {
         }
         return 0;
     }
+
+    /// A forward iterator over the Unicode scalar values of a UTF-8 string. Each
+    /// `next` decodes the codepoint at the cursor and advances past it; an
+    /// ill-formed byte sequence ends iteration (`next` returns `null`) at that
+    /// position rather than yielding a replacement character.
+    pub const Utf8Iterator = struct {
+        s: []const u8,
+        i: usize,
+
+        /// The next codepoint, or `null` at the end (or at an ill-formed byte).
+        pub fn next(self: *@This()) ?u32 {
+            if (self.i >= self.s.len) return null;
+            const r = utf8DecodeAt(self.s, self.i);
+            if (not r.ok) return null;
+            self.i += r.len;
+            return r.cp;
+        }
+    };
+
+    /// A `Utf8Iterator` over `s` starting at its first byte.
+    pub fn iterate(s: []const u8) Utf8Iterator {
+        return Utf8Iterator{ .s = s, .i = 0 };
+    }
 };
 
 // =========================================================================
@@ -1015,6 +2267,686 @@ pub const math = struct {
             if (e != 0) b = b * b;
         }
         return result;
+    }
+
+    /// The integer square root of `x`: the largest `r` with `r*r <= x`. A
+    /// digit-by-digit (binary) method — no floating point, exact for all `u64`.
+    /// `isqrt(0)` is `0`.
+    pub fn isqrt(x: u64) u64 {
+        var r: u64 = 0;
+        // The highest power-of-four <= x (a one-bit at an even position).
+        var bit: u64 = 1 << 62;
+        while (bit > x) bit = bit >> 2;
+        var n = x;
+        while (bit != 0) {
+            if (n >= r + bit) {
+                n = n - (r + bit);
+                r = (r >> 1) + bit;
+            } else {
+                r = r >> 1;
+            }
+            bit = bit >> 2;
+        }
+        return r;
+    }
+
+    /// `floor(log2(x))` — the index of the most-significant set bit. Returns `0`
+    /// for `x == 0` (vacuously), matching the common `@clz`-based definition.
+    pub fn log2Int(x: u64) u32 {
+        if (x == 0) return 0;
+        var v = x;
+        var r: u32 = 0;
+        while (v > 1) : (v = v >> 1) r += 1;
+        return r;
+    }
+
+    /// `true` if `x` is a power of two (`1, 2, 4, …`). Zero is not.
+    pub fn isPowerOfTwo(x: u64) bool {
+        return x != 0 and (x & (x - 1)) == 0;
+    }
+
+    /// The number of set bits in `x` (population count, Kernighan's loop).
+    pub fn popcount(x: u64) u32 {
+        var v = x;
+        var n: u32 = 0;
+        while (v != 0) : (n += 1) v = v & (v - 1);
+        return n;
+    }
+
+    /// The number of leading zero bits in a 64-bit `x` (`clz(0) == 64`).
+    pub fn clz(x: u64) u32 {
+        if (x == 0) return 64;
+        var v = x;
+        var n: u32 = 0;
+        while (v & (1 << 63) == 0) : (n += 1) v = v << 1;
+        return n;
+    }
+
+    /// The number of trailing zero bits in a 64-bit `x` (`ctz(0) == 64`).
+    pub fn ctz(x: u64) u32 {
+        if (x == 0) return 64;
+        var v = x;
+        var n: u32 = 0;
+        while (v & 1 == 0) : (n += 1) v = v >> 1;
+        return n;
+    }
+
+    /// Floor division of signed integers: rounds toward negative infinity (unlike
+    /// `/`, which truncates toward zero). `divFloor(-7, 2) == -4`.
+    pub fn divFloor(a: i64, b: i64) i64 {
+        const q = a / b;
+        const r = a % b;
+        // `/` truncated toward zero; nudge down when the remainder's sign
+        // disagrees with the divisor's (the true quotient was negative).
+        if (r != 0 and ((r < 0) != (b < 0))) return q - 1;
+        return q;
+    }
+
+    /// Euclidean modulo paired with `divFloor`, so `mod(-1, 3) == 2`. The result
+    /// has the sign of `b` and lies in `[0, |b|)` for positive `b`.
+    pub fn mod(a: i64, b: i64) i64 {
+        const r = a % b;
+        if (r != 0 and ((r < 0) != (b < 0))) return r + b;
+        return r;
+    }
+
+    /// Saturating add: `a + b`, clamped to `u64`'s maximum on overflow instead of
+    /// wrapping or trapping. Overflow is detected BEFORE the add (no wrapping
+    /// operator and no safe-build trap).
+    pub fn satAddU64(a: u64, b: u64) u64 {
+        const max_u64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        if (a > max_u64 - b) return max_u64;
+        return a + b;
+    }
+
+    /// Saturating subtract: `a - b`, clamped to `0` on underflow.
+    pub fn satSubU64(a: u64, b: u64) u64 {
+        return if (b > a) 0 else a - b;
+    }
+
+    /// The sign of a signed integer: `-1`, `0`, or `1`.
+    pub fn signI64(x: i64) i64 {
+        if (x > 0) return 1;
+        if (x < 0) return -1;
+        return 0;
+    }
+
+    /// `true` if `x` is even.
+    pub fn isEven(x: i64) bool {
+        return x % 2 == 0;
+    }
+
+    /// `true` if `x` is odd.
+    pub fn isOdd(x: i64) bool {
+        return x % 2 != 0;
+    }
+
+    /// The smallest power of two `>= x` (and `1` for `x == 0`). Returns `0` if the
+    /// result would overflow `u64` (`x > 2^63`).
+    pub fn nextPowerOfTwo(x: u64) u64 {
+        if (x <= 1) return 1;
+        if (x > (1 << 63)) return 0;
+        var p: u64 = 1;
+        while (p < x) p = p << 1;
+        return p;
+    }
+
+    /// `n!`, by iteration. `factorial(0)` is `1`. TRAPS on overflow past `20!`
+    /// (the largest factorial fitting in `u64`) in a safe build — there is no
+    /// wrapping multiply, so out-of-range inputs are a checked error, not a wrap.
+    pub fn factorial(n: u64) u64 {
+        var r: u64 = 1;
+        var i: u64 = 2;
+        while (i <= n) : (i += 1) r = r * i;
+        return r;
+    }
+
+    /// The `n`-th Fibonacci number (`fib(0) = 0`, `fib(1) = 1`), by iteration.
+    pub fn fib(n: u64) u64 {
+        var a: u64 = 0;
+        var b: u64 = 1;
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            const t = a + b;
+            a = b;
+            b = t;
+        }
+        return a;
+    }
+
+    /// Falling factorial / `k`-permutations of `n`: `n·(n-1)·…·(n-k+1)`. `0` if
+    /// `k > n`. Overflows (traps) once the product exceeds `u64`.
+    pub fn permutations(n: u64, k: u64) u64 {
+        if (k > n) return 0;
+        var result: u64 = 1;
+        var i: u64 = 0;
+        while (i < k) : (i += 1) result = result * (n - i);
+        return result;
+    }
+
+    /// The binomial coefficient `C(n, k)` ("n choose k"). `0` if `k > n`. Computed
+    /// incrementally (`result · (n-i) / (i+1)`, each step an exact integer) and
+    /// using the symmetry `C(n,k) = C(n,n-k)` to take the smaller `k`, so it stays
+    /// in `u64` for a much wider range than `n! / (k!·(n-k)!)`.
+    pub fn binomial(n: u64, k: u64) u64 {
+        if (k > n) return 0;
+        var kk = k;
+        if (kk > n - kk) kk = n - kk;
+        var result: u64 = 1;
+        var i: u64 = 0;
+        while (i < kk) : (i += 1) {
+            result = result * (n - i) / (i + 1);
+        }
+        return result;
+    }
+
+    /// The sum of a slice of any integer type (`0` for an empty slice).
+    pub fn sumSlice(comptime T: type, xs: []const T) T {
+        var s: T = 0;
+        var i: usize = 0;
+        while (i < xs.len) : (i += 1) s += xs[i];
+        return s;
+    }
+
+    /// The largest element of a non-empty slice, or `null` if empty.
+    pub fn maxSlice(comptime T: type, xs: []const T) ?T {
+        if (xs.len == 0) return null;
+        var m = xs[0];
+        var i: usize = 1;
+        while (i < xs.len) : (i += 1) {
+            if (xs[i] > m) m = xs[i];
+        }
+        return m;
+    }
+
+    /// The smallest element of a non-empty slice, or `null` if empty.
+    pub fn minSlice(comptime T: type, xs: []const T) ?T {
+        if (xs.len == 0) return null;
+        var m = xs[0];
+        var i: usize = 1;
+        while (i < xs.len) : (i += 1) {
+            if (xs[i] < m) m = xs[i];
+        }
+        return m;
+    }
+
+    /// Primality by trial division up to `sqrt(n)`, skipping evens. The bound is
+    /// `i <= n / i` (not `i*i <= n`), so the test never overflows even for a
+    /// `u64`-max input. `isPrime(0)`/`isPrime(1)` are `false`.
+    pub fn isPrime(n: u64) bool {
+        if (n < 2) return false;
+        if (n < 4) return true; // 2, 3
+        if (n % 2 == 0) return false;
+        var i: u64 = 3;
+        while (i <= n / i) : (i += 2) {
+            if (n % i == 0) return false;
+        }
+        return true;
+    }
+
+    /// Modular exponentiation `(base^exp) mod m`, by square-and-multiply. To keep
+    /// the intermediate products from overflowing `u64`, `m` must be at most
+    /// 2^32 (so every `x * y mod m` with `x, y < m` fits a `u64`). `modPow(_, 0, m)`
+    /// is `1 mod m`; `m == 0` returns `0`.
+    pub fn modPow(base: u64, exp: u64, m: u64) u64 {
+        if (m == 0) return 0;
+        if (m == 1) return 0;
+        var result: u64 = 1;
+        var b = base % m;
+        var e = exp;
+        while (e != 0) {
+            if (e & 1 == 1) result = (result * b) % m;
+            e = e >> 1;
+            if (e != 0) b = (b * b) % m;
+        }
+        return result;
+    }
+
+    /// Ceiling division `ceil(a / b)` for unsigned integers (`b != 0`). Computed as
+    /// `a / b + (a % b != 0)` so it never overflows. `divCeil(7, 3)` is `3`.
+    pub fn divCeil(a: u64, b: u64) u64 {
+        const q = a / b;
+        if (a % b != 0) return q + 1;
+        return q;
+    }
+
+    /// Round `x` UP to the nearest multiple of `m` (`m != 0`). Already-multiples are
+    /// unchanged. `roundUpToMultiple(13, 8)` is `16`.
+    pub fn roundUpToMultiple(x: u64, m: u64) u64 {
+        return divCeil(x, m) * m;
+    }
+
+    /// Round `x` DOWN to the nearest multiple of `m` (`m != 0`).
+    pub fn roundDownToMultiple(x: u64, m: u64) u64 {
+        return (x / m) * m;
+    }
+
+    /// Round `x` UP to the nearest multiple of `alignment`, which MUST be a power of
+    /// two — the fast bit-twiddling form of `roundUpToMultiple`. A non-power-of-two
+    /// `alignment` gives an unspecified result.
+    pub fn alignForward(x: u64, alignment: u64) u64 {
+        return (x + (alignment - 1)) & ~(alignment - 1);
+    }
+
+    /// The sum of the decimal digits of `n` (`digitSum(0)` is `0`).
+    pub fn digitSum(n: u64) u64 {
+        var v = n;
+        var s: u64 = 0;
+        while (v != 0) {
+            s += v % 10;
+            v = v / 10;
+        }
+        return s;
+    }
+
+    /// The number of decimal digits of `n` (`digitCount(0)` is `1`).
+    pub fn digitCount(n: u64) u64 {
+        if (n == 0) return 1;
+        var v = n;
+        var c: u64 = 0;
+        while (v != 0) : (v = v / 10) c += 1;
+        return c;
+    }
+
+    /// `n` with its decimal digits reversed (`reverseDigits(1230)` is `321`), or
+    /// `null` if the reversal would overflow `u64`. Trailing zeros are dropped.
+    pub fn reverseDigits(n: u64) ?u64 {
+        const max_u64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        var v = n;
+        var r: u64 = 0;
+        while (v != 0) {
+            const d = v % 10;
+            if (r > (max_u64 - d) / 10) return null; // would overflow
+            r = r * 10 + d;
+            v = v / 10;
+        }
+        return r;
+    }
+
+    /// `true` if `n` reads the same forwards and backwards in base 10.
+    pub fn isPalindrome(n: u64) bool {
+        const rev = reverseDigits(n);
+        if (rev == null) return false;
+        return rev.? == n;
+    }
+};
+
+// =========================================================================
+//  mathf — floating-point (`f64`) math by numerical approximation
+// =========================================================================
+
+/// Floating-point helpers computed from scratch (no hardware transcendental
+/// instructions): square root by Newton's method, rounding via the integer
+/// conversion builtins, and `exp`/`ln`/`sin`/`cos` by range-reduced series. Inputs
+/// are assumed finite and within roughly `|x| < 2^52` where an integer conversion
+/// is involved; accuracy is ~1e-12 for the elementary functions.
+pub const mathf = struct {
+    /// The ratio of a circle's circumference to its diameter.
+    pub const pi: f64 = 3.141592653589793;
+    /// Euler's number.
+    pub const e: f64 = 2.718281828459045;
+
+    /// The absolute value of `x`.
+    pub fn abs(x: f64) f64 {
+        return if (x < 0.0) -x else x;
+    }
+
+    /// The square root of `x` (Newton–Raphson). `sqrt(x)` for `x <= 0` is `0`.
+    /// `x` is first scaled by powers of four into `[1, 4)`, so Newton starts near
+    /// the answer and a handful of iterations suffice for ANY magnitude (a plain
+    /// `g = x` start needs O(log x) iterations and fails past ~1e33).
+    pub fn sqrt(x: f64) f64 {
+        if (x <= 0.0) return 0.0;
+        // x = m · 4^k with m ∈ [1, 4); then sqrt(x) = sqrt(m) · 2^k.
+        var m = x;
+        var k: i64 = 0;
+        while (m >= 4.0) {
+            m = m / 4.0;
+            k += 1;
+        }
+        while (m < 1.0) {
+            m = m * 4.0;
+            k -= 1;
+        }
+        var g = m;
+        var i: u32 = 0;
+        while (i < 30) : (i += 1) {
+            const next = 0.5 * (g + m / g);
+            if (abs(next - g) <= 1e-15 * next) {
+                g = next;
+                break;
+            }
+            g = next;
+        }
+        if (k >= 0) return g * powi(2.0, @as(u64, @intCast(k)));
+        return g / powi(2.0, @as(u64, @intCast(-k)));
+    }
+
+    /// The largest integer value `<= x`, as an `f64`.
+    pub fn floor(x: f64) f64 {
+        const t = @as(f64, @floatFromInt(@as(i64, @intFromFloat(x))));
+        if (t > x) return t - 1.0;
+        return t;
+    }
+
+    /// The smallest integer value `>= x`, as an `f64`.
+    pub fn ceil(x: f64) f64 {
+        const t = @as(f64, @floatFromInt(@as(i64, @intFromFloat(x))));
+        if (t < x) return t + 1.0;
+        return t;
+    }
+
+    /// `x` rounded to the nearest integer (ties away from zero), as an `f64`.
+    /// Compares the residual `x - floor(x)` against `0.5` rather than forming
+    /// `floor(x + 0.5)` — the latter double-rounds `0.49999999999999994` up to `1`.
+    pub fn round(x: f64) f64 {
+        if (x < 0.0) return -round(-x);
+        const r = floor(x);
+        if (x - r >= 0.5) return r + 1.0;
+        return r;
+    }
+
+    /// The fractional part of `x` (`x - trunc(x)`), keeping `x`'s sign.
+    pub fn fract(x: f64) f64 {
+        const t = @as(f64, @floatFromInt(@as(i64, @intFromFloat(x))));
+        return x - t;
+    }
+
+    /// `base` raised to a non-negative INTEGER power `n`, by binary exponentiation.
+    pub fn powi(base: f64, n: u64) f64 {
+        var result: f64 = 1.0;
+        var b = base;
+        var e2 = n;
+        while (e2 != 0) {
+            if (e2 & 1 == 1) result = result * b;
+            e2 = e2 >> 1;
+            if (e2 != 0) b = b * b;
+        }
+        return result;
+    }
+
+    /// `e^x` by the Taylor series, after reducing `x` by its integer part so the
+    /// series converges fast: `e^x = e^k * e^f` with `k = round(x)`, `|f| <= 0.5`.
+    pub fn exp(x: f64) f64 {
+        const k = round(x);
+        const f = x - k;
+        // e^f via Taylor (|f| <= 0.5 converges in ~12 terms).
+        var term: f64 = 1.0;
+        var sum: f64 = 1.0;
+        var i: u32 = 1;
+        while (i < 18) : (i += 1) {
+            term = term * f / @as(f64, @floatFromInt(@as(i64, @intCast(i))));
+            sum = sum + term;
+        }
+        // e^k by integer power of e (or 1/e for negative k).
+        const ki = @as(i64, @intFromFloat(k));
+        if (ki >= 0) return sum * powi(e, @as(u64, @intCast(ki)));
+        return sum / powi(e, @as(u64, @intCast(-ki)));
+    }
+
+    /// Reduce an angle to `[-pi, pi]` by subtracting whole turns.
+    fn reduceAngle(x: f64) f64 {
+        const two_pi = 2.0 * pi;
+        const turns = round(x / two_pi);
+        return x - turns * two_pi;
+    }
+
+    /// `sin(x)` (radians) by the range-reduced Taylor series.
+    pub fn sin(x: f64) f64 {
+        const a = reduceAngle(x);
+        var term = a;
+        var sum = a;
+        const a2 = a * a;
+        var i: u32 = 1;
+        while (i < 12) : (i += 1) {
+            const d1 = @as(f64, @floatFromInt(@as(i64, @intCast(2 * i))));
+            const d2 = @as(f64, @floatFromInt(@as(i64, @intCast(2 * i + 1))));
+            term = -term * a2 / (d1 * d2);
+            sum = sum + term;
+        }
+        return sum;
+    }
+
+    /// `cos(x)` (radians) by the range-reduced Taylor series.
+    pub fn cos(x: f64) f64 {
+        const a = reduceAngle(x);
+        var term: f64 = 1.0;
+        var sum: f64 = 1.0;
+        const a2 = a * a;
+        var i: u32 = 1;
+        // 13 terms (vs sin's 12): the highest cos term is `a^22/22!`, so near `±pi`
+        // an extra term is needed to stay under ~1e-12.
+        while (i < 13) : (i += 1) {
+            const d1 = @as(f64, @floatFromInt(@as(i64, @intCast(2 * i - 1))));
+            const d2 = @as(f64, @floatFromInt(@as(i64, @intCast(2 * i))));
+            term = -term * a2 / (d1 * d2);
+            sum = sum + term;
+        }
+        return sum;
+    }
+
+    /// The Euclidean hypotenuse `sqrt(a^2 + b^2)`, scaled by the larger magnitude so
+    /// it neither overflows nor underflows when the true result is representable
+    /// (`hypot(1e200, 1e200)` is finite, not `inf`/`NaN`).
+    pub fn hypot(a: f64, b: f64) f64 {
+        const aa = abs(a);
+        const ab = abs(b);
+        const m = if (aa > ab) aa else ab;
+        if (m == 0.0) return 0.0;
+        const x = a / m;
+        const y = b / m;
+        return m * sqrt(x * x + y * y);
+    }
+
+    /// `tan(x)` (radians) as `sin(x) / cos(x)`. Near an odd multiple of `pi/2` the
+    /// cosine approaches zero and the result blows up, as expected.
+    pub fn tan(x: f64) f64 {
+        return sin(x) / cos(x);
+    }
+
+    /// The natural logarithm `ln(x)` for `x > 0` (`0` for `x <= 0`). Reduces `x`
+    /// into `[~0.6, 1.5]` by factoring out powers of `e`, then sums the `atanh`
+    /// series `ln(v) = 2·(z + z³/3 + z⁵/5 + …)` with `z = (v-1)/(v+1)`.
+    pub fn ln(x: f64) f64 {
+        if (x <= 0.0) return 0.0;
+        var v = x;
+        var k: f64 = 0.0;
+        while (v > 1.5) {
+            v = v / e;
+            k += 1.0;
+        }
+        while (v < 0.6) {
+            v = v * e;
+            k -= 1.0;
+        }
+        const z = (v - 1.0) / (v + 1.0);
+        const z2 = z * z;
+        var term = z;
+        var sum = z;
+        var i: u32 = 1;
+        while (i < 24) : (i += 1) {
+            term = term * z2;
+            sum = sum + term / @as(f64, @floatFromInt(@as(i64, @intCast(2 * i + 1))));
+        }
+        return k + 2.0 * sum;
+    }
+
+    /// The base-`b` logarithm of `x` (`x, b > 0`, `b != 1`).
+    pub fn logBase(x: f64, b: f64) f64 {
+        return ln(x) / ln(b);
+    }
+
+    /// General power `base^exponent` for a POSITIVE base, via `exp(exponent ·
+    /// ln(base))`. (Use `powi` for an integer exponent of any base.)
+    pub fn pow(base: f64, exponent: f64) f64 {
+        if (base <= 0.0) return 0.0;
+        return exp(exponent * ln(base));
+    }
+
+    /// Base-10 logarithm (`x > 0`).
+    pub fn log10(x: f64) f64 {
+        return ln(x) / ln(10.0);
+    }
+
+    /// Base-2 logarithm (`x > 0`).
+    pub fn log2(x: f64) f64 {
+        return ln(x) / ln(2.0);
+    }
+
+    /// The real cube root of `x` (handles negatives, unlike `pow`).
+    pub fn cbrt(x: f64) f64 {
+        if (x == 0.0) return 0.0;
+        if (x < 0.0) return -pow(-x, 1.0 / 3.0);
+        return pow(x, 1.0 / 3.0);
+    }
+
+    /// Truncate `x` toward zero, as an `f64` (drops the fractional part).
+    pub fn trunc(x: f64) f64 {
+        return @as(f64, @floatFromInt(@as(i64, @intFromFloat(x))));
+    }
+
+    /// `-1.0`, `0.0`, or `1.0` for the sign of `x`.
+    pub fn signf(x: f64) f64 {
+        if (x > 0.0) return 1.0;
+        if (x < 0.0) return -1.0;
+        return 0.0;
+    }
+
+    /// The lesser of `a` and `b`.
+    pub fn minf(a: f64, b: f64) f64 {
+        return if (a < b) a else b;
+    }
+
+    /// The greater of `a` and `b`.
+    pub fn maxf(a: f64, b: f64) f64 {
+        return if (a > b) a else b;
+    }
+
+    /// `x` clamped into `[lo, hi]` (assumes `lo <= hi`).
+    pub fn clampf(x: f64, lo: f64, hi: f64) f64 {
+        if (x < lo) return lo;
+        if (x > hi) return hi;
+        return x;
+    }
+
+    /// Linear interpolation between `a` and `b` by `t` (`lerp(a,b,0)=a`,
+    /// `lerp(a,b,1)=b`; `t` outside `[0,1]` extrapolates).
+    pub fn lerp(a: f64, b: f64, t: f64) f64 {
+        return a + (b - a) * t;
+    }
+
+    /// Convert degrees to radians.
+    pub fn degToRad(deg: f64) f64 {
+        return deg * (pi / 180.0);
+    }
+
+    /// Convert radians to degrees.
+    pub fn radToDeg(rad: f64) f64 {
+        return rad * (180.0 / pi);
+    }
+
+    /// Arctangent of `x`, in `(-pi/2, pi/2)`. Reflects `x > 1` through
+    /// `atan(x) = pi/2 - atan(1/x)`, then shrinks the argument with the half-angle
+    /// identity `atan(v) = 2·atan(v/(1+sqrt(1+v²)))` until it is small, where the
+    /// power series converges fast (the raw series at `x = 1` converges like `1/n`
+    /// and would need millions of terms).
+    pub fn atan(x: f64) f64 {
+        if (x < 0.0) return -atan(-x);
+        if (x > 1.0) return (pi / 2.0) - atan(1.0 / x);
+        // Halve the argument until `v <= 0.2`, doubling once per reduction.
+        var v = x;
+        var reductions: u32 = 0;
+        while (v > 0.2) {
+            v = v / (1.0 + sqrt(1.0 + v * v));
+            reductions += 1;
+        }
+        const v2 = v * v;
+        var term = v;
+        var sum = v;
+        var i: u32 = 1;
+        while (i < 24) : (i += 1) {
+            term = -term * v2;
+            const denom = @as(f64, @floatFromInt(@as(i64, @intCast(2 * i + 1))));
+            sum = sum + term / denom;
+        }
+        var k: u32 = 0;
+        while (k < reductions) : (k += 1) sum = sum * 2.0;
+        return sum;
+    }
+};
+
+// =========================================================================
+//  bits — unsigned bit manipulation (byte swap, rotate, single-bit ops)
+// =========================================================================
+
+/// Pure bit-twiddling over fixed-width unsigned integers. Single-bit indices and
+/// rotate/shift amounts are `u6` (`0..=63`) for the `u64` operations, matching the
+/// width so a shift never exceeds it.
+pub const bits = struct {
+    /// Reverse the two bytes of a `u16`.
+    pub fn byteSwap16(x: u16) u16 {
+        return ((x & 0x00FF) << 8) | ((x >> 8) & 0x00FF);
+    }
+
+    /// Reverse the four bytes of a `u32`.
+    pub fn byteSwap32(x: u32) u32 {
+        return ((x & 0x0000_00FF) << 24) | ((x & 0x0000_FF00) << 8) |
+            ((x >> 8) & 0x0000_FF00) | ((x >> 24) & 0x0000_00FF);
+    }
+
+    /// Reverse the eight bytes of a `u64`.
+    pub fn byteSwap64(x: u64) u64 {
+        var r: u64 = 0;
+        var i: u6 = 0;
+        while (i < 8) : (i += 1) {
+            const byte = (x >> (@as(u6, i) * 8)) & 0xFF;
+            r = r | (byte << ((7 - @as(u6, i)) * 8));
+        }
+        return r;
+    }
+
+    /// Rotate the bits of a `u64` LEFT by `n` (`0..=63`).
+    pub fn rotateLeft64(x: u64, n: u6) u64 {
+        if (n == 0) return x;
+        return (x << n) | (x >> (64 - @as(u32, n)));
+    }
+
+    /// Rotate the bits of a `u64` RIGHT by `n` (`0..=63`).
+    pub fn rotateRight64(x: u64, n: u6) u64 {
+        if (n == 0) return x;
+        return (x >> n) | (x << (64 - @as(u32, n)));
+    }
+
+    /// `x` with bit `i` set.
+    pub fn setBit(x: u64, i: u6) u64 {
+        return x | (@as(u64, 1) << i);
+    }
+
+    /// `x` with bit `i` cleared.
+    pub fn clearBit(x: u64, i: u6) u64 {
+        return x & ~(@as(u64, 1) << i);
+    }
+
+    /// `x` with bit `i` flipped.
+    pub fn toggleBit(x: u64, i: u6) u64 {
+        return x ^ (@as(u64, 1) << i);
+    }
+
+    /// `true` if bit `i` of `x` is set.
+    pub fn testBit(x: u64, i: u6) bool {
+        return (x >> i) & 1 == 1;
+    }
+
+    /// The reverse of all 64 bits of `x` (bit 0 ↔ bit 63, …).
+    pub fn reverseBits64(x: u64) u64 {
+        var r: u64 = 0;
+        var i: u6 = 0;
+        var k: u32 = 0;
+        while (k < 64) : (k += 1) {
+            r = (r << 1) | ((x >> @as(u6, i)) & 1);
+            if (i < 63) i += 1;
+        }
+        return r;
     }
 };
 
@@ -1266,6 +3198,121 @@ pub const fmt = struct {
     /// `error.NoSpaceLeft` if it does not fit.
     pub fn bufPrint(buf: []u8, comptime template: []const u8, args: anytype) ![]u8 {
         return @bufPrint(buf, template, args);
+    }
+
+    /// Parse an unsigned decimal string to a `u64`. `null` on an empty string, a
+    /// non-digit byte, or overflow. Overflow is checked BEFORE each multiply, so it
+    /// never traps. Leading zeros are accepted (`"007"` is `7`).
+    pub fn parseUint(s: []const u8) ?u64 {
+        if (s.len == 0) return null;
+        const max_u64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        var acc: u64 = 0;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            if (c < '0' or c > '9') return null;
+            const d: u64 = @as(u64, c - '0');
+            if (acc > (max_u64 - d) / 10) return null; // would overflow
+            acc = acc * 10 + d;
+        }
+        return acc;
+    }
+
+    /// Parse a signed decimal string (optional leading `+`/`-`) to an `i64`. `null`
+    /// on a malformed string or a value outside `i64`. Supports the full range
+    /// including `i64`'s minimum.
+    pub fn parseInt(s: []const u8) ?i64 {
+        if (s.len == 0) return null;
+        var neg = false;
+        var body = s;
+        if (s[0] == '-') {
+            neg = true;
+            body = s[1..s.len];
+        } else if (s[0] == '+') {
+            body = s[1..s.len];
+        }
+        const u_opt = parseUint(body);
+        if (u_opt == null) return null;
+        const u = u_opt.?;
+        const i64_min_mag: u64 = 0x8000_0000_0000_0000; // |i64::MIN|
+        const i64_max: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+        if (neg) {
+            if (u == i64_min_mag) return -9223372036854775807 - 1; // i64::MIN
+            if (u > i64_min_mag) return null;
+            return -@as(i64, @intCast(u));
+        }
+        if (u > i64_max) return null;
+        return @as(i64, @intCast(u));
+    }
+
+    /// The 0..=35 value of a base-36 alphanumeric digit (`0-9 a-z A-Z`), or `null`.
+    fn digitValue(c: u8) ?u8 {
+        if (c >= '0' and c <= '9') return c - '0';
+        if (c >= 'a' and c <= 'z') return c - 'a' + 10;
+        if (c >= 'A' and c <= 'Z') return c - 'A' + 10;
+        return null;
+    }
+
+    /// Parse an unsigned string in `radix` (2..=36) to a `u64`. `null` on an empty
+    /// string, a digit out of range for the radix, or overflow.
+    pub fn parseUintRadix(s: []const u8, radix: u8) ?u64 {
+        if (s.len == 0 or radix < 2 or radix > 36) return null;
+        const max_u64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        const r: u64 = @as(u64, radix);
+        var acc: u64 = 0;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const dv_opt = digitValue(s[i]);
+            if (dv_opt == null) return null;
+            const dv = dv_opt.?;
+            if (dv >= radix) return null;
+            const d: u64 = @as(u64, dv);
+            if (acc > (max_u64 - d) / r) return null;
+            acc = acc * r + d;
+        }
+        return acc;
+    }
+
+    const lower_digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+    /// Write `value` in `radix` (2..=36, lowercase) into `buf` and return the
+    /// written sub-slice. `buf` needs at most 64 bytes (a `u64` in base 2). An
+    /// out-of-range radix writes nothing (returns an empty slice).
+    pub fn formatUintRadix(buf: []u8, value: u64, radix: u8) []u8 {
+        if (radix < 2 or radix > 36) return buf[0..0];
+        if (value == 0) {
+            buf[0] = '0';
+            return buf[0..1];
+        }
+        // Emit least-significant digit first into a scratch array, then reverse.
+        var tmp: [64]u8 = undefined;
+        const r: u64 = @as(u64, radix);
+        var n = value;
+        var i: usize = 0;
+        while (n > 0) {
+            tmp[i] = lower_digits[@as(usize, @intCast(n % r))];
+            n = n / r;
+            i += 1;
+        }
+        var j: usize = 0;
+        while (j < i) : (j += 1) buf[j] = tmp[i - 1 - j];
+        return buf[0..i];
+    }
+
+    /// Write `value` as decimal into `buf` (a leading `-` for negatives) and return
+    /// the written sub-slice. `buf` needs at most 20 bytes.
+    pub fn formatInt(buf: []u8, value: i64) []u8 {
+        if (value < 0) {
+            buf[0] = '-';
+            // Negate into u64 to cover i64::MIN without overflow.
+            const mag: u64 = if (value == -9223372036854775807 - 1)
+                0x8000_0000_0000_0000
+            else
+                @as(u64, @intCast(-value));
+            const body = formatUintRadix(buf[1 .. buf.len], mag, 10);
+            return buf[0 .. 1 + body.len];
+        }
+        return formatUintRadix(buf, @as(u64, @intCast(value)), 10);
     }
 };
 

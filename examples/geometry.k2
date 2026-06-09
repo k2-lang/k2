@@ -1,0 +1,37 @@
+//! geometry.k2 — a real program: plane-geometry calculations on `f64` using the
+//! from-scratch `std.mathf` (no hardware transcendentals). Distance via `hypot`,
+//! circle area/circumference from `pi`, and a `sin`/`cos`-based check that a unit
+//! vector has length 1. Float results print at full `f64` precision.
+
+const std = @import("std");
+
+/// Euclidean distance between (x1,y1) and (x2,y2).
+fn dist(x1: f64, y1: f64, x2: f64, y2: f64) f64 {
+    return std.mathf.hypot(x2 - x1, y2 - y1);
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // A 3-4-5 right triangle: the distance is exactly 5.
+    try out.print("dist (0,0)->(3,4): {d}\n", .{dist(0.0, 0.0, 3.0, 4.0)});
+
+    // Circle of radius 2.
+    const r: f64 = 2.0;
+    try out.print("circle r=2: area={d} circumference={d}\n", .{
+        std.mathf.pi * r * r,
+        2.0 * std.mathf.pi * r,
+    });
+
+    // The point on the unit circle at 60 degrees (pi/3): (cos, sin) and its length.
+    const theta = std.mathf.pi / 3.0;
+    const px = std.mathf.cos(theta);
+    const py = std.mathf.sin(theta);
+    const len = std.mathf.hypot(px, py);
+    // Round the unit length to 6 places so it reads cleanly (it's 1 ± ~1e-16).
+    const len_rounded = std.mathf.round(len * 1000000.0) / 1000000.0;
+    try out.print("unit vector length (rounded): {d}\n", .{len_rounded});
+
+    // sqrt of a perfect square is exact.
+    try out.print("sqrt(144)={d} sqrt(625)={d}\n", .{ std.mathf.sqrt(144.0), std.mathf.sqrt(625.0) });
+}

@@ -1,0 +1,86 @@
+//! roman_numerals.k2 — a real program: convert integers (1..3999) to Roman
+//! numerals and back, then verify the round-trip. `toRoman` greedily subtracts
+//! from a value/symbol table into a caller buffer; `fromRoman` scans left to right,
+//! subtracting when a smaller symbol precedes a larger one. Pure (no allocator).
+
+const std = @import("std");
+
+const values = [_]u64{ 1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1 };
+const symbols = [_][]const u8{ "M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I" };
+
+/// Write the Roman numeral for `n` (1..3999) into `dst`, returning the sub-slice.
+fn toRoman(dst: []u8, n: u64) []u8 {
+    var rem = n;
+    var di: usize = 0;
+    var k: usize = 0;
+    while (k < values.len) : (k += 1) {
+        while (rem >= values[k]) {
+            const sym = symbols[k];
+            var j: usize = 0;
+            while (j < sym.len) : (j += 1) {
+                dst[di] = sym[j];
+                di += 1;
+            }
+            rem -= values[k];
+        }
+    }
+    return dst[0..di];
+}
+
+/// The numeric value of a single Roman digit, or 0 if not one.
+fn digit(c: u8) u64 {
+    return switch (c) {
+        'I' => 1,
+        'V' => 5,
+        'X' => 10,
+        'L' => 50,
+        'C' => 100,
+        'D' => 500,
+        'M' => 1000,
+        else => 0,
+    };
+}
+
+/// Parse a Roman numeral string back to an integer. Accumulates in `i64` so the
+/// subtractive case (a numeral like "IV" that opens with the smaller symbol) can
+/// dip negative mid-scan without a `u64` underflow trap.
+fn fromRoman(s: []const u8) u64 {
+    var total: i64 = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const cur = @as(i64, @intCast(digit(s[i])));
+        // A smaller value before a larger one is subtractive (IV, IX, …).
+        if (i + 1 < s.len and cur < @as(i64, @intCast(digit(s[i + 1])))) {
+            total -= cur;
+        } else {
+            total += cur;
+        }
+    }
+    return @as(u64, @intCast(total));
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var buf: [32]u8 = undefined;
+    const samples = [_]u64{ 4, 9, 14, 40, 90, 2024, 3888, 1994 };
+    try out.print("to roman: ", .{});
+    for (samples) |n| {
+        try out.print("{s} ", .{toRoman(&buf, n)});
+    }
+    try out.print("\n", .{});
+
+    // Parse a few back.
+    try out.print("from roman: MMXXIV={d} MCMXCIV={d} MMMDCCCLXXXVIII={d}\n", .{
+        fromRoman("MMXXIV"), fromRoman("MCMXCIV"), fromRoman("MMMDCCCLXXXVIII"),
+    });
+
+    // Round-trip every value 1..1000.
+    var mismatches: usize = 0;
+    var v: u64 = 1;
+    while (v <= 1000) : (v += 1) {
+        const r = toRoman(&buf, v);
+        if (fromRoman(r) != v) mismatches += 1;
+    }
+    try out.print("round-trip 1..1000 mismatches: {d}\n", .{mismatches});
+}

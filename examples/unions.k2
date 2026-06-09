@@ -1,0 +1,117 @@
+// unions.k2 — Tagged unions `union(enum)`: the one obvious way to spell a sum type.
+//
+// A `union(enum)` is a value that is EXACTLY ONE of several named variants at a
+// time, with a discriminating tag. Because the tag is an enum, the union is
+// exhaustively `switch`-able, and each arm can CAPTURE the active variant's
+// payload by value — the same `|x|` capture used by optionals and error unions,
+// generalized to N variants. No allocation, no vtable: a union is just a tag word
+// plus a payload area sized to its largest variant.
+//
+// This file demonstrates:
+//   * declaring a `union(enum)` with payload-carrying AND payload-less variants,
+//   * constructing a variant with `.{ .name = payload }` and a bare `.name`,
+//   * an exhaustive `switch` with payload capture (`.circle => |r| …`),
+//   * a method on the union, and unions flowing through functions,
+//   * exhaustiveness: the compiler rejects a `switch` that misses a variant.
+//
+// Run it:
+//   k2 run examples/unions.k2
+//
+// Payloads here are all SCALAR (integers), so this example also compiles and
+// runs on the native x86-64 backend with byte-identical output. (A variant with
+// an aggregate `struct` payload runs on the VM but is currently outside the
+// native subset — see the conformance corpus.)
+
+const std = @import("std");
+
+/// A geometric shape: exactly one of a circle, a square, or a dimensionless
+/// point. `circle`/`square` carry a scalar payload (their size); `point` is a
+/// payload-less (tagless) variant — it carries no data, only its identity.
+const Shape = union(enum) {
+    circle: u64, // radius
+    square: u64, // side length
+    point, // no payload
+
+    /// A method on the union. `switch (self)` is exhaustive over the variants,
+    /// and each arm binds the active payload with `|name|`. We use an integer
+    /// "π ≈ 3" so the whole example stays in the native (integer-only) subset.
+    pub fn area(self: Shape) u64 {
+        return switch (self) {
+            .circle => |r| 3 * r * r,
+            .square => |s| s * s,
+            .point => 0,
+        };
+    }
+
+    /// The number of corners — shows a `switch` whose arms need no capture, plus
+    /// an `else` that covers every remaining variant at once.
+    pub fn corners(self: Shape) u64 {
+        return switch (self) {
+            .square => 4,
+            else => 0, // a circle and a point have none
+        };
+    }
+};
+
+/// Unions are ordinary values: pass them, return them, store them. Here we
+/// classify a shape by name without touching its payload.
+fn name(s: Shape) []const u8 {
+    return switch (s) {
+        .circle => "circle",
+        .square => "square",
+        .point => "point",
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Construct one of each variant. The target type (`Shape`) is known from the
+    // binding, so the `.{ ... }` / `.point` literals need no type prefix.
+    const shapes = [_]Shape{ .{ .circle = 2 }, .{ .square = 3 }, .point };
+
+    // Iterate, dispatching on the active variant through the union's methods.
+    for (shapes) |s| {
+        try out.print("{s:>6}: area={d} corners={d}\n", .{ name(s), s.area(), s.corners() });
+    }
+
+    // A union also reads back as its tag for direct comparison: switch returns a
+    // plain value, so we can fold over the array.
+    var total: u64 = 0;
+    for (shapes) |s| {
+        total += s.area();
+    }
+    try out.print("total area = {d}\n", .{total});
+}
+
+// --- Tests: a union value is easy to assert on, variant by variant -----------
+
+test "area captures the active variant's payload" {
+    const c: Shape = .{ .circle = 2 };
+    const q: Shape = .{ .square = 3 };
+    const p: Shape = .point;
+    try std.testing.expectEqual(@as(u64, 12), c.area()); // 3*2*2
+    try std.testing.expectEqual(@as(u64, 9), q.area()); // 3*3
+    try std.testing.expectEqual(@as(u64, 0), p.area()); // no payload
+}
+
+test "corners uses an else arm to cover the remaining variants" {
+    try std.testing.expectEqual(@as(u64, 4), Shape{ .square = 1 }.corners());
+    try std.testing.expectEqual(@as(u64, 0), Shape{ .circle = 1 }.corners());
+    const p: Shape = .point;
+    try std.testing.expectEqual(@as(u64, 0), p.corners());
+}
+
+test "a union flows through a function as an ordinary value" {
+    // Compare by the name's first byte + length to keep this in the native subset
+    // (string equality goes through a generic helper that the native backend does
+    // not yet cover — see the integration matrix).
+    const c: Shape = .{ .circle = 5 };
+    const cn = name(c);
+    try std.testing.expectEqual(@as(usize, 6), cn.len);
+    try std.testing.expectEqual(@as(u8, 'c'), cn[0]);
+    const p: Shape = .point;
+    const pn = name(p);
+    try std.testing.expectEqual(@as(usize, 5), pn.len);
+    try std.testing.expectEqual(@as(u8, 'p'), pn[0]);
+}

@@ -1,0 +1,3 @@
+all: 80x24 v=false lvl=-1
+some: 100x24 v=true lvl=-1
+areas: 1920 2400

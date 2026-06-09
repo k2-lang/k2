@@ -35,7 +35,7 @@
 //! `*System`/writer-token capabilities the subset already handles as opaque
 //! pointers.
 
-use k2_types::{ArrayLen, IntBits, Type, TypeArena, TypeId};
+use k2_types::{ArrayLen, IntBits, Type, TypeArena, TypeId, UnionTagKind};
 
 /// The size and alignment of a type, in bytes. Mirrors `reflect::Layout`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -169,7 +169,91 @@ fn layout_depth(arena: &TypeArena, ty: TypeId, depth: u32) -> Option<Layout> {
             let tag = arena.enums[id.0 as usize].tag;
             layout_depth(arena, tag, depth + 1)
         }
+        // A `union(enum)` — a tag (discriminant) at +0 followed by a payload area
+        // sized to the largest variant and aligned to the strictest. A faithful port
+        // of the `Type::Union` arm in `reflect::layout_depth`; the two MUST agree, or
+        // `@sizeOf`/`@offsetOf` (folded from `reflect`) would disagree with the bytes
+        // native code reads/writes.
+        Type::Union(id) => {
+            let info = &arena.unions[id.0 as usize];
+            let tag = match info.tag {
+                UnionTagKind::None => Layout { size: 0, align: 1 },
+                _ => {
+                    let sz = int_byte_size(IntBits::Fixed(enum_tag_bits(info.variants.len())));
+                    Layout {
+                        size: sz,
+                        align: sz.max(1),
+                    }
+                }
+            };
+            let variants = info.variants.clone();
+            let mut payload_size = 0u64;
+            let mut payload_align = 1u64;
+            for v in &variants {
+                let pl = layout_depth(arena, v.payload, depth + 1)?;
+                payload_size = payload_size.max(pl.size);
+                payload_align = payload_align.max(pl.align);
+            }
+            let align = tag.align.max(payload_align);
+            let payload_off = round_up(tag.size, payload_align);
+            Some(Layout {
+                size: round_up(payload_off + payload_size, align),
+                align,
+            })
+        }
         _ => None,
+    }
+}
+
+/// The bit width of an inferred enum/union tag distinguishing `n` variants:
+/// `max(1, ceil(log2(n)))`. A faithful copy of `k2_types::check::enum_tag_bits`
+/// (a private helper in that crate); the two MUST agree so a union's tag is sized
+/// identically here and in `reflect`.
+fn enum_tag_bits(n: usize) -> u16 {
+    if n <= 2 {
+        return 1;
+    }
+    let bits = (usize::BITS - (n - 1).leading_zeros()) as u16;
+    bits.max(1)
+}
+
+/// The byte offset of a tagged union's payload area: `round_up(tag_size,
+/// max_variant_align)`. The tag sits at +0; every variant's payload begins here.
+/// Returns 0 for a non-union type.
+pub fn union_payload_off(arena: &TypeArena, union_ty: TypeId) -> u64 {
+    let Type::Union(id) = arena.get(union_ty) else {
+        return 0;
+    };
+    let info = &arena.unions[id.0 as usize];
+    let tag_size = match info.tag {
+        UnionTagKind::None => 0,
+        _ => int_byte_size(IntBits::Fixed(enum_tag_bits(info.variants.len()))),
+    };
+    let mut payload_align = 1u64;
+    for v in &info.variants {
+        if let Some(pl) = layout_of(arena, v.payload) {
+            payload_align = payload_align.max(pl.align);
+        }
+    }
+    round_up(tag_size, payload_align)
+}
+
+/// The byte size and alignment of a tagged union's tag (discriminant) at +0.
+/// `(0, 1)` for an untagged `union {…}`.
+pub fn union_tag_layout(arena: &TypeArena, union_ty: TypeId) -> Layout {
+    let Type::Union(id) = arena.get(union_ty) else {
+        return Layout { size: 0, align: 1 };
+    };
+    let info = &arena.unions[id.0 as usize];
+    match info.tag {
+        UnionTagKind::None => Layout { size: 0, align: 1 },
+        _ => {
+            let sz = int_byte_size(IntBits::Fixed(enum_tag_bits(info.variants.len())));
+            Layout {
+                size: sz,
+                align: sz.max(1),
+            }
+        }
     }
 }
 
@@ -226,4 +310,77 @@ pub fn optional_flag_off(arena: &TypeArena, opt_ty: TypeId) -> Option<u64> {
         return layout_of(arena, *inner).map(|l| l.size);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k2_types::{UnionInfo, UnionTagKind, UnionVariant};
+
+    fn span() -> k2_syntax::Span {
+        k2_syntax::Span::new(0, 0, 0, 0)
+    }
+
+    /// Builds an inferred-tag `union(enum)` whose variants carry `payloads` (in
+    /// order). The union's defining span is `start`, so two unions in one arena
+    /// get distinct nominal identities (interning dedups by span).
+    fn union_of(arena: &mut TypeArena, start: u32, payloads: &[TypeId]) -> TypeId {
+        let variants = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| UnionVariant {
+                name: format!("v{i}"),
+                payload: p,
+                span: span(),
+            })
+            .collect();
+        arena.intern_union(UnionInfo {
+            def: None,
+            name: "U".to_string(),
+            span: k2_syntax::Span::new(start, start + 1, 0, 0),
+            tag: UnionTagKind::Inferred,
+            variants,
+            decls: Vec::new(),
+        })
+    }
+
+    fn u(arena: &mut TypeArena, bits: u16) -> TypeId {
+        arena.intern(Type::Int {
+            signed: false,
+            bits: IntBits::Fixed(bits),
+        })
+    }
+
+    #[test]
+    fn union_layout_is_tag_plus_max_payload() {
+        let mut arena = TypeArena::new();
+        let (u8t, u32t) = (u(&mut arena, 8), u(&mut arena, 32));
+        // union(enum) { v0: u8, v1: u32 }: 2 variants -> 1-byte tag; payload max =
+        // u32 (4, align 4); payload at round_up(1, 4) = 4; size round_up(4+4, 4)=8.
+        let un = union_of(&mut arena, 100, &[u8t, u32t]);
+        assert_eq!(layout_of(&arena, un), Some(Layout { size: 8, align: 4 }));
+        assert_eq!(union_payload_off(&arena, un), 4);
+        assert_eq!(union_tag_layout(&arena, un).size, 1);
+    }
+
+    #[test]
+    fn union_layout_aligns_payload_to_widest_variant() {
+        let mut arena = TypeArena::new();
+        let boolt = arena.intern(Type::Bool);
+        let u64t = u(&mut arena, 64);
+        let voidt = arena.t_void();
+        // union(enum) { v0: bool, v1: u64, v2: void }: 3 variants -> 1-byte tag;
+        // payload max = u64 (8, align 8); payload at round_up(1, 8) = 8; size 16.
+        let un = union_of(&mut arena, 200, &[boolt, u64t, voidt]);
+        assert_eq!(layout_of(&arena, un), Some(Layout { size: 16, align: 8 }));
+        assert_eq!(union_payload_off(&arena, un), 8);
+        assert_eq!(union_tag_layout(&arena, un).size, 1);
+    }
+
+    #[test]
+    fn union_payload_off_is_zero_for_a_non_union() {
+        let mut arena = TypeArena::new();
+        let u32t = u(&mut arena, 32);
+        assert_eq!(union_payload_off(&arena, u32t), 0);
+    }
 }

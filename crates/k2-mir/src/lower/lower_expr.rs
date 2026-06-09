@@ -11,6 +11,16 @@
 
 use super::*;
 
+/// How a tagged-union literal's value is wrapped to match its target type: built
+/// directly (`Bare`), or wrapped into an optional (`Some`) or error union (`Ok`)
+/// when the literal is coerced into `?U` / `E!U`. See [`FnBuilder::union_coercion`].
+#[derive(Clone, Copy)]
+enum UnionWrap {
+    Bare,
+    Some,
+    Ok,
+}
+
 impl FnBuilder<'_, '_> {
     /// Lowers `e` so that its value is written into `dst`.
     pub(super) fn lower_into(&mut self, dst: Place, e: &Expr) {
@@ -23,8 +33,7 @@ impl FnBuilder<'_, '_> {
             | Expr::Bool { .. }
             | Expr::Null { .. }
             | Expr::Undefined { .. }
-            | Expr::ErrorLiteral { .. }
-            | Expr::EnumLiteral { .. } => {
+            | Expr::ErrorLiteral { .. } => {
                 let ty = self.type_at(e.span());
                 if let Some(c) = self.const_of(e, ty) {
                     self.assign(dst, Rvalue::Use(Operand::Const(c)), e.span());
@@ -35,6 +44,14 @@ impl FnBuilder<'_, '_> {
                         e.span(),
                     );
                 }
+            }
+
+            // An enum literal `.variant`: a plain enum constant, OR — when the
+            // target is a `union(enum)` — a payload-less tagged-union value built
+            // with `MakeUnion`.
+            Expr::EnumLiteral { name, span, .. } => {
+                let ty = self.type_at(*span);
+                self.lower_variant_into(dst, *span, ty, name);
             }
 
             // ---- place reads ----------------------------------------------
@@ -190,12 +207,28 @@ impl FnBuilder<'_, '_> {
                 }
             }
             Some(MemberRes::Variant(idx)) => {
+                // `Enum.Variant` is a plain enum constant; `Union.variant` (a
+                // payload-less `union(enum)` variant accessed by qualified name)
+                // builds a `{tag, payload}` union value via `MakeUnion`.
                 let ty = self.type_at(span);
-                self.assign(
-                    dst,
-                    Rvalue::Use(Operand::Const(Const::EnumVal { variant: idx, ty })),
-                    span,
-                );
+                if self.is_tagged_union(ty) {
+                    self.assign(
+                        dst,
+                        Rvalue::MakeUnion {
+                            variant: idx,
+                            payload: Operand::Const(Const::Void),
+                            ty,
+                        },
+                        span,
+                    );
+                } else {
+                    let value = self.enum_variant_value(ty, idx);
+                    self.assign(
+                        dst,
+                        Rvalue::Use(Operand::Const(Const::EnumVal { variant: value, ty })),
+                        span,
+                    );
+                }
             }
             Some(MemberRes::ErrorMember) => {
                 let tag = self.lo.err_tag(field);
@@ -372,6 +405,18 @@ impl FnBuilder<'_, '_> {
                 let ty = self.type_at(span);
                 if let Some(c) = self.comptime_span_const(span, ty) {
                     self.assign(dst, Rvalue::Use(Operand::Const(c)), span);
+                } else if let Some(bytes) = self
+                    .lo
+                    .typed
+                    .comptime_span_strs
+                    .get(&(span.start, span.end))
+                    .cloned()
+                {
+                    // A `++` STRING concat folded to these bytes — materialize a
+                    // `Const::Str` (the checker recorded the fold by span) instead of
+                    // leaving it `undef`.
+                    let id = self.lo.intern_str(bytes);
+                    self.assign(dst, Rvalue::Use(Operand::Const(Const::Str(id))), span);
                 } else {
                     self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
                 }
@@ -1276,7 +1321,20 @@ impl FnBuilder<'_, '_> {
                             .typed
                             .type_valued_spans
                             .get(&(bspan.start, bspan.end))
-                            .copied();
+                            .copied()
+                            .or_else(|| {
+                                // A stored type-alias const base
+                                // (`const S = Sorter(…); S.method(…)`): the denoted
+                                // type is keyed by the ident's def in `item_types`,
+                                // not recorded at the ident span. Mirrors the
+                                // checker's `is_method_call`.
+                                if let Expr::Ident { span: ispan, .. } = &**base {
+                                    self.resolved_def(*ispan)
+                                        .and_then(|d| self.lo.typed.item_types.get(&d).copied())
+                                } else {
+                                    None
+                                }
+                            });
                         if let Some(struct_ty) = inst_arg {
                             // Associated call: no implicit receiver.
                             let inst = InstId {
@@ -1832,22 +1890,65 @@ impl FnBuilder<'_, '_> {
         span: Span,
     ) {
         let agg_ty = self.type_at(span);
-        // `union`/`union(enum)` values are accepted by the front-end (parse,
-        // resolve, type-check, format, doc) but their runtime payload
-        // storage/retrieval is not yet implemented in either backend — the
-        // initializer would otherwise lower to a plain struct aggregate and read
-        // back `undefined`. Per k2's first rule — implement what is feasible and
-        // *cleanly refuse* the rest, NEVER miscompile — refuse the construction
-        // here with a compile-time diagnostic rather than emit a wrong value.
-        // (`k2c check` still accepts the program; only running/compiling it is
-        // refused.) Tracked as future work in ROADMAP.md (Beyond 0.30).
-        if matches!(self.lo.typed.arena.get(agg_ty), Type::Union(_)) {
-            self.lo.diagnostics.push(Diagnostic::error(
+        // Tagged-union construction `.{ .variant = payload }` builds a `{tag,
+        // payload}` value via `MakeUnion` (the single union constructor), directly
+        // or — when coerced into `?U`/`E!U` — wrapped (a union is NOT transparent
+        // through an optional/error-union, so the wrap is explicit; without it the
+        // value silently lowered to a tagless struct aggregate, a miscompile). A
+        // bare `union {…}` (untagged) has no runtime discriminant: still refused.
+        //
+        // The union target is taken from the DESTINATION first, then the span type:
+        // a NESTED union literal (`.{ .nested = .{ .b = 3 } }`, where the inner type
+        // comes from the outer variant's payload type) is typed by the checker as a
+        // bare struct at its span, but its destination temp carries the true union
+        // type — so without the dst check it would lower to a tagless struct.
+        let dst_ty = if dst.is_local() {
+            self.func.locals[dst.base.index()].ty
+        } else {
+            agg_ty
+        };
+        // The `.{ … }` form only ever constructs a union (or a struct/array below);
+        // an enum is never written `.{ }`. So we take the union-only coercions.
+        let coerce = self
+            .tagged_coercion(dst_ty)
+            .filter(|&(_, _, is_union)| is_union)
+            .map(|(u, w, _)| (u, w, dst_ty))
+            .or_else(|| {
+                self.tagged_coercion(agg_ty)
+                    .filter(|&(_, _, is_union)| is_union)
+                    .map(|(u, w, _)| (u, w, agg_ty))
+            });
+        if let Some((union_ty, wrap, full_ty)) = coerce {
+            match wrap {
+                UnionWrap::Bare => self.lower_union_init(dst, union_ty, body, span),
+                _ => {
+                    let tmp = self.new_temp(union_ty, span);
+                    self.lower_union_init(Place::local(tmp), union_ty, body, span);
+                    self.wrap_union_into(dst, tmp, full_ty, wrap, span);
+                }
+            }
+            return;
+        }
+        // An EMPTY initializer (`C{}` / `.{}`) targeting a struct constructs the
+        // struct with ALL fields defaulted. `{}` parses as an empty *tuple*, so
+        // without this it would build an empty aggregate (0 fields) and any field
+        // read faulted with "field index out of range".
+        let body_empty = match body {
+            k2_syntax::InitBody::Fields(f) => f.is_empty(),
+            k2_syntax::InitBody::Tuple(e) => e.is_empty(),
+        };
+        if body_empty && matches!(self.lo.typed.arena.get(agg_ty), Type::Struct(_)) {
+            let ordered = self.order_struct_fields(agg_ty, &[]);
+            self.assign(
+                dst,
+                Rvalue::Aggregate {
+                    kind: AggKind::Struct,
+                    fields: ordered,
+                    ty: agg_ty,
+                },
                 span,
-                "constructing a `union`/`union(enum)` value is not yet supported by the \
-                 backends (runtime payload storage is unimplemented); model the sum type as \
-                 an `enum` tag plus a payload `struct` for now. See ROADMAP.md (Beyond 0.30).",
-            ));
+            );
+            return;
         }
         match body {
             k2_syntax::InitBody::Fields(fields) => {
@@ -1910,6 +2011,260 @@ impl FnBuilder<'_, '_> {
         }
     }
 
+    /// Lowers a tagged-union initializer `.{ .variant = payload }` into `dst` as a
+    /// `MakeUnion`. The single field names the active variant; its value is the
+    /// payload (lowered at the variant's declared payload type). An untagged
+    /// `union {…}` or an unresolved variant is *cleanly refused* (no runtime tag /
+    /// payload layout) rather than miscompiled.
+    fn lower_union_init(
+        &mut self,
+        dst: Place,
+        union_ty: TypeId,
+        body: &k2_syntax::InitBody,
+        span: Span,
+    ) {
+        if self.is_tagged_union(union_ty) {
+            if let k2_syntax::InitBody::Fields(fields) = body {
+                if let Some(fi) = fields.first() {
+                    if let Some((idx, payload_ty)) = self.union_variant(union_ty, &fi.name) {
+                        let payload = self.lower_operand(&fi.value, payload_ty);
+                        self.assign(
+                            dst,
+                            Rvalue::MakeUnion {
+                                variant: idx,
+                                payload,
+                                ty: union_ty,
+                            },
+                            span,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        self.lo.diagnostics.push(Diagnostic::error(
+            span,
+            "constructing an untagged `union {…}` value is not supported (it carries no \
+             runtime discriminant); use a `union(enum)` for a runtime sum type. See \
+             ROADMAP.md (Beyond 0.30).",
+        ));
+    }
+
+    /// Lowers an enum/union variant literal at `span` into `dst`. A plain enum
+    /// variant becomes a `Const::EnumVal`; a payload-less `union(enum)` variant
+    /// becomes a `MakeUnion` with a `void` payload.
+    ///
+    /// The union decision is driven by the DESTINATION's type, not the literal's
+    /// span type: the checker types a bare `.variant` literal as the union's *tag
+    /// enum*, so `self.type_at(span)` for `.point` is the tag enum, not `Shape`.
+    /// The destination local (`const p: Shape = .point`) carries the true union
+    /// type, so we read it back to choose `MakeUnion` over `Const::EnumVal`.
+    fn lower_variant_into(&mut self, dst: Place, span: Span, ty: TypeId, name: &str) {
+        let dst_ty = if dst.is_local() {
+            self.func.locals[dst.base.index()].ty
+        } else {
+            ty
+        };
+        // The tagged target (union, or an enum that needs wrapping) and the wrapper,
+        // from the destination type first then the span type. A `.clear` coerced
+        // into `?Cmd` must become `Some(Cmd.clear)`, never `null`; a `.green` into
+        // `?Color` must become `Some(Color.green)`, never a transparent bare enum
+        // whose `.payload` reads back empty.
+        let coerce = self
+            .tagged_coercion(dst_ty)
+            .map(|c| (c, dst_ty))
+            .or_else(|| self.tagged_coercion(ty).map(|c| (c, ty)));
+        // Resolve the variant index. The checker records a `Variant` resolution at
+        // the span for a direct target; for a `?T`/`E!T` target it may not, so we
+        // fall back to resolving the variant by NAME against the inner enum/union —
+        // otherwise the literal would lower to `undef` and read back wrong.
+        let idx = match self.member_at(span) {
+            Some(MemberRes::Variant(i)) => Some(i),
+            _ => coerce.and_then(|((inner, _, _), _)| self.variant_index(inner, name)),
+        };
+        let Some(idx) = idx else {
+            self.assign(dst, Rvalue::Use(Operand::Const(Const::Undef { ty })), span);
+            return;
+        };
+        let Some(((inner_ty, wrap, is_union), full_ty)) = coerce else {
+            // A bare enum variant (no wrap, no union) — a plain `Const::EnumVal`
+            // carrying the variant's tag VALUE (explicit `= N`, else its index). The
+            // ENUM type comes from the destination: the checker types a bare
+            // `.variant` literal as the tag enum, not the enum, so the value lookup
+            // must use `dst_ty` (falling back to the span type).
+            let enum_ty = if matches!(self.lo.typed.arena.get(dst_ty), Type::Enum(_)) {
+                dst_ty
+            } else {
+                ty
+            };
+            let value = self.enum_variant_value(enum_ty, idx);
+            self.assign(
+                dst,
+                Rvalue::Use(Operand::Const(Const::EnumVal {
+                    variant: value,
+                    ty: enum_ty,
+                })),
+                span,
+            );
+            return;
+        };
+        // The bare tagged value: a union via `MakeUnion` (whose tag is the variant
+        // INDEX), an enum via `Const::EnumVal` (whose tag is the variant VALUE).
+        let make = if is_union {
+            Rvalue::MakeUnion {
+                variant: idx,
+                payload: Operand::Const(Const::Void),
+                ty: inner_ty,
+            }
+        } else {
+            Rvalue::Use(Operand::Const(Const::EnumVal {
+                variant: self.enum_variant_value(inner_ty, idx),
+                ty: inner_ty,
+            }))
+        };
+        match wrap {
+            UnionWrap::Bare => self.assign(dst, make, span),
+            _ => {
+                let tmp = self.new_temp(inner_ty, span);
+                self.assign(Place::local(tmp), make, span);
+                self.wrap_union_into(dst, tmp, full_ty, wrap, span);
+            }
+        }
+    }
+
+    /// The integer tag VALUE of an `enum` variant by its declaration index — an
+    /// explicit `= N` (else the auto-incremented value, which equals the index when
+    /// no explicit values are given). Falls back to `idx` for a non-enum type (a
+    /// union, whose runtime tag IS the declaration index) or an out-of-range index.
+    /// Cast to `u32`, the `Const::EnumVal` tag width (explicit values are expected
+    /// to be small non-negative integers).
+    pub(super) fn enum_variant_value(&self, ty: TypeId, idx: u32) -> u32 {
+        if let Type::Enum(eid) = self.lo.typed.arena.get(ty) {
+            if let Some(v) = self.lo.typed.arena.enums[eid.0 as usize]
+                .variants
+                .get(idx as usize)
+            {
+                return v.value as u32;
+            }
+        }
+        idx
+    }
+
+    /// The declaration index of a `union(enum)` or `enum` variant by name (its tag
+    /// value). `None` if `ty` is neither, or has no such variant.
+    fn variant_index(&self, ty: TypeId, name: &str) -> Option<u32> {
+        match self.lo.typed.arena.get(ty) {
+            Type::Union(uid) => {
+                let uid = *uid;
+                self.lo.typed.arena.unions[uid.0 as usize]
+                    .variants
+                    .iter()
+                    .position(|v| v.name == name)
+                    .map(|i| i as u32)
+            }
+            Type::Enum(eid) => {
+                let eid = *eid;
+                self.lo.typed.arena.enums[eid.0 as usize]
+                    .variants
+                    .iter()
+                    .position(|v| v.name == name)
+                    .map(|i| i as u32)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves a union variant by name to its declaration index (its tag value)
+    /// and payload type. `None` if `union_ty` is not a union or has no such
+    /// variant.
+    pub(super) fn union_variant(&self, union_ty: TypeId, name: &str) -> Option<(u32, TypeId)> {
+        if let Type::Union(uid) = self.lo.typed.arena.get(union_ty) {
+            let info = &self.lo.typed.arena.unions[uid.0 as usize];
+            return info
+                .variants
+                .iter()
+                .enumerate()
+                .find(|(_, v)| v.name == name)
+                .map(|(i, v)| (i as u32, v.payload));
+        }
+        None
+    }
+
+    /// `true` if `ty` is a *tagged* union (`union(enum)` / `union(TagType)`),
+    /// which carries a runtime discriminant and so can be constructed and
+    /// `switch`-ed. A bare `union {…}` (untagged) is not.
+    pub(super) fn is_tagged_union(&self, ty: TypeId) -> bool {
+        if let Type::Union(uid) = self.lo.typed.arena.get(ty) {
+            return !matches!(
+                self.lo.typed.arena.unions[uid.0 as usize].tag,
+                k2_types::UnionTagKind::None
+            );
+        }
+        false
+    }
+
+    /// If a literal's target type `ty` constructs a tagged value that is NOT
+    /// transparent through an optional/error-union, returns `(inner_ty, wrap,
+    /// is_union)`. Both a `union(enum)` and an `enum` are `Value::Enum`-backed, and
+    /// a bare `Value::Enum` stored *transparently* as an optional's payload has its
+    /// `.payload` mis-read as the inner payload (a union's active variant; an
+    /// enum's empty `void`) rather than the value — so when WRAPPED they must get an
+    /// explicit `MakeSome`/`MakeOk`. A union (built with `MakeUnion`) needs this in
+    /// every position; an enum (a `Const::EnumVal`) only when wrapped, since a bare
+    /// enum value stands on its own. Returns `None` for a bare enum and any other
+    /// type. (Mirrored in `reflect`/codegen layout only conceptually; this is a
+    /// lowering-time rule.)
+    fn tagged_coercion(&self, ty: TypeId) -> Option<(TypeId, UnionWrap, bool)> {
+        if self.is_tagged_union(ty) {
+            return Some((ty, UnionWrap::Bare, true));
+        }
+        match self.lo.typed.arena.get(ty) {
+            Type::Optional(inner) => {
+                let inner = *inner;
+                self.tagged_inner(inner)
+                    .map(|is_union| (inner, UnionWrap::Some, is_union))
+            }
+            Type::ErrorUnion { ok, .. } => {
+                let ok = *ok;
+                self.tagged_inner(ok)
+                    .map(|is_union| (ok, UnionWrap::Ok, is_union))
+            }
+            _ => None,
+        }
+    }
+
+    /// `Some(is_union)` if `ty` is a tagged union (`true`) or an enum (`false`) —
+    /// the `Value::Enum`-backed types that are not transparent through an
+    /// optional/error-union. `None` otherwise.
+    fn tagged_inner(&self, ty: TypeId) -> Option<bool> {
+        if self.is_tagged_union(ty) {
+            return Some(true);
+        }
+        if matches!(self.lo.typed.arena.get(ty), Type::Enum(_)) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Wraps a freshly-built union value `tmp` per `wrap` into `dst` (`full_ty` is
+    /// the wrapper type). A `Bare` wrap is a no-op (the union was built into `dst`
+    /// directly by the caller and this is not called).
+    fn wrap_union_into(
+        &mut self,
+        dst: Place,
+        tmp: LocalId,
+        full_ty: TypeId,
+        wrap: UnionWrap,
+        span: Span,
+    ) {
+        let op = Operand::local(tmp);
+        match wrap {
+            UnionWrap::Bare => self.assign(dst, Rvalue::Use(op), span),
+            UnionWrap::Some => self.assign(dst, Rvalue::MakeSome(op, full_ty), span),
+            UnionWrap::Ok => self.assign(dst, Rvalue::MakeOk(op, full_ty), span),
+        }
+    }
+
     /// The element type of an array/slice/vector type (best effort).
     pub(super) fn array_elem(&self, ty: TypeId) -> TypeId {
         match self.lo.typed.arena.get(ty) {
@@ -1927,15 +2282,19 @@ impl FnBuilder<'_, '_> {
         agg_ty: TypeId,
         fields: &[k2_syntax::FieldInit],
     ) -> Vec<Operand> {
-        // Gather the struct's declared field names + types, if a struct.
-        let layout: Vec<(String, TypeId)> = match self.lo.typed.arena.get(agg_ty).clone() {
-            Type::Struct(sid) => self.lo.typed.arena.structs[sid.0 as usize]
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.ty))
-                .collect(),
-            _ => Vec::new(),
-        };
+        // Gather the struct's declared field names + types and its defining span
+        // (the key for its field defaults), if a struct.
+        let (layout, struct_span): (Vec<(String, TypeId)>, Option<Span>) =
+            match self.lo.typed.arena.get(agg_ty).clone() {
+                Type::Struct(sid) => {
+                    let info = &self.lo.typed.arena.structs[sid.0 as usize];
+                    (
+                        info.fields.iter().map(|f| (f.name.clone(), f.ty)).collect(),
+                        Some(info.span),
+                    )
+                }
+                _ => (Vec::new(), None),
+            };
         if layout.is_empty() {
             // Anonymous / unknown: keep source order.
             return fields
@@ -1950,12 +2309,30 @@ impl FnBuilder<'_, '_> {
         for (fname, fty) in &layout {
             if let Some(fi) = fields.iter().find(|fi| &fi.name == fname) {
                 ops.push(self.lower_operand(&fi.value, *fty));
+            } else if let Some(def) = self.struct_field_default(struct_span, fname) {
+                // An omitted field with a `= default`: lower the default expression
+                // (a comptime-known value) into the field, NOT `undef`. Without this
+                // the field read back uninitialized — a miscompile.
+                ops.push(self.lower_operand(&def, *fty));
             } else {
-                // Defaulted/omitted field: undef placeholder (default applied by VM).
+                // Omitted field with no default: undef placeholder.
                 ops.push(Operand::Const(Const::Undef { ty: *fty }));
             }
         }
         ops
+    }
+
+    /// The default initializer expression for `field` of the struct defined at
+    /// `struct_span`, if it has one (indexed at lowering setup from the struct's
+    /// declaration).
+    fn struct_field_default(&self, struct_span: Option<Span>, field: &str) -> Option<Expr> {
+        let span = struct_span?;
+        self.lo
+            .struct_field_defaults
+            .get(&(span.start, span.end))?
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, expr)| expr.clone())
     }
 
     // ===================================================================
@@ -2026,8 +2403,21 @@ impl FnBuilder<'_, '_> {
                 Some(Const::ErrVal { tag, ty })
             }
             Expr::EnumLiteral { span, .. } => {
+                // A variant literal whose target needs a `MakeUnion` and/or an
+                // explicit optional/error-union wrap — a `union(enum)` (`.point`,
+                // `.clear`) anywhere, or an `enum` coerced into `?E`/`E!E` (`.green`
+                // at `?Color`) — is NOT a plain inline constant. Returning `None`
+                // routes it through the rvalue path (`lower_variant_into`), which
+                // builds the value and wraps it; a bare enum still folds to
+                // `Const::EnumVal` here.
+                if self.tagged_coercion(ty).is_some() {
+                    return None;
+                }
                 if let Some(MemberRes::Variant(idx)) = self.member_at(*span) {
-                    Some(Const::EnumVal { variant: idx, ty })
+                    Some(Const::EnumVal {
+                        variant: self.enum_variant_value(ty, idx),
+                        ty,
+                    })
                 } else {
                     Some(Const::Undef { ty })
                 }

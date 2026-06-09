@@ -1,0 +1,38 @@
+//! percentiles.k2 — a real program: order statistics of a dataset using
+//! `std.sort.Sorter.quickselect` (O(n) average per query) rather than a full sort.
+//! Reports the min, max, several percentiles, and the median, cross-checking the
+//! median against a fully-sorted copy. Each quickselect runs on its own copy
+//! because it reorders the slice.
+
+const std = @import("std");
+
+const S = std.sort.Sorter(i64, std.sort.asc(i64));
+
+const data = [_]i64{ 23, 7, 91, 42, 15, 68, 4, 50, 33, 80, 12, 60, 28, 75, 19, 88, 1, 55, 37, 99 };
+
+/// The `p`-th percentile (0..100) by nearest-rank, via quickselect on a copy.
+fn percentile(p: u64) i64 {
+    var copy = data; // an array copy (value type), so quickselect won't disturb `data`
+    const n = copy.len;
+    // nearest-rank index = floor(p/100 · n), clamped to [0, n-1].
+    var rank: usize = @as(usize, @intCast((p * @as(u64, n)) / 100));
+    if (rank >= n) rank = n - 1;
+    return S.quickselect(copy[0..n], rank).?;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    try out.print("n={d} min={d} max={d}\n", .{ data.len, percentile(0), percentile(100) });
+    try out.print("p25={d} p50={d} p75={d} p90={d}\n", .{
+        percentile(25), percentile(50), percentile(75), percentile(90),
+    });
+
+    // Median by the dedicated helper, cross-checked against a sorted copy.
+    var sorted = data;
+    S.sort(sorted[0..sorted.len]);
+    var copy = data;
+    const med = S.median(copy[0..copy.len]).?;
+    const ref = sorted[(sorted.len - 1) / 2];
+    try out.print("median={d} matches_sorted={}\n", .{ med, med == ref });
+}

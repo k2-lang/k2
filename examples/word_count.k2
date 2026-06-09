@@ -1,0 +1,63 @@
+//! word_count.k2 — a small, real program: tally word frequencies in a text.
+//!
+//! It ties together several `std` pieces built up over v0.36+: the `str`
+//! field-iterator `splitScalar` (yielding no-copy sub-slices of the input — which
+//! needs the string-literal slicing fix), a `StringHashMap` for the counts with
+//! the `getOrPut` pointer idiom, and `fmt`-formatted output. The keys are
+//! sub-slices that borrow the source text, which outlives them, so nothing is
+//! copied or allocated per word beyond the map's own storage.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    const text = "the quick brown fox the lazy dog the quick fox the end";
+
+    var counts = std.StringHashMap(usize).init(alloc);
+    defer counts.deinit();
+
+    // Split on spaces; count each non-empty word.
+    var total: usize = 0;
+    var it = std.str.splitScalar(text, ' ');
+    while (it.next()) |word| {
+        if (word.len == 0) continue;
+        total += 1;
+        const r = try counts.getOrPut(word);
+        if (r.found_existing) {
+            r.value_ptr.* += 1;
+        } else {
+            r.value_ptr.* = 1;
+        }
+    }
+
+    try out.print("total words: {d}\n", .{total});
+    try out.print("unique words: {d}\n", .{counts.count()});
+
+    // Report a few specific frequencies.
+    try out.print("the={d} quick={d} fox={d} dog={d} missing={d}\n", .{
+        counts.get("the") orelse 0,
+        counts.get("quick") orelse 0,
+        counts.get("fox") orelse 0,
+        counts.get("dog") orelse 0,
+        counts.get("cat") orelse 0,
+    });
+
+    // The most frequent word's count, by scanning the map's iterator.
+    var max_count: usize = 0;
+    var distinct_singletons: usize = 0;
+    var mit = counts.iterator();
+    while (mit.next()) |e| {
+        if (e.value > max_count) max_count = e.value;
+        if (e.value == 1) distinct_singletons += 1;
+    }
+    try out.print("max frequency: {d}\n", .{max_count});
+    try out.print("words seen once: {d}\n", .{distinct_singletons});
+}

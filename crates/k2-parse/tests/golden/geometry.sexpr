@@ -1,0 +1,242 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn dist
+    (params
+      (param x1
+        (ident f64)
+      )
+      (param y1
+        (ident f64)
+      )
+      (param x2
+        (ident f64)
+      )
+      (param y2
+        (ident f64)
+      )
+    )
+    (ret
+      (ident f64)
+    )
+    (block
+      (return
+        (call
+          (field hypot
+            (field mathf
+              (ident std)
+            )
+          )
+          (binary sub
+            (ident x2)
+            (ident x1)
+          )
+          (binary sub
+            (ident y2)
+            (ident y1)
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"dist (0,0)->(3,4): {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident dist)
+                  (float 0.0)
+                  (float 0.0)
+                  (float 3.0)
+                  (float 4.0)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const r
+        (ty
+          (ident f64)
+        )
+        (float 2.0)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"circle r=2: area={d} circumference={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary mul
+                  (binary mul
+                    (field pi
+                      (field mathf
+                        (ident std)
+                      )
+                    )
+                    (ident r)
+                  )
+                  (ident r)
+                )
+                (binary mul
+                  (binary mul
+                    (float 2.0)
+                    (field pi
+                      (field mathf
+                        (ident std)
+                      )
+                    )
+                  )
+                  (ident r)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const theta
+        (binary div
+          (field pi
+            (field mathf
+              (ident std)
+            )
+          )
+          (float 3.0)
+        )
+      )
+      (const px
+        (call
+          (field cos
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident theta)
+        )
+      )
+      (const py
+        (call
+          (field sin
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident theta)
+        )
+      )
+      (const len
+        (call
+          (field hypot
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident px)
+          (ident py)
+        )
+      )
+      (const len_rounded
+        (binary div
+          (call
+            (field round
+              (field mathf
+                (ident std)
+              )
+            )
+            (binary mul
+              (ident len)
+              (float 1000000.0)
+            )
+          )
+          (float 1000000.0)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"unit vector length (rounded): {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident len_rounded)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sqrt(144)={d} sqrt(625)={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field sqrt
+                    (field mathf
+                      (ident std)
+                    )
+                  )
+                  (float 144.0)
+                )
+                (call
+                  (field sqrt
+                    (field mathf
+                      (ident std)
+                    )
+                  )
+                  (float 625.0)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

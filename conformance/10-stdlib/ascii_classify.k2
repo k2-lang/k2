@@ -1,0 +1,37 @@
+// ascii_classify.k2 — the v0.36+ `std.ascii` classifiers: isUpper/isLower,
+// isHexDigit, isControl, isPrint, isPunct, and the hexValue digit decoder. Pure
+// single-byte predicates, `{d}` counts only — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Tally classifications over the printable ASCII range 0x20..=0x7E.
+    var letters: u32 = 0;
+    var digits: u32 = 0;
+    var hexd: u32 = 0;
+    var punct: u32 = 0;
+    var upper: u32 = 0;
+    var c: u8 = 0x20;
+    while (c <= 0x7E) : (c += 1) {
+        if (std.ascii.isAlpha(c)) letters += 1;
+        if (std.ascii.isDigit(c)) digits += 1;
+        if (std.ascii.isHexDigit(c)) hexd += 1;
+        if (std.ascii.isPunct(c)) punct += 1;
+        if (std.ascii.isUpper(c)) upper += 1;
+    }
+    try out.print("letters={d} digits={d} hex={d} punct={d} upper={d}\n", .{
+        letters, digits, hexd, punct, upper,
+    });
+
+    // Control vs printable at the boundaries, and hexValue round trip.
+    try out.print("ctrl(0,31,127)={d} print(0x20,0x7e)={d} hexValue(a..f sum)={d}\n", .{
+        @as(u8, if (std.ascii.isControl(0)) 1 else 0) +
+            @as(u8, if (std.ascii.isControl(31)) 1 else 0) +
+            @as(u8, if (std.ascii.isControl(127)) 1 else 0),
+        @as(u8, if (std.ascii.isPrint(0x20)) 1 else 0) +
+            @as(u8, if (std.ascii.isPrint(0x7E)) 1 else 0),
+        std.ascii.hexValue('a').? + std.ascii.hexValue('b').? + std.ascii.hexValue('c').? +
+            std.ascii.hexValue('d').? + std.ascii.hexValue('e').? + std.ascii.hexValue('f').?,
+    });
+}

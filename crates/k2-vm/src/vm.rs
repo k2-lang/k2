@@ -1625,6 +1625,20 @@ impl<'p> Vm<'p> {
                 self.set_cur(dst, Value::ErrVal(tag));
                 Ok(Flow::Next)
             }
+            Instr::MakeUnion { dst, tag, src } => {
+                // A `union(enum)` value: the active variant index plus its payload.
+                // Read back via `Discr` (tag) + `Switch` and `LoadPayload`/`Payload`
+                // projection — identical machinery to `Value::Enum` for enums.
+                let v = self.get(src);
+                self.set_cur(
+                    dst,
+                    Value::Enum {
+                        tag,
+                        payload: Box::new(v),
+                    },
+                );
+                Ok(Flow::Next)
+            }
             Instr::Aggregate { dst, kind, fields } => {
                 let vs: Vec<Value> = fields.iter().map(|&r| self.get(r)).collect();
                 let v = match kind {
@@ -2019,10 +2033,16 @@ impl<'p> Vm<'p> {
                 SliceMeta::Len => Value::int(*len as i128, IntRepr::USIZE),
                 SliceMeta::Ptr => Value::Ptr(*ptr),
             }),
-            // A `[]const u8` string literal: `.len` is its byte length.
+            // A `[]const u8` string literal: `.len` is its byte length. For `.ptr`
+            // (the data-pointer half a slice expression reads before `MakeSlice`),
+            // hand back the `Str` VALUE itself — it has no heap cell, so `make_slice`
+            // recognizes a `Str` base and produces a sub-`Str`. Returning `Unit` here
+            // (the old behavior) yielded a NULL-pointer slice, so `"abc"[1..]`
+            // faulted on access. (A bare `s.ptr` read of a string literal — rare — now
+            // observes the `Str`; the slice path is the real consumer.)
             Value::Str(bytes) => Ok(match which {
                 SliceMeta::Len => Value::int(bytes.len() as i128, IntRepr::USIZE),
-                SliceMeta::Ptr => Value::Unit,
+                SliceMeta::Ptr => base.clone(),
             }),
             Value::Array(elems) => Ok(match which {
                 SliceMeta::Len => Value::int(elems.len() as i128, IntRepr::USIZE),
@@ -2062,6 +2082,10 @@ impl<'p> Vm<'p> {
             Value::Optional(Some(v)) => (**v).clone(),
             Value::Optional(None) => Value::Unit,
             Value::ErrOk(v) => (**v).clone(),
+            // A `union(enum)` payload (a `.variant => |x| …` capture): the active
+            // variant's value, NOT the whole union. Without this arm the capture
+            // would bind the entire `Value::Enum` and read garbage.
+            Value::Enum { payload, .. } => (**payload).clone(),
             other => other.clone(),
         }
     }
@@ -2109,6 +2133,17 @@ impl<'p> Vm<'p> {
                 ptr: with_offset(*ptr),
                 len: n,
             },
+            // Slicing a string literal (`Value::Str`, an `Rc<Vec<u8>>` with no heap
+            // cell) yields a sub-STRING of the same bytes. Without this arm the base
+            // fell through to a NULL-pointer slice, so `"hello"[1..4]` read back as a
+            // null `[]const u8` (indexing it / `{s}`-printing it faulted). A `Str`
+            // value is a valid `[]const u8`, so a `Str` result is type-consistent;
+            // `index`/`slice_meta`/`{s}` all already handle `Str`.
+            Value::Str(bytes) => {
+                let lo = off.min(bytes.len());
+                let hi = (off + n).min(bytes.len());
+                Value::Str(Rc::new(bytes[lo..hi].to_vec()))
+            }
             _ => Value::Slice {
                 ptr: Ptr::NULL,
                 len: n,
@@ -5153,6 +5188,15 @@ impl<'p> Vm<'p> {
         match target {
             // A concrete sized integer target: range-check precisely.
             Some(repr) if repr.width != 0 => {
+                // A 128-bit UNSIGNED target is i128-backed, so `min_value()`
+                // collapses to `i128::MIN` and a NEGATIVE source would wrongly
+                // "fit" (a `u128` can't be negative). Reject it explicitly so a
+                // narrowing cast like `@intCast(@as(i64, -5))` to `u128` traps —
+                // matching the native backend, which already does. Other widths and
+                // signed 128-bit targets keep the precise range check below.
+                if repr.width >= 128 && !repr.signed && a < 0 {
+                    return Value::Bool(false);
+                }
                 Value::Bool(a >= repr.min_value() && a <= repr.max_value())
             }
             // No carrier, or an unsized/unknown (comptime/deferred) target: the

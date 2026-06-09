@@ -1,0 +1,3 @@
+radix: 255 ff 1010 rust 0 
+signed: 42 -987 -9223372036854775808 9223372036854775807 
+roundtrip: true true true true 

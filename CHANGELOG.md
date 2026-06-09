@@ -10,7 +10,198 @@ is being designed in the open and nothing is stable yet.
 
 ## [Unreleased]
 
+### Changed
+
+- **Spec §1.3 reconciled: a lone `\r` is whitespace (v0.33).** The reference lexer
+  has always treated a lone carriage return (old-style Mac line ending) — and a
+  `\r\n` pair — as whitespace, but the spec called a lone `\r` a *lexical error*.
+  The spec is now relaxed to match the lexer (the lenient, common choice), closing
+  the documented gap. Pinned by `k2-lexer`'s `lone_carriage_return_is_whitespace`
+  test; the deferred note is removed from the roadmap.
+
 ### Fixed
+
+- **An out-of-range comptime shift/bitwise/division result coerced silently (found
+  by a review sub-agent).** `const x: u8 = 1 << 9;` (512) was accepted while
+  `const x: u8 = 255 + 1;` correctly errors — the coercion range-check only folded
+  `+`/`-`/`*`. `fold_comptime_int` now also folds `<<`/`>>`/`&`/`|`/`^`/`/`/`%`
+  (mirroring the comptime engine), so a sized-int coercion of a compile-time-known
+  out-of-range result is a clean error. In-range values and runtime (non-literal)
+  shifts are unaffected.
+
+- **A negative `@intCast` to `u128` silently wrapped in the VM (found by a review
+  sub-agent).** `const u: u128 = @intCast(@as(i64, -5));` yielded `2^128 - 5`
+  instead of trapping — a "never miscompile" violation, and a divergence from the
+  native backend (which correctly traps "cast truncated value"). The VM's narrowing
+  check is i128-backed, and `IntRepr::min_value()` collapses to `i128::MIN` for
+  128-bit widths, so a negative source "fit" an (unsigned) `u128`. The VM now
+  rejects a negative source for any unsigned ≥128-bit target, matching native.
+  (The separate, *documented* limitation that `u128` add/sub/mul overflow
+  under-traps — VM and native agreeing — is unchanged.)
+
+- **`std.mathf` numerical bugs (found by a review sub-agent).** Three real defects,
+  now fixed and pinned by `conformance/10-stdlib/mathf_edge.k2`:
+  - **`sqrt`** diverged for magnitudes outside ~`[1e-33, 1e33]` (a `g = x` Newton
+    start needs O(log x) iterations). It now scales `x` by powers of four into
+    `[1, 4)`, runs Newton there, and rescales — accurate for `1e-300 … 1e300`.
+  - **`round`** double-rounded `0.49999999999999994` up to `1` (the `floor(x+0.5)`
+    defect). It now compares the residual `x - floor(x)` against `0.5`.
+  - **`hypot`** overflowed to `inf`/`NaN` forming `a² + b²`. It now scales by
+    `max(|a|,|b|)`, so `hypot(1e200, 1e200)` is finite. (`cos` near `±π` also got
+    one more series term to hold ≈1e-12.)
+
+- **`++` string concatenation lowered to `undef`.** `const s = "a" ++ "b";` then
+  `s.len` / `{s}` trapped ("slice meta on non-slice"): the comptime engine folded
+  the concat to a `Value::Str`, but the MIR only materialized a folded value through
+  the ints-only `comptime_span_const`, so a folded STRING became `undef`. The
+  checker now records the folded bytes of a `++` string concat by span (a new
+  `comptime_span_strs` map on `Typed`), and the MIR's concat lowering emits a
+  `Const::Str` from it. Verified VM- and native-identical for top-level consts,
+  inline args, chained-with-escapes, empty operands, and slicing the result; pinned
+  by `conformance/02-types/string_concat.k2`. (A non-string ARRAY `++` still lowers
+  to `undef` — tracked separately.)
+
+- **An unknown or unimplemented builtin lowered to a silent `undef` (`<int>`).** A
+  `@name` the toolchain does not implement — a typo, or a Zig-ism k2 spells
+  differently (`@divTrunc`/`@divFloor`/`@rem`/`@mod` → `/`, `%`, `std.math.divFloor`,
+  `std.math.mod`) — type-checked as a conservative `Deferred` and the MIR lowered it
+  to `undef`, so it ran and printed `<int>` instead of failing. The checker now
+  validates every `@builtin` against a `KNOWN_BUILTINS` allowlist (the union of the
+  typed builtins and the raw/intrinsic ones the std and build graph use) and reports
+  `unknown builtin \`@…\`` at the call site. Pinned by
+  `crates/k2c/tests/cli.rs::unknown_builtin_is_reported_not_silently_undef`.
+
+- **The leak analysis falsely flagged an allocation stored into a pointer-reachable
+  field.** A node-based structure — `const n = try alloc.create(Node); n.* = …;
+  self.left = n;` — reported "allocated value is never freed", because the
+  ownership trace recognized `return`, a paired free, and passing to a *call* as
+  transfers, but NOT a store THROUGH a pointer (`(*self).left = n`). The pass now
+  also treats a store into a place with a `Deref` step as an ownership transfer
+  (the value escapes via that pointer; the owning structure frees it). Genuine
+  leaks — an allocation never freed, returned, passed, or stored out — are still
+  reported (verified). This unblocks recursive containers; pinned by the new
+  `std.BstNode` and `conformance/10-stdlib/bst_node.k2`.
+
+- **A static method call through a stored generic-type alias dropped an
+  argument.** `const S = std.sort.Sorter(i64, std.sort.asc(i64)); S.binarySearch(&arr, 5)`
+  failed with "expects 1 argument, found 2" — yet the inline
+  `std.sort.Sorter(…).binarySearch(&arr, 5)` worked. The alias ident synths to the
+  *denoted* `struct` (not to `type`), so the member-call resolver misread it as a
+  value receiver and consumed `&arr` as a phantom `self`. Both the checker
+  (`is_method_call`) and the lowerer (`resolve_direct_call`) now treat an ident
+  bound to a type-denoting `const` as an ASSOCIATED call (`item_types` is exported
+  on `Typed` for the lowerer). Done as a member-call decision, NOT a blanket
+  type-valued record, so `@TypeOf(S)` still sees `type`. Pinned by
+  `conformance/10-stdlib/type_alias_methods.k2`.
+
+- **A struct field could not point to its own type (`?*@This()`).** A
+  self-referential field — the building block of linked lists, trees, and graphs —
+  was rejected with "expected `?*deferred`, found `*Node`": the struct's type was
+  not visible while its own fields were being evaluated, so the pointer's pointee
+  resolved to `deferred`. Both the top-level path (`eval_struct`) and the generic
+  instantiation path (`eval_struct_comptime`) now use two-phase nominal resolution
+  — intern a field-less SHELL, expose its type (on `self_stack`, and top-level also
+  by name in `item_types`), evaluate the fields, then patch them in. `next: ?*@This()`
+  / `left: ?*@This()` now resolve to the struct, for both a top-level `struct` (also
+  by its bare name, `?*Node`) and a generic node `Node(T)`. Pinned by
+  `conformance/02-types/recursive_types.k2` (a stack-linked list and a generic
+  binary tree). (A field naming a SIBLING type const — `head: ?*Node` where
+  `const Node = struct {…}` is a neighbor decl — still needs nested type-consts
+  bound before fields, and is tracked separately.)
+
+- **Slicing a string LITERAL produced a null-pointer slice (VM).** `"hello"[1..4]`
+  (and any sub-slice of a `[]const u8` literal) read back with a NULL data pointer,
+  so indexing it or `{s}`-printing it faulted ("null pointer dereference"); only
+  the WHOLE literal worked. In the VM a string literal is a `Value::Str` (an
+  `Rc<Vec<u8>>` with no heap cell), and the slice path took its `.ptr` half — which
+  returned `Unit`, then `make_slice` produced a `Ptr::NULL` slice. The slice path
+  now hands back the `Str` value, and `make_slice` recognizes a `Str` base and
+  yields a sub-`Str` of the same bytes. Native was already correct (literals live
+  in `.rodata` with real addresses); this aligns the VM. Surfaced by the new
+  `std.str` module, which slices literals throughout.
+
+- **A `comptime { … return X; }` block's return value was dropped.** Such a block
+  returns a comptime-known value from its enclosing function
+  (`fn answer() u64 { comptime { return 42; } }`), but the MIR emitted nothing for
+  the block, so the function fell through to `undefined` (printed `<int>`). The
+  block's `return` now materializes the folded constant. Pinned by
+  `conformance/07-comptime/comptime_block_return.k2` (native-marked). NOTE: a value
+  computed by an in-block LOOP across distinct comptime arguments
+  (`comptime { var r = 1; while (…) r *= i; return r; }`) is per-monomorphization,
+  and the span-keyed fold can't represent it yet — that case is still deferred
+  (tracked); the common `comptime { return <const-expr>; }` form is fixed.
+
+- **Explicit `enum` values were ignored (v0.35).** `enum(u8) { ok = 0, busy = 10,
+  gone = 200 }` used the declaration *index* as each variant's tag — so
+  `@intFromEnum(.gone)` was `2`, not `200`, and a `switch` matched the wrong prong.
+  Each variant now carries its tag VALUE (an explicit `= N`, else the previous + 1;
+  spec §9), threaded through construction (`Const::EnumVal`), `switch` dispatch,
+  `@intFromEnum`/`@enumFromInt` (runtime *and* comptime), and `@typeInfo` reflection.
+  A bare (valueless) enum is unchanged (0, 1, 2 …). VM- and native-verified by
+  `conformance/02-types/enum_explicit_values.k2` (native-marked) and
+  `crates/k2c/tests/cli.rs::explicit_enum_values_are_honored`. (The variant
+  *declaration index* — used for reflection ordering and a `union(enum)`'s runtime
+  tag — stays distinct from the value, which only diverge under explicit values.)
+
+- **`struct` field defaults were not applied (v0.34).** A field with a `= default`
+  read back `undefined` when an initializer omitted it (`C{ .y = 5 }` left `x`
+  uninitialized), and an *empty* initializer `C{}` — which parses as an empty
+  tuple — faulted with "field index out of range" instead of defaulting every
+  field. Construction now indexes each struct's declared field defaults (keyed by
+  the struct's defining span, like the existing value-const index) and lowers the
+  default expression into any omitted field; an empty struct initializer routes
+  through the same all-defaults path. All default kinds work (int, bool, float,
+  `[]const u8`). VM- and native-verified by
+  `conformance/02-types/struct_field_defaults.k2` and
+  `crates/k2c/tests/cli.rs::struct_field_defaults_are_filled_in`.
+
+- **An `enum` literal coerced into an optional/error-union was miscompiled.**
+  `const c: ?Color = .green` (and `E!Color = .blue`) read back as `null` / the
+  wrong variant: like a union, an `enum` value is `Value::Enum`-backed and not
+  transparent through an optional (its payload is empty), but it was stored
+  transparently. The construction path that wraps unions (`MakeSome`/`MakeOk`) was
+  generalized to any `Value::Enum`-backed value (`tagged_coercion`), so a wrapped
+  enum is wrapped explicitly while a bare enum stays a plain `Const::EnumVal`.
+  Pre-existing (independent of unions); fixed alongside them. VM-verified by
+  `conformance/03-expr-stmt/enum_optional_coercion.k2` and
+  `crates/k2c/tests/cli.rs::enum_literal_coerced_into_optional_is_not_miscompiled`.
+  (The native backend's narrow-enum-through-optional path, passed to a function,
+  remains a fragile subset matter — VM-only for now; an `int`/`union` through the
+  same shape is fine.)
+
+- **A `union(enum)` literal nested as another union's variant payload was
+  miscompiled.** In `.{ .nested = .{ .b = 3 } }` the inner literal's type comes
+  from the outer variant's declared payload type, not its own span, so the
+  initializer lowered it to a tagless `struct` aggregate instead of the inner
+  union — the nested `switch` then read garbage. Union construction now derives
+  the union target from the DESTINATION type first (then the span type), fixing
+  nested unions, unions coerced into `?U`/`E!U`, and the payload-less variant
+  forms uniformly. Pinned by `conformance/02-types/union_nested.k2` and
+  `crates/k2c/tests/cli.rs::nested_union_literal_is_not_miscompiled`.
+
+- **A `union(enum)` literal coerced into an optional/error-union was
+  miscompiled.** `const c: ?Cmd = .{ .set = 42 }` (and the bare `.clear` form)
+  silently lowered to a tagless `struct` aggregate / an `undef` read back as
+  `null`, because a union — unlike a struct — is NOT transparent through an
+  optional (its `.payload` reads the active variant's payload, not the whole
+  union). Union construction now recognizes a `U` / `?U` / `E!U` target uniformly
+  (`union_coercion`) and, for the wrapped cases, builds the union and applies an
+  explicit `MakeSome`/`MakeOk`. The payload-less `.variant` form also resolves its
+  variant by name against the union when the checker recorded no span resolution
+  for the coerced target. Pinned by
+  `crates/k2c/tests/cli.rs::union_literal_coerced_into_optional_is_not_miscompiled`
+  and `conformance/02-types/union_in_optional.k2`. (Surfaced by v0.31.)
+
+- **Native: a 9–15 byte aggregate passed BY VALUE corrupted an adjacent frame
+  slot.** A by-value `struct`/`union` of 9–15 bytes is passed in a System V
+  register PAIR (`TwoInt`) and received with two full 8-byte stores at `home+0` /
+  `home+8` — 16 bytes written. The frame planner reserved a home of only
+  `max(size, 8)` bytes, so the second store spilled 1–7 bytes into the adjacent
+  local (a 12-byte `struct { a, b, c: u32 }` parameter read back garbage or
+  faulted). The home is now padded to `round_up(size, 8)`, so the word-granular
+  receive always lands inside it. Found while bringing up `union(enum)` runtime
+  values (v0.31); pinned by `conformance/02-types/struct_by_value_abi.k2`
+  (native-marked: 8/12/16-byte struct params, native output ≡ VM).
 
 - **Multi-file DWARF mis-attributed `@import`-ed code to the main file's
   nonexistent lines (v0.27 follow-up).** The native backend compiles a *merged*
@@ -34,6 +225,119 @@ is being designed in the open and nothing is stable yet.
   length.
 
 ### Added
+
+- **Standard-library expansion (v0.36): strings, bit/int math, hex, and two
+  containers.** All pure or single-allocator, VM-verified by
+  `conformance/10-stdlib/string_math_hex.k2` and `ringbuffer_bitset.k2`:
+  - **`std.str`** — byte-string (`[]const u8`) `equal`, `startsWith`, `endsWith`,
+    `indexOf`, `contains`, `countSubstr`, `trimLeft`/`trimRight`/`trim`, and
+    lexicographic `compare`/`lessThan`. Allocation-free; trims return sub-slices.
+  - **`std.math`** (extended) — `isqrt`, `log2Int`, `isPowerOfTwo`, `popcount`,
+    `clz`, `ctz`, `divFloor`, `mod` (Euclidean), `satAddU64`/`satSubU64`.
+  - **`std.mem`** (extended) — `fill`, `reverse`, `swap`, `indexOfScalar`,
+    `lastIndexOfScalar`, `contains`, `count`, `commonPrefixLen`, generic
+    `startsWith`/`endsWith`/`indexOf` (sub-slice search over any `T`), and
+    `allInRange`.
+  - **`std.hex`** — lowercase `encode`/`decode` over caller buffers (no alloc).
+  - **`std.base64`** — RFC 4648 (`=`-padded) `encode`/`decode` over caller
+    buffers; pinned by the canonical `""`/`f`/`fo`/`foo`/`foob`/`fooba`/`foobar`
+    vectors.
+  - **`std.bits`** — unsigned bit manipulation: `byteSwap16`/`32`/`64`,
+    `rotateLeft64`/`rotateRight64`, `setBit`/`clearBit`/`toggleBit`/`testBit`, and a
+    full `reverseBits64`. `u6` shift amounts match the `u64` width.
+  - **`std.hash`** — non-cryptographic `crc32` (IEEE), `adler32` (RFC 1950), and
+    32-bit `fnv1a32` over byte slices; checked against published vectors (CRC-32 of
+    `"123456789"` is `0xCBF43926`). No wrapping multiply needed.
+  - **`std.mathf`** — `f64` math computed from scratch (no hardware transcendental
+    ops): `abs`, `sqrt` (Newton), `floor`/`ceil`/`round`/`fract`, `powi`, `hypot`,
+    range-reduced `exp`/`sin`/`cos`/`tan`, `ln` (atanh series) with `logBase`/`log10`/
+    `log2`, a general `pow` (`exp(y·ln x)`), `cbrt`, `atan` (half-angle reduced so it
+    is accurate even at `x=1`), `trunc`, `signf`, `minf`/`maxf`, `clampf`, `lerp`,
+    and `degToRad`/`radToDeg`. ≈1e-12; verified against identities (`sin²+cos²=1`,
+    `exp(1)=e`, `ln(e)=1`, `tan(atan(x))=x`, `pow=powi`).
+  - **`std.RingBuffer(T)`** — a fixed-capacity circular FIFO (`push`/`pop`/`peek`/
+    `len`/`isEmpty`/`isFull`), one allocation for its buffer.
+  - **`std.BitSet`** — a dense `u64`-packed bit array (`set`/`clear`/`isSet`/
+    `popcount`).
+  - **`std.Random`** — a seedable `xorshift64` PRNG (`next`/`below`/`intRange`/
+    `boolean`); deterministic per seed, native-capable. Plus `shuffle` (in-place
+    Fisher–Yates) and `choice` (a uniform random element).
+  - **`std.ArrayList(T)`** (extended) — `appendSlice`, `insert`, `removeAt`
+    (order-preserving), `swapRemove` (O(1)), `pop`, `getLast`, `set`, `clear`.
+  - **`std.Deque(T)`** — a growable double-ended queue (ring buffer that doubles
+    when full): amortized-O(1) `pushFront`/`pushBack`/`popFront`/`popBack`, plus
+    `front`/`back`/`get`/`len`.
+  - **`std.math`** (more) — `signI64`, `isEven`/`isOdd`, `nextPowerOfTwo`,
+    `factorial`, `fib`, `sumSlice`, `maxSlice`/`minSlice`, `isPrime` (overflow-safe
+    trial division), `modPow` (modular exponentiation), `divCeil`,
+    `roundUpToMultiple`/`roundDownToMultiple`, `alignForward`, `digitSum`,
+    `digitCount`, `reverseDigits`, `isPalindrome`, `permutations` (falling
+    factorial), and `binomial` (incremental, symmetry-reduced).
+  - **`std.ascii`** (more) — `isUpper`/`isLower`, `isHexDigit`, `isControl`,
+    `isPrint`, `isPunct`, and `hexValue` (hex digit → `0..=15`).
+  - **`std.str`** (more) — `eqlIgnoreCase`, `containsScalar`, `countSplit`, a
+    no-copy `splitScalar` field iterator (`SplitIterator`), an allocate-and-
+    concatenate `join`, `toLowerInto`/`toUpperInto`, `lastIndexOf`, and
+    `indexOfPos`.
+  - **`std.unicode`** (more) — `iterate`, a `Utf8Iterator` yielding each Unicode
+    scalar value of a UTF-8 string.
+  - **`std.fmt`** (more) — `parseUint`/`parseInt` (decimal string → integer, with
+    pre-checked overflow that never traps and full `i64` range incl. its minimum)
+    and `parseUintRadix` (base 2–36); plus the inverse `formatUintRadix` (base
+    2–36, lowercase) and `formatInt` (signed decimal incl. `i64::MIN`) into a
+    caller buffer. `parseInt`→`formatInt` round-trips.
+  - **`std.sort.Sorter`** (more) — `lowerBound`/`upperBound` (sorted-array
+    binary-search bounds; their difference is a key's multiplicity),
+    `heapSort` (in-place, O(n log n) worst case, no extra memory), `mergeSort`
+    (STABLE, O(n log n) guaranteed, one allocator-owned scratch buffer), and
+    `quickselect`/`median` (O(n)-average k-th smallest by Lomuto partition).
+  - **`std.BstNode(T)`** — a self-referential binary-search-tree node (recursive
+    `?*@This()` children, heap-allocated through an allocator): `insert`,
+    `contains`, `count`, `height`, `min`/`max`, recursive `freeChildren`. The
+    first recursive container, enabled by the `?*@This()` and leak-analysis fixes.
+
+- **`@typeInfo` reflection for `union(enum)` (v0.32).** `@typeInfo(U).Union` now
+  reports a union's `tag_type` (its inferred discriminant integer) and `fields` —
+  one `StructField` per variant carrying the variant's `name` and payload `type`
+  (a variant is `name : type`, exactly a struct field, so the descriptor is
+  reused; a payload-less variant's `type` is `void`). Previously `@typeInfo` of a
+  union returned an empty descriptor. This composes with the existing comptime
+  surface (`@typeInfo(U) != .Union`, `inline for (…Union.fields)`, `@sizeOf(field.type)`,
+  sizing an array by `…fields.len`) the same way struct/enum reflection does, and
+  folds to runtime constants — so it is native-capable. Pinned by
+  `conformance/07-comptime/union_reflection.k2` (native-marked).
+
+- **Tagged-union runtime values `union(enum)` (v0.31).** A `union(enum)` — a sum
+  type that is exactly one of its named variants at a time — now **constructs,
+  flows, and `switch`es at run time**, where it was previously a clean
+  compile-time refusal (the front-end understood it; the backends could not store
+  the payload). Highlights:
+  - **Layout.** A union is a discriminant (the inferred enum tag — a 1-byte tag
+    for ≤256 variants) at `+0` followed by a payload area sized to the largest
+    variant and aligned to the strictest. The rule is added to
+    `k2_types::reflect::layout_depth` (the source of `@sizeOf`/`@alignOf`) and
+    mirrored byte-for-byte in `k2_codegen::layout`, so the folded constants and
+    the native byte image agree.
+  - **Construction.** Both `.{ .circle = r }` and the bare `.point` form lower to
+    one MIR rvalue, `MakeUnion { variant, payload, ty }` (sibling to
+    `MakeOk`/`MakeSome`). The VM stores `Value::Enum { tag, payload }`; native
+    writes the tag word plus the payload.
+  - **`switch` with payload capture.** `.circle => |r| …` reads the union's tag
+    into the existing `SwitchInt`, then binds each arm's capture to the *active
+    variant's payload* (a `Proj::Payload` at the variant type), reusing the
+    optional/error-union capture machinery. Exhaustiveness is type-checked; `else`
+    covers the rest.
+  - **Tagless variants.** The parser now accepts a payload-less union variant
+    (`point,`), as in the spec example; its payload is `void`.
+  - **Backends.** The VM supports scalar *and* aggregate (`struct`) payloads. The
+    native x86-64 backend supports scalar/`void` payloads with output
+    byte-identical to the VM across Debug/ReleaseSafe/ReleaseFast; an aggregate
+    payload, or a bare untagged `union {…}`, is **cleanly refused** by native
+    (never miscompiled).
+  - **Coverage.** `examples/unions.k2` (native-capable),
+    `conformance/02-types/union_tagged.k2` (native-marked) and
+    `union_payload_struct.k2` (VM-only), plus layout/parse/both-backends unit
+    tests.
 
 - **`k2c doc` documentation generator + doc-tests (v0.28).** A new `doc`
   subcommand extracts the `///` doc comments attached to public declarations

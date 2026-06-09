@@ -626,6 +626,29 @@ Notes:
   `switch`-ed safely. Prefer `union(enum)` for ordinary k2 code — it is
   the one obvious way to spell a sum type.
 
+### Relation to other languages
+
+For readers coming from elsewhere, k2's `union(enum)` is the same construct as
+**Zig**'s `union(enum)`, intentionally: an explicit tag enum, payload capture in
+each `switch` prong, and the option of an untagged bare `union` for FFI. The
+representation is also the same idea as a **Rust** `enum` with data (`enum E { A(T),
+B }`) or an OCaml/Haskell variant — a *tagged* sum type — but the spelling differs
+deliberately:
+
+- The tag is a first-class `enum` you can name and reflect on, not an anonymous
+  discriminant. A variant's payload is one type (use a `struct` for several
+  fields), so the layout is exactly "tag + a payload area sized to the largest
+  variant" with no hidden niche optimization to reason about.
+- Matching is the ordinary `switch` with the same `|x|` capture used by optionals
+  (`?T`) and error unions (`E!T`); a tagged union is just those two-variant
+  shapes generalized to N variants. There is no separate `match` construct.
+- Unlike a Rust `enum`, k2 keeps the FFI/manual-reinterpretation case as a
+  distinct, clearly-named **untagged** `union { ... }`, rather than folding it
+  into the same keyword.
+
+This is downstream of the project's "one obvious way" rule: a sum type is a
+`union(enum)`, matched with a `switch`, with no second mechanism to learn.
+
 ---
 
 ## 11. Foreign handles and `*anyopaque`
@@ -1002,6 +1025,13 @@ can pattern-match: the variant tells you whether `T` is a `.Struct`,
 signature attached. `@Type` is the inverse — it constructs a new type from
 such a description, enabling serializers, ABI shims, and trait-style checks
 written as plain k2.
+
+For a `union(enum)`, `@typeInfo(U).Union` carries `tag_type` (the
+discriminant's integer type) and `fields` — one descriptor per variant with
+its `name` and payload `type` (a payload-less variant's `type` is `void`),
+the same `name : type` shape a struct field has. So a generic that walks a
+union's variants reads `inline for (@typeInfo(U).Union.fields) |v| { … }`
+exactly as it would walk a struct's fields.
 
 ```k2
 const std = @import("std");

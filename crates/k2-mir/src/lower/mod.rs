@@ -71,6 +71,13 @@ pub(crate) struct Lowerer<'a> {
     /// an unresolvable `@std.<member>` intrinsic. See
     /// [`FnBuilder::lower_field_into`].
     value_const_inits: HashMap<DefId, Expr>,
+    /// Struct field DEFAULT initializers, keyed by `(struct defining span)` ->
+    /// `[(field name, default expr)]`. A `struct { x: i64 = 100, y: i64 }` records
+    /// `x -> 100`; an initializer `.{ .y = 5 }` that omits `x` lowers this default
+    /// into the field instead of leaving it `undef`. The defining span is the
+    /// struct's nominal identity key (`StructInfo::span`), so a construction can
+    /// look its defaults up from the construction's struct type.
+    struct_field_defaults: HashMap<(u32, u32), Vec<(String, Expr)>>,
     /// The monomorphization worklist: instantiations still to lower.
     worklist: Vec<InstId>,
     /// Instantiation -> its assigned FnId (dedup; also lets recursion resolve).
@@ -135,6 +142,12 @@ impl<'a> Lowerer<'a> {
         for item in &file.items {
             index_value_consts(resolved, item, &mut value_const_inits);
         }
+        // Index struct field defaults (incl. structs nested in container types) so
+        // an initializer that omits a defaulted field can fill it in.
+        let mut struct_field_defaults = HashMap::new();
+        for item in &file.items {
+            index_struct_field_defaults(item, &mut struct_field_defaults);
+        }
         Lowerer {
             file,
             resolved,
@@ -142,6 +155,7 @@ impl<'a> Lowerer<'a> {
             mode,
             fn_items,
             value_const_inits,
+            struct_field_defaults,
             err_set_consts,
             worklist: Vec::new(),
             by_inst: HashMap::new(),
@@ -726,6 +740,43 @@ fn index_value_consts(resolved: &Resolved, item: &Item, out: &mut HashMap<DefId,
     }
 }
 
+/// Indexes the DEFAULT initializers of every `struct` declared anywhere in `item`
+/// (top-level, or nested as a member of another container), keyed by the struct's
+/// defining span. A `const Sp = struct { x: i64 = 100, y: i64 };` records
+/// `(Sp.span) -> [("x", 100)]`. Mirrors [`index_value_consts`]'s container walk.
+fn index_struct_field_defaults(item: &Item, out: &mut HashMap<(u32, u32), Vec<(String, Expr)>>) {
+    if let Item::Const { value, .. } = item {
+        index_container_defaults(value, out);
+    }
+}
+
+/// Walks a container-valued expression: if it is a `struct`, record its fields'
+/// defaults; recurse into nested container-typed member decls (a struct declared
+/// inside another type's body).
+fn index_container_defaults(value: &Expr, out: &mut HashMap<(u32, u32), Vec<(String, Expr)>>) {
+    let Expr::Container(c) = value else { return };
+    let is_struct = matches!(c.kind, k2_syntax::ContainerKind::Struct { .. });
+    if is_struct {
+        let mut defaults = Vec::new();
+        for m in &c.members {
+            if let Member::Field(f) = m {
+                if let Some(def) = &f.default {
+                    defaults.push((f.name.clone(), def.clone()));
+                }
+            }
+        }
+        if !defaults.is_empty() {
+            out.insert((c.span.start, c.span.end), defaults);
+        }
+    }
+    // Nested container declarations (e.g. a struct defined inside another type).
+    for m in &c.members {
+        if let Member::Decl(Item::Const { value: inner, .. }) = m {
+            index_container_defaults(inner, out);
+        }
+    }
+}
+
 /// `true` if a const's initializer expression yields a *runtime value* (rather
 /// than a type / namespace / error-set). Conservative: only the expression
 /// shapes that clearly denote a value are accepted, so a stray type-expression is
@@ -1215,9 +1266,17 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 self.note_release_from_defer(body);
             }
             Stmt::Block { body, .. } => self.lower_block_scoped(body),
-            Stmt::Comptime { .. } => {
-                // Comptime blocks are fully folded at type-check time; emit
-                // nothing (any runtime-visible folded const was bound elsewhere).
+            Stmt::Comptime { body, .. } => {
+                // A comptime block is folded at type-check and emits no runtime code
+                // — EXCEPT a `return`, which returns a comptime-known value from the
+                // enclosing function (`fn f(comptime n) u64 { comptime { …; return r; } }`).
+                // Without emitting it, the function falls through to `undef` (prints
+                // `<int>`). Emit the folded return value.
+                if let Some(Stmt::Return { value, span }) =
+                    body.iter().find(|s| matches!(s, Stmt::Return { .. }))
+                {
+                    self.lower_comptime_return(value.as_ref(), *span);
+                }
             }
             Stmt::If { expr, .. }
             | Stmt::While { expr, .. }
@@ -1228,6 +1287,37 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             Stmt::Break { label, value, .. } => self.lower_break(label.as_deref(), value.as_ref()),
             Stmt::Continue { label, .. } => self.lower_continue(label.as_deref()),
         }
+    }
+
+    /// Lowers a `return <value>` that sits inside a `comptime { … }` block: the
+    /// value is comptime-known, so materialize its folded constant (the block's
+    /// runtime statements were elided). Falls back to lowering the expression when
+    /// no folded constant is recorded (e.g. a `return` of a comptime-known
+    /// aggregate, which still lowers structurally).
+    fn lower_comptime_return(&mut self, value: Option<&Expr>, span: Span) {
+        let ret_ty = self.func.ret;
+        let operand = match value {
+            Some(e) => {
+                if let Some(c) = self.comptime_span_const(e.span(), ret_ty) {
+                    Operand::Const(c)
+                } else {
+                    let tmp = self.new_temp(ret_ty, span);
+                    self.lower_return_value_into(Place::local(tmp), e, ret_ty);
+                    Operand::local(tmp)
+                }
+            }
+            None => Operand::Const(Const::Void),
+        };
+        self.run_scope_exit_all(false);
+        self.emit(Statement::Assign {
+            place: Place::local(LocalId(0)),
+            rvalue: Rvalue::Use(operand.clone()),
+            span,
+        });
+        self.set_term(Terminator::Return {
+            value: operand,
+            err_trace: None,
+        });
     }
 
     /// Lowers a `return [value]`, running every enclosing scope's defers.

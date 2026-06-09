@@ -195,7 +195,10 @@ enum_field       = identifier , [ "=" , expr ] , "," ; (* optional explicit valu
 
 union_member     = [ doc_comment ] , ( union_field | container_decl ) ;
 
-union_field      = [ "pub" ] , identifier , ":" , type , "," ;
+(* A union variant's payload type is OPTIONAL: `name : type` carries a       *)
+(* payload, a bare `name` is a payload-less (tagless) variant (a `void`      *)
+(* payload), as in `union(enum) { circle: f64, point }`.                     *)
+union_field      = [ "pub" ] , identifier , [ ":" , type ] , "," ;
 
 
 (* ===================================================================== *)

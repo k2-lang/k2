@@ -38,6 +38,7 @@ pub(crate) fn for_each_rvalue_operand_mut<F: FnMut(&mut Operand)>(rvalue: &mut R
         Rvalue::Use(o)
         | Rvalue::MakeSome(o, _)
         | Rvalue::MakeOk(o, _)
+        | Rvalue::MakeUnion { payload: o, .. }
         | Rvalue::Cast { operand: o, .. }
         | Rvalue::Unary { operand: o, .. }
         | Rvalue::Discriminant { operand: o, .. } => f(o),
@@ -116,6 +117,7 @@ pub(crate) fn rvalue_is_pure(rvalue: &Rvalue) -> bool {
         | Rvalue::MakeNull(_)
         | Rvalue::MakeOk(_, _)
         | Rvalue::MakeErr(_, _)
+        | Rvalue::MakeUnion { .. }
         | Rvalue::Discriminant { .. }
         | Rvalue::Aggregate { .. } => true,
         Rvalue::Call { .. } | Rvalue::Intrinsic { .. } => false,

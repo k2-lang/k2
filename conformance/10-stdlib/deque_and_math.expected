@@ -1,0 +1,3 @@
+sum=28 max=9 min=1 fact6=720 fib15=610 npot(1000)=1024
+sign(-9)=-1 even(10)=true odd(10)=false eqlIC=true split=4
+deque drained total=190 (expect 190)

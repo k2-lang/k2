@@ -67,7 +67,7 @@ pub use dump::{dump_signatures, dump_types};
 pub use ty::{
     ArrayLen, EnumInfo, ErrSetInfo, ErrSetRef, ExternInfo, ExternKind, FieldInfo, FnSig, IntBits,
     MemberDecl, MemberRes, PackedField, ParamInfo, StructInfo, StructLayout, Type, TypeId,
-    UnionInfo,
+    UnionInfo, UnionTagKind, UnionVariant,
 };
 
 use k2_resolve::{DefId, Resolved};
@@ -97,6 +97,11 @@ pub struct Typed {
     /// The type bound to each value definition (const/var/param/local/capture),
     /// and the [`Type::Fn`] type of each `fn`/method definition.
     pub binding_types: HashMap<DefId, TypeId>,
+    /// The TYPE denoted by each type-denoting const (`const S = Sorter(T, …)` /
+    /// `const P = struct {…}`), keyed by its [`DefId`]. The MIR lowerer consults
+    /// this so a member call on a stored type alias (`S.binarySearch(…)`) resolves
+    /// as an ASSOCIATED call (no implicit receiver), like the inline form.
+    pub item_types: HashMap<DefId, TypeId>,
     /// Spans whose expression *value is a `type`*: a type-returning generic call
     /// (`List(u32)`) maps to the instantiated aggregate [`TypeId`]. The MIR
     /// lowerer reuses this as the monomorphization key for an associated call
@@ -107,6 +112,9 @@ pub struct Typed {
     /// comptime array length / folded const as a literal instead of emitting
     /// comptime-only code.
     pub comptime_span_ints: HashMap<(u32, u32), i128>,
+    /// The comptime-folded BYTE STRING at an expression span (a `++` string concat),
+    /// which the MIR lowerer materializes as a `Const::Str` instead of `undef`.
+    pub comptime_span_strs: HashMap<(u32, u32), Vec<u8>>,
     /// The compile-time-known `i128` value of each `const` binding that folded
     /// to a `comptime_int`, so a `const N = serializedSize(T)` use lowers to a
     /// literal rather than to a runtime call.

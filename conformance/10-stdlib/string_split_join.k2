@@ -1,0 +1,35 @@
+// string_split_join.k2 — `std.str.splitScalar` (a no-copy field iterator over a
+// byte string) and `std.str.join` (allocate-and-concatenate). Splitting yields
+// sub-slices of the original — exercising sub-slicing of a string LITERAL — and
+// join round-trips them back. VM case (join allocates).
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    // Split a path-like string, collect the fields into an ArrayList, and report.
+    var fields = std.ArrayList([]const u8).init(alloc);
+    defer fields.deinit();
+    var it = std.str.splitScalar("usr/local/bin/k2", '/');
+    while (it.next()) |f| try fields.append(f);
+    try out.print("nfields={d} first=[{s}] last=[{s}]\n", .{
+        fields.len(), fields.get(0).?, fields.get(fields.len() - 1).?,
+    });
+
+    // Join the collected fields back with a different separator.
+    const joined = try std.str.join(alloc, fields.items, " > ");
+    defer alloc.free(joined);
+    try out.print("joined=[{s}]\n", .{joined});
+
+    // An empty field (consecutive separators) is preserved.
+    var n: usize = 0;
+    var it2 = std.str.splitScalar("a,,b,", ',');
+    while (it2.next()) |_| n += 1;
+    try out.print("empty-fields count={d}\n", .{n});
+}

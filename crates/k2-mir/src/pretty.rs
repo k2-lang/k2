@@ -280,6 +280,9 @@ fn fmt_rvalue(arena: &TypeArena, rv: &Rvalue) -> String {
         Rvalue::MakeNull(_) => "null".to_string(),
         Rvalue::MakeOk(o, _) => format!("ok {}", fmt_operand(o)),
         Rvalue::MakeErr(tag, _) => format!("err #{}", tag.0),
+        Rvalue::MakeUnion {
+            variant, payload, ..
+        } => format!("union .{} {}", variant, fmt_operand(payload)),
         Rvalue::Discriminant { operand, kind } => {
             format!("discr.{kind:?} {}", fmt_operand(operand))
         }

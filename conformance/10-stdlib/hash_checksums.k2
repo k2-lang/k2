@@ -1,0 +1,29 @@
+// hash_checksums.k2 — `std.hash`: CRC-32, Adler-32, and 32-bit FNV-1a over byte
+// slices, checked against published test vectors. All pure (no allocator) and
+// `{d}` only — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // CRC-32 (IEEE): the canonical "check" value for "123456789" is 0xCBF43926.
+    try out.print("crc32: empty={d} check={d} k2={d}\n", .{
+        std.hash.crc32(""),
+        std.hash.crc32("123456789"),
+        std.hash.crc32("The quick brown fox jumps over the lazy dog"),
+    });
+
+    // Adler-32 (RFC 1950): adler32("Wikipedia") == 0x11E60398.
+    try out.print("adler32: empty={d} wiki={d} k2={d}\n", .{
+        std.hash.adler32(""),
+        std.hash.adler32("Wikipedia"),
+        std.hash.adler32("The quick brown fox jumps over the lazy dog"),
+    });
+
+    // FNV-1a (32-bit): deterministic, and distinct inputs differ here.
+    const same: u8 = if (std.hash.fnv1a32("k2") == std.hash.fnv1a32("k2")) 1 else 0;
+    const diff: u8 = if (std.hash.fnv1a32("k2") != std.hash.fnv1a32("k3")) 1 else 0;
+    try out.print("fnv1a: hello={d} stable={d} distinct={d}\n", .{
+        std.hash.fnv1a32("hello"), same, diff,
+    });
+}

@@ -259,6 +259,23 @@ impl crate::check::Checker<'_> {
         is_extern: bool,
         is_packed: bool,
     ) -> TypeId {
+        // Two-phase (mirrors the non-generic `eval_struct`): intern a SHELL for
+        // this instantiation FIRST and put its type on `self_stack`, so a
+        // self-referential field — `left: ?*@This()` for a generic tree/list node
+        // `Node(T)` — resolves to THIS instantiation instead of `deferred`. The
+        // name is NOT bound in `item_types` here: the generic's def is shared across
+        // instantiations, so only `@This()` (per-instantiation) is safe.
+        let layout = struct_layout_of(is_extern, is_packed);
+        let span = self.fresh_synthetic_span();
+        let struct_ty = self.arena.intern_struct(crate::ty::StructInfo {
+            def: self.def_of(c.span),
+            name: display.to_string(),
+            span,
+            layout,
+            fields: Vec::new(),
+            decls: Vec::new(),
+        });
+        self.self_stack.push(struct_ty);
         let mut fields = Vec::new();
         for m in &c.members {
             if let k2_syntax::Member::Field(f) = m {
@@ -281,20 +298,19 @@ impl crate::check::Checker<'_> {
                 });
             }
         }
-        let layout = struct_layout_of(is_extern, is_packed);
+        self.self_stack.pop();
         if layout == crate::ty::StructLayout::Packed {
             self.fill_packed_offsets(c.span, &mut fields);
         }
-        let span = self.fresh_synthetic_span();
-        let info = crate::ty::StructInfo {
-            def: self.def_of(c.span),
-            name: display.to_string(),
-            span,
-            layout,
-            fields,
-            decls: Vec::new(),
+        // Patch the evaluated fields into the interned shell.
+        let sidx = if let crate::ty::Type::Struct(id) = self.arena.get(struct_ty) {
+            Some(id.0 as usize)
+        } else {
+            None
         };
-        let struct_ty = self.arena.intern_struct(info);
+        if let Some(idx) = sidx {
+            self.arena.structs[idx].fields = fields;
+        }
         // Build the nested method/const declarations with the comptime params
         // and the freshly-instantiated `Self` bound, so a method signature like
         // `fn push(self: *Self, value: T) !void` gets `T` substituted and member
@@ -518,10 +534,20 @@ impl crate::check::Checker<'_> {
         tag: Option<&Expr>,
     ) -> TypeId {
         let mut variants = Vec::new();
+        let mut next: i128 = 0;
         for m in &c.members {
             if let k2_syntax::Member::Field(f) = m {
+                let value = match &f.default {
+                    Some(e) => self
+                        .comptime_eval_value(e)
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(next),
+                    None => next,
+                };
+                next = value + 1;
                 variants.push(crate::ty::EnumVariant {
                     name: f.name.clone(),
+                    value,
                     span: f.span,
                 });
             }

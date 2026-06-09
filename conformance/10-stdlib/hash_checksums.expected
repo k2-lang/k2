@@ -1,0 +1,3 @@
+crc32: empty=0 check=3421780262 k2=1095738169
+adler32: empty=1 wiki=300286872 k2=1541148634
+fnv1a: hello=1335831723 stable=1 distinct=1

@@ -1,0 +1,300 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (const g
+    (ty
+      (ident f64)
+    )
+    (float 9.8)
+  )
+  (fn r3
+    (params
+      (param x
+        (ident f64)
+      )
+    )
+    (ret
+      (ident f64)
+    )
+    (block
+      (return
+        (binary div
+          (call
+            (field round
+              (field mathf
+                (ident std)
+              )
+            )
+            (binary mul
+              (ident x)
+              (float 1000.0)
+            )
+          )
+          (float 1000.0)
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const v
+        (ty
+          (ident f64)
+        )
+        (float 20.0)
+      )
+      (const deg
+        (ty
+          (ident f64)
+        )
+        (float 30.0)
+      )
+      (const theta
+        (call
+          (field degToRad
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident deg)
+        )
+      )
+      (const s
+        (call
+          (field sin
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident theta)
+        )
+      )
+      (const c
+        (call
+          (field cos
+            (field mathf
+              (ident std)
+            )
+          )
+          (ident theta)
+        )
+      )
+      (const range
+        (binary div
+          (binary mul
+            (binary mul
+              (binary mul
+                (binary mul
+                  (ident v)
+                  (ident v)
+                )
+                (float 2.0)
+              )
+              (ident s)
+            )
+            (ident c)
+          )
+          (ident g)
+        )
+      )
+      (const peak
+        (binary div
+          (binary mul
+            (binary mul
+              (binary mul
+                (ident v)
+                (ident v)
+              )
+              (ident s)
+            )
+            (ident s)
+          )
+          (binary mul
+            (float 2.0)
+            (ident g)
+          )
+        )
+      )
+      (const flight
+        (binary div
+          (binary mul
+            (binary mul
+              (float 2.0)
+              (ident v)
+            )
+            (ident s)
+          )
+          (ident g)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"v={d} angle={d}deg: range={d}m peak={d}m flight={d}s\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident v)
+                (ident deg)
+                (call
+                  (ident r3)
+                  (ident range)
+                )
+                (call
+                  (ident r3)
+                  (ident peak)
+                )
+                (call
+                  (ident r3)
+                  (ident flight)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const best
+        (call
+          (field degToRad
+            (field mathf
+              (ident std)
+            )
+          )
+          (float 45.0)
+        )
+      )
+      (const max_range
+        (binary div
+          (binary mul
+            (binary mul
+              (binary mul
+                (binary mul
+                  (ident v)
+                  (ident v)
+                )
+                (float 2.0)
+              )
+              (call
+                (field sin
+                  (field mathf
+                    (ident std)
+                  )
+                )
+                (ident best)
+              )
+            )
+            (call
+              (field cos
+                (field mathf
+                  (ident std)
+                )
+              )
+              (ident best)
+            )
+          )
+          (ident g)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"max range (at 45deg): {d}m\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident r3)
+                  (ident max_range)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const vx
+        (binary mul
+          (ident v)
+          (ident c)
+        )
+      )
+      (const vy
+        (binary mul
+          (ident v)
+          (ident s)
+        )
+      )
+      (const recovered_deg
+        (call
+          (field radToDeg
+            (field mathf
+              (ident std)
+            )
+          )
+          (call
+            (field atan
+              (field mathf
+                (ident std)
+              )
+            )
+            (binary div
+              (ident vy)
+              (ident vx)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"recovered angle from (vx,vy): {d}deg\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident r3)
+                  (ident recovered_deg)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

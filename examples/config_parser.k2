@@ -1,0 +1,52 @@
+//! config_parser.k2 — a real program: parse a `key = value` config (one entry per
+//! line, `#` comments and blank lines skipped) into a `StringHashMap`, then query
+//! it. Ties together `std.str.splitScalar`/`trim`/`indexOf` (all over no-copy
+//! sub-slices of the source text) with the map's `put`/`get`. Keys and values
+//! borrow the source, which outlives them.
+
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    const config = "# k2 demo config\nname = k2\nversion = 0.39\n\n  debug = true  \n# a comment line\nport = 8080\n";
+
+    var map = std.StringHashMap([]const u8).init(alloc);
+    defer map.deinit();
+
+    var parsed: usize = 0;
+    var skipped: usize = 0;
+    var lines = std.str.splitScalar(config, '\n');
+    while (lines.next()) |raw| {
+        const line = std.str.trim(raw);
+        if (line.len == 0 or line[0] == '#') {
+            skipped += 1;
+            continue;
+        }
+        const eq = std.str.indexOf(line, "=");
+        if (eq == null) {
+            skipped += 1;
+            continue;
+        }
+        const key = std.str.trim(line[0..eq.?]);
+        const value = std.str.trim(line[eq.? + 1 .. line.len]);
+        try map.put(key, value);
+        parsed += 1;
+    }
+
+    try out.print("parsed={d} skipped={d} entries={d}\n", .{ parsed, skipped, map.count() });
+    try out.print("name={s} version={s} debug={s} port={s}\n", .{
+        map.get("name") orelse "?",
+        map.get("version") orelse "?",
+        map.get("debug") orelse "?",
+        map.get("port") orelse "?",
+    });
+    try out.print("missing key 'host': {s}\n", .{map.get("host") orelse "(default)"});
+}

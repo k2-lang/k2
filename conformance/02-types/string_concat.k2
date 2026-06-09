@@ -1,0 +1,25 @@
+// string_concat.k2 — the `++` comptime string concatenation operator. Its folded
+// value is now MATERIALIZED as a runtime string (it used to lower to `undef`, so
+// `.len`/`{s}` trapped). Covers a top-level const, an inline concat, a chained
+// concat with escapes, empty operands, and slicing the result. Native-capable.
+const std = @import("std");
+
+const banner = "== " ++ "k2" ++ " ==";
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // A top-level `const` built by `++`.
+    try out.print("banner=[{s}] len={d}\n", .{ banner, banner.len });
+
+    // Inline concat as a call argument, and an empty-operand concat.
+    try out.print("inline=[{s}] empty=[{s}]\n", .{ "foo" ++ "bar", "" ++ "x" ++ "" });
+
+    // A chained concat with escape sequences, then sliced and split.
+    const doc = "alpha\n" ++ "beta\n" ++ "gamma";
+    try out.print("doc.len={d} head=[{s}]\n", .{ doc.len, doc[0..5] });
+    var lines: usize = 0;
+    var it = std.str.splitScalar(doc, '\n');
+    while (it.next()) |_| lines += 1;
+    try out.print("lines={d}\n", .{lines});
+}

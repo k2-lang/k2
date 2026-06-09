@@ -1,0 +1,3 @@
+starts=true ends=true startsBad=false
+indexOf=2 emptyNeedle=0 missing=true
+inRange[10,99]=true inRange[10,50]=false

@@ -78,6 +78,9 @@ pub fn is_memory_aggregate(arena: &TypeArena, ty: TypeId) -> bool {
         | Type::Array { .. }
         | Type::Slice { .. }
         | Type::ErrorUnion { .. }
+        // A `union(enum)` is a tag + payload area stored inline in the frame
+        // (never a scalar register), exactly like an error union.
+        | Type::Union(_)
         | Type::Vector { .. } => true,
         Type::Optional(inner) => !matches!(arena.get(*inner), Type::Pointer { .. }),
         _ => false,
@@ -98,7 +101,15 @@ pub fn is_memory_aggregate(arena: &TypeArena, ty: TypeId) -> bool {
 /// frame planner — nothing reads `size` back out of the home.
 fn pad_aggregate_home(l: Layout) -> Layout {
     Layout {
-        size: l.size.max(8),
+        // Round the reserved home UP TO A MULTIPLE OF 8, not merely to ≥8. A
+        // by-value aggregate of 9–15 bytes is passed in a register PAIR (SysV
+        // `TwoInt`) and received with two full 8-byte stores at `home+0` / `home+8`
+        // — 16 bytes written. A home sized to the exact 12 bytes (or any 9–15) would
+        // have that second word spill 1–7 bytes into the ADJACENT frame slot,
+        // corrupting it (a 12-byte `struct {a,b,c: u32}` or a 12-byte `union(enum)`
+        // passed by value miscompiled / faulted). Reserving `round_up(size, 8)`
+        // bytes makes the word-granular store/load always land inside the home.
+        size: crate::layout::round_up(l.size, 8).max(8),
         align: l.align,
     }
 }

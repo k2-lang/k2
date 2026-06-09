@@ -1,0 +1,53 @@
+// union_nested.k2 — a `union(enum)` whose variant payload is ANOTHER union, and a
+// union whose variant payload is an optional. The inner literal's type comes from
+// the outer variant's declared payload type (not its own span), so construction
+// must build the inner union from the destination type — otherwise it silently
+// lowers to a tagless struct (a miscompile).
+const std = @import("std");
+
+const Inner = union(enum) { pos: i64, neg: i64 };
+const Outer = union(enum) {
+    one: i64,
+    nested: Inner,
+    none,
+};
+
+fn evalInner(i: Inner) i64 {
+    return switch (i) {
+        .pos => |x| x,
+        .neg => |x| -x,
+    };
+}
+fn evalOuter(o: Outer) i64 {
+    return switch (o) {
+        .one => |x| x,
+        .nested => |inner| evalInner(inner) * 10,
+        .none => 0,
+    };
+}
+
+// A union variant carrying an optional payload (orthogonal nesting).
+const Slot = union(enum) {
+    filled: ?i64,
+    empty,
+};
+fn evalSlot(s: Slot) i64 {
+    return switch (s) {
+        .filled => |opt| opt orelse -1,
+        .empty => -2,
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const a: Outer = .{ .one = 7 };
+    const b: Outer = .{ .nested = .{ .neg = 3 } };
+    const c: Outer = .none;
+    try out.print("outer = {d} {d} {d}\n", .{ evalOuter(a), evalOuter(b), evalOuter(c) });
+
+    const f: Slot = .{ .filled = 42 };
+    const g: Slot = .{ .filled = null };
+    const h: Slot = .empty;
+    try out.print("slot = {d} {d} {d}\n", .{ evalSlot(f), evalSlot(g), evalSlot(h) });
+}

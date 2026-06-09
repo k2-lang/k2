@@ -485,6 +485,7 @@ fn remap_rvalue(rvalue: &mut Rvalue, f: &impl Fn(LocalId) -> LocalId) {
         Rvalue::Use(o)
         | Rvalue::MakeSome(o, _)
         | Rvalue::MakeOk(o, _)
+        | Rvalue::MakeUnion { payload: o, .. }
         | Rvalue::Cast { operand: o, .. }
         | Rvalue::Unary { operand: o, .. }
         | Rvalue::Discriminant { operand: o, .. } => remap_operand(o, f),

@@ -1,0 +1,404 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn rleEncode
+    (params
+      (param dst
+        (slice
+          (ident u8)
+        )
+      )
+      (param src
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (ident usize)
+    )
+    (block
+      (var di
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (field len
+              (ident src)
+            )
+          )
+        )
+        (body
+          (block
+            (const b
+              (index
+                (ident src)
+                (ident i)
+              )
+            )
+            (var run
+              (ty
+                (ident usize)
+              )
+              (int 1)
+            )
+            (while
+              (cond
+                (binary and
+                  (binary and
+                    (binary lt
+                      (binary add
+                        (ident i)
+                        (ident run)
+                      )
+                      (field len
+                        (ident src)
+                      )
+                    )
+                    (binary eq
+                      (index
+                        (ident src)
+                        (binary add
+                          (ident i)
+                          (ident run)
+                        )
+                      )
+                      (ident b)
+                    )
+                  )
+                  (binary lt
+                    (ident run)
+                    (int 255)
+                  )
+                )
+              )
+              (body
+                (block
+                  (assign +=
+                    (ident run)
+                    (int 1)
+                  )
+                )
+              )
+            )
+            (assign =
+              (index
+                (ident dst)
+                (ident di)
+              )
+              (builtin @as
+                (ident u8)
+                (builtin @intCast
+                  (ident run)
+                )
+              )
+            )
+            (assign =
+              (index
+                (ident dst)
+                (binary add
+                  (ident di)
+                  (int 1)
+                )
+              )
+              (ident b)
+            )
+            (assign +=
+              (ident di)
+              (int 2)
+            )
+            (assign +=
+              (ident i)
+              (ident run)
+            )
+          )
+        )
+      )
+      (return
+        (ident di)
+      )
+    )
+  )
+  (fn rleDecode
+    (params
+      (param dst
+        (slice
+          (ident u8)
+        )
+      )
+      (param src
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (ident usize)
+    )
+    (block
+      (var di
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (binary add
+              (ident i)
+              (int 1)
+            )
+            (field len
+              (ident src)
+            )
+          )
+        )
+        (body
+          (block
+            (const run
+              (ty
+                (ident usize)
+              )
+              (builtin @as
+                (ident usize)
+                (index
+                  (ident src)
+                  (ident i)
+                )
+              )
+            )
+            (const b
+              (index
+                (ident src)
+                (binary add
+                  (ident i)
+                  (int 1)
+                )
+              )
+            )
+            (var k
+              (ty
+                (ident usize)
+              )
+              (int 0)
+            )
+            (while
+              (cond
+                (binary lt
+                  (ident k)
+                  (ident run)
+                )
+              )
+              (cont
+                (assign +=
+                  (ident k)
+                  (int 1)
+                )
+              )
+              (body
+                (block
+                  (assign =
+                    (index
+                      (ident dst)
+                      (ident di)
+                    )
+                    (ident b)
+                  )
+                  (assign +=
+                    (ident di)
+                    (int 1)
+                  )
+                )
+              )
+            )
+            (assign +=
+              (ident i)
+              (int 2)
+            )
+          )
+        )
+      )
+      (return
+        (ident di)
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const text
+        (str "\"aaaaabbbcccccccdddddddddddddddddddddeeeeeeeeeeffffffffffffffffffff\"")
+      )
+      (var enc
+        (ty
+          (array-type
+            (len
+              (int 256)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const elen
+        (call
+          (ident rleEncode)
+          (unary addrof
+            (ident enc)
+          )
+          (ident text)
+        )
+      )
+      (var dec
+        (ty
+          (array-type
+            (len
+              (int 256)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const dlen
+        (call
+          (ident rleDecode)
+          (unary addrof
+            (ident dec)
+          )
+          (slice-expr
+            (ident enc)
+            (lo
+              (int 0)
+            )
+            (hi
+              (ident elen)
+            )
+          )
+        )
+      )
+      (const ok
+        (call
+          (field equal
+            (field str
+              (ident std)
+            )
+          )
+          (ident text)
+          (slice-expr
+            (ident dec)
+            (lo
+              (int 0)
+            )
+            (hi
+              (ident dlen)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"original={d} encoded={d} decoded={d} roundtrip={}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field len
+                  (ident text)
+                )
+                (ident elen)
+                (ident dlen)
+                (ident ok)
+              )
+            )
+          )
+        )
+      )
+      (const ratio_tenths
+        (call
+          (field divCeil
+            (field math
+              (ident std)
+            )
+          )
+          (binary mul
+            (builtin @as
+              (ident u64)
+              (ident elen)
+            )
+            (int 10)
+          )
+          (builtin @as
+            (ident u64)
+            (field len
+              (ident text)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"ratio (x10): {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident ratio_tenths)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

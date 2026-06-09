@@ -1,0 +1,48 @@
+// deque_and_math.k2 — `std.Deque` (growable double-ended ring buffer) plus the
+// v0.36+ `std.math` slice/number helpers and `std.str.eqlIgnoreCase`/`countSplit`.
+// The Deque exercises wrap-around and a grow past the initial capacity. VM case
+// (the generic container is refused by the native subset).
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // math: slice reductions and number theory.
+    const xs = [_]i64{ 5, 2, 8, 1, 9, 3 };
+    try out.print("sum={d} max={d} min={d} fact6={d} fib15={d} npot(1000)={d}\n", .{
+        std.math.sumSlice(i64, &xs), std.math.maxSlice(i64, &xs).?, std.math.minSlice(i64, &xs).?,
+        std.math.factorial(6), std.math.fib(15), std.math.nextPowerOfTwo(1000),
+    });
+    try out.print("sign(-9)={d} even(10)={} odd(10)={} eqlIC={} split={d}\n", .{
+        std.math.signI64(-9), std.math.isEven(10), std.math.isOdd(10),
+        std.str.eqlIgnoreCase("K2-Lang", "k2-LANG"), std.str.countSplit("a:b:c:d", ':'),
+    });
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    var dq = std.Deque(i64).init(gpa.allocator());
+    defer dq.deinit();
+
+    // Push 0..19 alternating ends, forcing several grows and wrap-arounds.
+    var i: i64 = 0;
+    while (i < 20) : (i += 1) {
+        if (std.math.isEven(i)) {
+            try dq.pushBack(i);
+        } else {
+            try dq.pushFront(i);
+        }
+    }
+    // Drain from both ends, summing, to confirm nothing was lost or corrupted.
+    var total: i64 = 0;
+    var fromFront = true;
+    while (dq.len() > 0) {
+        const v = if (fromFront) dq.popFront().? else dq.popBack().?;
+        total += v;
+        fromFront = not fromFront;
+    }
+    // 0+1+...+19 = 190.
+    try out.print("deque drained total={d} (expect 190)\n", .{total});
+}

@@ -1,0 +1,41 @@
+// merge_sort.k2 — `std.sort.Sorter.mergeSort`, the STABLE allocator-backed
+// O(n log n) sort. Checks it fully orders a duplicate-heavy input, agrees with
+// the in-place heapSort on the same data, and handles edge cases. VM case
+// (allocator + generic container).
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+    const S = std.sort.Sorter(i64, std.sort.asc(i64));
+
+    var a = [_]i64{ 9, 1, 9, 1, 5, 5, 3, 7, 0, 8, 2, 6, 4, 5 };
+    try S.mergeSort(&a, alloc);
+    var sum: i64 = 0;
+    for (a) |x| sum += x;
+    try out.print("sorted={} first={d} last={d} sum={d}\n", .{ S.isSorted(&a), a[0], a[a.len - 1], sum });
+
+    // mergeSort and heapSort agree element-for-element on the same input.
+    var m = [_]i64{ -3, 10, -3, 0, 42, 10, -100, 7, 7 };
+    var h = [_]i64{ -3, 10, -3, 0, 42, 10, -100, 7, 7 };
+    try S.mergeSort(&m, alloc);
+    S.heapSort(&h);
+    var agree: u8 = 1;
+    var i: usize = 0;
+    while (i < m.len) : (i += 1) {
+        if (m[i] != h[i]) agree = 0;
+    }
+    try out.print("merge==heap: {d}\n", .{agree});
+
+    // Edge cases.
+    var e0 = [_]i64{};
+    var e1 = [_]i64{5};
+    try S.mergeSort(&e0, alloc);
+    try S.mergeSort(&e1, alloc);
+    try out.print("edges: empty={} single={}\n", .{ S.isSorted(&e0), S.isSorted(&e1) });
+}

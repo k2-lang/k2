@@ -134,10 +134,11 @@ impl Parser {
 
         self.expect(TokenKind::LBrace, "to open a container body");
         let is_enum = matches!(kind, ContainerKind::Enum { .. });
+        let is_union = matches!(kind, ContainerKind::Union { .. });
         let mut members = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             let before = self.pos;
-            if let Some(m) = self.parse_member(is_enum) {
+            if let Some(m) = self.parse_member(is_enum, is_union) {
                 members.push(m);
             }
             // Loop guard: never spin on a member that consumed nothing.
@@ -163,7 +164,7 @@ impl Parser {
     /// hand-narrow this per container (higher risk of regressing examples), the
     /// grammar (`docs/grammar.ebnf`, `enum_member`/`union_member`) was made
     /// co-normative with this uniform behavior via a shared `container_decl`.
-    fn parse_member(&mut self, is_enum: bool) -> Option<Member> {
+    fn parse_member(&mut self, is_enum: bool, is_union: bool) -> Option<Member> {
         let (_guard, over) = self.enter();
         if over {
             // Too deep: record the single diagnostic and skip this member so the
@@ -203,11 +204,50 @@ impl Parser {
             return Some(Member::Decl(item));
         }
 
-        // Otherwise a field.
+        // Otherwise a field. The three container kinds differ only in field shape:
+        // an enum field has no type (`name [= value]`), a union variant has an
+        // OPTIONAL payload type (`name [: type]` — a bare `name` is a tagless
+        // variant), and a struct field requires `name : type`.
         if is_enum {
             Some(Member::Field(self.parse_enum_field(doc)))
+        } else if is_union {
+            Some(Member::Field(self.parse_union_field(doc)))
         } else {
             Some(Member::Field(self.parse_struct_field(doc)))
+        }
+    }
+
+    /// Parses a union variant: `[pub] name [: type] [align(e)] ,`. The payload
+    /// type is OPTIONAL — a bare `name` is a payload-less (tagless) variant
+    /// (`ty: None`, a `void` payload), as in the spec's `point,` variant.
+    fn parse_union_field(&mut self, doc: Option<String>) -> Field {
+        let start = self.here();
+        let is_pub = self.eat(TokenKind::KwPub).is_some();
+        let name = self.expect_ident_text("as a union variant name");
+        let ty = if self.eat(TokenKind::Colon).is_some() {
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        let align = if self.at(TokenKind::KwAlign) {
+            self.bump();
+            self.expect(TokenKind::LParen, "after `align`");
+            let e = self.parse_expr_no_struct(false);
+            self.expect(TokenKind::RParen, "to close `align(...)`");
+            Some(e)
+        } else {
+            None
+        };
+        let end = self.eat_field_terminator("after a union variant");
+        Field {
+            doc,
+            is_pub,
+            is_comptime: false,
+            name,
+            ty,
+            align,
+            default: None,
+            span: start.merge(end),
         }
     }
 

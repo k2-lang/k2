@@ -1,0 +1,26 @@
+// enum_optional_coercion.k2 — an `enum` literal coerced directly into an optional
+// (`?E`) or error union (`E!E`). Like a union, an enum value is not transparent
+// through an optional (its payload is empty), so the compiler must wrap it with an
+// explicit `Some`/`Ok`. With scalar enums this stays native-capable.
+const std = @import("std");
+
+const Color = enum { red, green, blue };
+const Fail = error{Bad};
+
+fn code(c: Color) u8 {
+    return switch (c) { .red => 1, .green => 2, .blue => 3 };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const a: ?Color = .green; // enum -> optional
+    const b: ?Color = null;
+    const av: u8 = if (a) |x| code(x) else 0;
+    const bv: u8 = if (b) |x| code(x) else 0;
+    try out.print("opt = {d} {d}\n", .{ av, bv });
+
+    const e: Fail!Color = .blue; // enum -> error union
+    const ev: u8 = if (e) |x| code(x) else |_| 0;
+    try out.print("eu = {d}\n", .{ev});
+}

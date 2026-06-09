@@ -1,0 +1,357 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const total
+        (call
+          (field binomial
+            (field math
+              (ident std)
+            )
+          )
+          (int 49)
+          (int 6)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"6/49 lottery: {d} possible tickets\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident total)
+              )
+            )
+          )
+        )
+      )
+      (var m
+        (ty
+          (ident u64)
+        )
+        (int 6)
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"match counts (6..3): \"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (while
+        (cond
+          (binary ge
+            (ident m)
+            (int 3)
+          )
+        )
+        (cont
+          (assign -=
+            (ident m)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (const ways
+              (binary mul
+                (call
+                  (field binomial
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 6)
+                  (ident m)
+                )
+                (call
+                  (field binomial
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 43)
+                  (binary sub
+                    (int 6)
+                    (ident m)
+                  )
+                )
+              )
+            )
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"{d} \"")
+                  (init
+                    (ty)
+                    (tuple
+                      (ident ways)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (var sum
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (var j
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary le
+            (ident j)
+            (int 6)
+          )
+        )
+        (cont
+          (assign +=
+            (ident j)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (assign +=
+              (ident sum)
+              (binary mul
+                (call
+                  (field binomial
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 6)
+                  (ident j)
+                )
+                (call
+                  (field binomial
+                    (field math
+                      (ident std)
+                    )
+                  )
+                  (int 43)
+                  (binary sub
+                    (int 6)
+                    (ident j)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"all tiers sum to total: {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary eq
+                  (ident sum)
+                  (ident total)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const poker_hands
+        (call
+          (field binomial
+            (field math
+              (ident std)
+            )
+          )
+          (int 52)
+          (int 5)
+        )
+      )
+      (const bridge_hands
+        (call
+          (field binomial
+            (field math
+              (ident std)
+            )
+          )
+          (int 52)
+          (int 13)
+        )
+      )
+      (const orderings_of_5
+        (call
+          (field permutations
+            (field math
+              (ident std)
+            )
+          )
+          (int 52)
+          (int 5)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"poker(5)={d} bridge(13)={d} ordered5={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident poker_hands)
+                (ident bridge_hands)
+                (ident orderings_of_5)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"Pascal row 10: \"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (var k
+        (ty
+          (ident u64)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary le
+            (ident k)
+            (int 10)
+          )
+        )
+        (cont
+          (assign +=
+            (ident k)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"{d} \"")
+                  (init
+                    (ty)
+                    (tuple
+                      (call
+                        (field binomial
+                          (field math
+                            (ident std)
+                          )
+                        )
+                        (int 10)
+                        (ident k)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+    )
+  )
+)

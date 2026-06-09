@@ -1,0 +1,394 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var gpa
+        (call
+          (field init
+            (field GeneralPurposeAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident sys)
+        )
+      )
+      (defer
+        (block
+          (const leaked
+            (call
+              (field deinit
+                (ident gpa)
+              )
+            )
+          )
+          (if
+            (cond
+              (ident leaked)
+            )
+            (then
+              (block
+                (expr
+                  (builtin @panic
+                    (str "\"memory leak detected\"")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const alloc
+        (call
+          (field allocator
+            (ident gpa)
+          )
+        )
+      )
+      (const text
+        (str "\"the quick brown fox the lazy dog the quick fox the end\"")
+      )
+      (var counts
+        (call
+          (field init
+            (call
+              (field StringHashMap
+                (ident std)
+              )
+              (ident usize)
+            )
+          )
+          (ident alloc)
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident counts)
+            )
+          )
+        )
+      )
+      (var total
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var it
+        (call
+          (field splitScalar
+            (field str
+              (ident std)
+            )
+          )
+          (ident text)
+          (char "' '")
+        )
+      )
+      (while
+        (cond
+          (call
+            (field next
+              (ident it)
+            )
+          )
+        )
+        (capture word)
+        (body
+          (block
+            (if
+              (cond
+                (binary eq
+                  (field len
+                    (ident word)
+                  )
+                  (int 0)
+                )
+              )
+              (then
+                (block
+                  (continue)
+                )
+              )
+            )
+            (assign +=
+              (ident total)
+              (int 1)
+            )
+            (const r
+              (unary try
+                (call
+                  (field getOrPut
+                    (ident counts)
+                  )
+                  (ident word)
+                )
+              )
+            )
+            (if
+              (cond
+                (field found_existing
+                  (ident r)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (deref
+                      (field value_ptr
+                        (ident r)
+                      )
+                    )
+                    (int 1)
+                  )
+                )
+              )
+              (else
+                (block
+                  (assign =
+                    (deref
+                      (field value_ptr
+                        (ident r)
+                      )
+                    )
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"total words: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident total)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"unique words: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field count
+                    (ident counts)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"the={d} quick={d} fox={d} dog={d} missing={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (binary orelse
+                  (call
+                    (field get
+                      (ident counts)
+                    )
+                    (str "\"the\"")
+                  )
+                  (int 0)
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident counts)
+                    )
+                    (str "\"quick\"")
+                  )
+                  (int 0)
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident counts)
+                    )
+                    (str "\"fox\"")
+                  )
+                  (int 0)
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident counts)
+                    )
+                    (str "\"dog\"")
+                  )
+                  (int 0)
+                )
+                (binary orelse
+                  (call
+                    (field get
+                      (ident counts)
+                    )
+                    (str "\"cat\"")
+                  )
+                  (int 0)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var max_count
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var distinct_singletons
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var mit
+        (call
+          (field iterator
+            (ident counts)
+          )
+        )
+      )
+      (while
+        (cond
+          (call
+            (field next
+              (ident mit)
+            )
+          )
+        )
+        (capture e)
+        (body
+          (block
+            (if
+              (cond
+                (binary gt
+                  (field value
+                    (ident e)
+                  )
+                  (ident max_count)
+                )
+              )
+              (then
+                (block
+                  (assign =
+                    (ident max_count)
+                    (field value
+                      (ident e)
+                    )
+                  )
+                )
+              )
+            )
+            (if
+              (cond
+                (binary eq
+                  (field value
+                    (ident e)
+                  )
+                  (int 1)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident distinct_singletons)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"max frequency: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident max_count)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"words seen once: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident distinct_singletons)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

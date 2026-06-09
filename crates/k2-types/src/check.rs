@@ -103,6 +103,10 @@ pub struct Checker<'a> {
     /// or `serializedSize(T)` occurrence), used to resolve a comptime array
     /// length to a concrete count.
     pub(crate) comptime_span_ints: HashMap<(u32, u32), i128>,
+    /// The comptime-folded BYTE STRING at an expression span — the value of a `++`
+    /// string concatenation, which the MIR materializes as a `Const::Str` (without
+    /// this it lowered to `undef`). Keyed like [`Self::comptime_span_ints`].
+    pub(crate) comptime_span_strs: HashMap<(u32, u32), Vec<u8>>,
     /// Index from a fn's [`DefId`] to its AST item, built once in [`Self::run`],
     /// so the generic-instantiation engine can fetch a body without re-walking.
     pub(crate) fn_items: HashMap<DefId, k2_syntax::Item>,
@@ -182,6 +186,7 @@ impl<'a> Checker<'a> {
             comptime_fuel_reported: false,
             comptime_const_values: HashMap::new(),
             comptime_span_ints: HashMap::new(),
+            comptime_span_strs: HashMap::new(),
             fn_items: HashMap::new(),
             inst_cache: HashMap::new(),
             inst_stack: Vec::new(),
@@ -239,8 +244,10 @@ impl<'a> Checker<'a> {
             members: self.members,
             inst_members: self.inst_members,
             binding_types: self.binding_types,
+            item_types: self.item_types,
             type_valued_spans: self.type_valued_spans,
             comptime_span_ints: self.comptime_span_ints,
+            comptime_span_strs: self.comptime_span_strs,
             comptime_int_values: self.comptime_int_values,
             extern_fns: self.extern_fns,
             diagnostics: self.diags,
@@ -1240,6 +1247,15 @@ impl<'a> Checker<'a> {
     }
 
     /// Evaluates a `struct {...}` body into a [`Type::Struct`].
+    ///
+    /// Two-phase nominal resolution: a SHELL struct (no fields yet) is interned
+    /// FIRST, so the struct's own type is visible while its FIELD types are
+    /// evaluated, then the evaluated fields are patched into the shell. Without
+    /// this, a self-referential field — `next: ?*@This()` for a linked-list /
+    /// tree node — saw the struct still being defined and resolved to `deferred`,
+    /// so assigning a real `*Node` to it failed to type-check. The shell carries
+    /// the struct's final [`TypeId`] on `self_stack` (for `@This()`) and, when the
+    /// declaring def is known, in `item_types` (for the name) during field eval.
     fn eval_struct(
         &mut self,
         c: &Container,
@@ -1247,17 +1263,33 @@ impl<'a> Checker<'a> {
         is_extern: bool,
         is_packed: bool,
     ) -> TypeId {
+        let layout = struct_layout_of(is_extern, is_packed);
+        let def = self.def_of(c.span);
+        // Phase 1: intern the shell (empty fields) and expose its type.
+        let ty = self.arena.intern_struct(StructInfo {
+            def,
+            name: name.to_string(),
+            span: c.span,
+            layout,
+            fields: Vec::new(),
+            decls: Vec::new(),
+        });
+        self.self_stack.push(ty);
+        if let Some(def) = def {
+            self.item_types.insert(def, ty);
+        }
+        // Phase 2: evaluate the fields with the shell's type in scope.
         let mut fields = Vec::new();
         for m in &c.members {
             if let Member::Field(f) = m {
-                let ty = match &f.ty {
+                let fty = match &f.ty {
                     Some(t) => self.eval_type(t),
                     None => self.arena.t_deferred(),
                 };
                 let align = self.eval_field_align_static(f);
                 fields.push(FieldInfo {
                     name: f.name.clone(),
-                    ty,
+                    ty: fty,
                     has_default: f.default.is_some(),
                     is_comptime: f.is_comptime,
                     align,
@@ -1267,19 +1299,20 @@ impl<'a> Checker<'a> {
                 });
             }
         }
-        let layout = struct_layout_of(is_extern, is_packed);
+        self.self_stack.pop();
         if layout == StructLayout::Packed {
             self.fill_packed_offsets(c.span, &mut fields);
         }
-        let info = StructInfo {
-            def: self.def_of(c.span),
-            name: name.to_string(),
-            span: c.span,
-            layout,
-            fields,
-            decls: Vec::new(),
+        // Patch the evaluated fields into the interned shell. The struct index is
+        // read out first so the immutable arena borrow ends before the mutation.
+        let sidx = if let Type::Struct(id) = self.arena.get(ty) {
+            Some(id.0 as usize)
+        } else {
+            None
         };
-        let ty = self.arena.intern_struct(info);
+        if let Some(idx) = sidx {
+            self.arena.structs[idx].fields = fields;
+        }
         self.eval_container_decls(c, ty);
         ty
     }
@@ -1368,10 +1401,22 @@ impl<'a> Checker<'a> {
     /// Evaluates an `enum {...}` body into a [`Type::Enum`].
     fn eval_enum(&mut self, c: &Container, name: &str, tag: Option<&Expr>) -> TypeId {
         let mut variants = Vec::new();
+        // Auto-incrementing tag value: an explicit `= N` sets it; each subsequent
+        // bare variant is the previous value + 1 (the first defaults to 0). Spec §9.
+        let mut next: i128 = 0;
         for m in &c.members {
             if let Member::Field(f) = m {
+                let value = match &f.default {
+                    Some(e) => self
+                        .comptime_eval_value(e)
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(next),
+                    None => next,
+                };
+                next = value + 1;
                 variants.push(EnumVariant {
                     name: f.name.clone(),
+                    value,
                     span: f.span,
                 });
             }
@@ -1632,7 +1677,7 @@ impl<'a> Checker<'a> {
 /// The minimal unsigned tag width for an inferred-tag enum of `n` variants:
 /// `max(1, ceil(log2(n)))` bits (so 0..=2 variants -> 1 bit, 3..=4 -> 2, …). A
 /// zero-variant enum still gets a 1-bit tag (a legal, minimal placeholder).
-fn enum_tag_bits(n: usize) -> u16 {
+pub(crate) fn enum_tag_bits(n: usize) -> u16 {
     if n <= 2 {
         return 1;
     }

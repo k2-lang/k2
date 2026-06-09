@@ -1,0 +1,31 @@
+// union_payload_struct.k2 — a `union(enum)` whose variants carry aggregate
+// (struct) payloads, captured by value in each switch arm. Exercises that the
+// payload area is laid out after the tag and read back at the active variant's
+// type on BOTH backends.
+const std = @import("std");
+
+const Op = union(enum) {
+    nullary: u32, // an immediate value
+    binary: struct { lhs: u32, rhs: u32 },
+    ternary: struct { a: u32, b: u32, c: u32 },
+
+    pub fn eval(self: Op) u32 {
+        return switch (self) {
+            .nullary => |v| v,
+            .binary => |b| b.lhs + b.rhs,
+            .ternary => |t| t.a + t.b + t.c,
+        };
+    }
+};
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const n: Op = .{ .nullary = 41 };
+    const b: Op = .{ .binary = .{ .lhs = 10, .rhs = 20 } };
+    const t: Op = .{ .ternary = .{ .a = 1, .b = 2, .c = 3 } };
+
+    try out.print("nullary = {d}\n", .{n.eval()});
+    try out.print("binary  = {d}\n", .{b.eval()});
+    try out.print("ternary = {d}\n", .{t.eval()});
+}

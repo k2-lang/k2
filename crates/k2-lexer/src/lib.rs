@@ -171,8 +171,9 @@ pub enum TokenKind {
     DocComment,
     /// End-of-input marker; always the final token.
     Eof,
-    /// A lexical error (e.g. an unterminated string, a stray `\r`, a NUL byte).
-    /// The token text is the offending lexeme; recovery continues afterward.
+    /// A lexical error (e.g. an unterminated string, or a NUL byte). The token
+    /// text is the offending lexeme; recovery continues afterward. (A lone `\r` is
+    /// NOT an error — it is whitespace; see §1.3.)
     Error,
 }
 
@@ -1073,6 +1074,28 @@ mod tests {
         assert_eq!(
             kinds("const x = 1;"),
             vec![KwConst, Ident, Eq, IntLiteral, Semicolon]
+        );
+    }
+
+    #[test]
+    fn lone_carriage_return_is_whitespace() {
+        // Spec §1.3 (reconciled): a lone `\r` (old-style Mac line ending), and a
+        // `\r\n` pair, are whitespace — never a `TokenKind::Error`. A file using
+        // either still lexes to the same token stream as one using `\n`.
+        let lf = kinds("a\nb");
+        assert_eq!(lf, vec![TokenKind::Ident, TokenKind::Ident]);
+        assert_eq!(
+            kinds("a\rb"),
+            lf,
+            "a lone CR separates tokens like a newline"
+        );
+        assert_eq!(kinds("a\r\nb"), lf, "a CRLF pair lexes like a newline");
+        // No error token is produced for a lone CR anywhere in the stream.
+        assert!(
+            !tokenize("a\r\rb\r")
+                .iter()
+                .any(|t| t.kind == TokenKind::Error),
+            "a lone CR must not lex to an Error token"
         );
     }
 

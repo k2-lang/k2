@@ -1,0 +1,92 @@
+// expr_tree_eval.k2 — a recursive arithmetic-expression tree built from
+// self-referential `?*@This()` nodes, allocated on the heap and evaluated
+// recursively, then torn down. Exercises the v0.37/v0.38 unlocks together:
+// a recursive struct type, node allocation stored into child links (leak
+// analysis sees the escape), and recursive traversal. VM case (node allocation).
+const std = @import("std");
+
+// An expression node: a literal number, or a binary op with two children.
+const Expr = struct {
+    const Self = @This();
+    // 0 = number; otherwise the operator byte '+', '-', '*', '/'.
+    kind: u8,
+    num: i64,
+    left: ?*@This(),
+    right: ?*@This(),
+
+    fn evaluate(self: *const Self) i64 {
+        if (self.kind == 0) return self.num;
+        const l = self.left.?.*.evaluate();
+        const r = self.right.?.*.evaluate();
+        return switch (self.kind) {
+            '+' => l + r,
+            '-' => l - r,
+            '*' => l * r,
+            '/' => divTrunc(l, r),
+            else => 0,
+        };
+    }
+
+    fn free(self: *Self, alloc: std.heap.Allocator) void {
+        if (self.left) |l| {
+            l.free(alloc);
+            alloc.destroy(l);
+        }
+        if (self.right) |r| {
+            r.free(alloc);
+            alloc.destroy(r);
+        }
+    }
+};
+
+fn num(alloc: std.heap.Allocator, v: i64) !*Expr {
+    const n = try alloc.create(Expr);
+    n.* = Expr{ .kind = 0, .num = v, .left = null, .right = null };
+    return n;
+}
+
+fn bin(alloc: std.heap.Allocator, op: u8, l: *Expr, r: *Expr) !*Expr {
+    const n = try alloc.create(Expr);
+    n.* = Expr{ .kind = op, .num = 0, .left = l, .right = r };
+    return n;
+}
+
+fn divTrunc(a: i64, b: i64) i64 {
+    return a / b; // k2 integer `/` truncates toward zero
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    // Build (3 + 4) * (10 - 2)  ==  7 * 8  ==  56.
+    var root = try bin(
+        alloc,
+        '*',
+        try bin(alloc, '+', try num(alloc, 3), try num(alloc, 4)),
+        try bin(alloc, '-', try num(alloc, 10), try num(alloc, 2)),
+    );
+    defer {
+        root.free(alloc);
+        alloc.destroy(root);
+    }
+    try out.print("(3+4)*(10-2) = {d}\n", .{root.evaluate()});
+
+    // Build 100 / (2 * (1 + 4))  ==  100 / 10  ==  10.
+    var root2 = try bin(
+        alloc,
+        '/',
+        try num(alloc, 100),
+        try bin(alloc, '*', try num(alloc, 2), try bin(alloc, '+', try num(alloc, 1), try num(alloc, 4))),
+    );
+    defer {
+        root2.free(alloc);
+        alloc.destroy(root2);
+    }
+    try out.print("100/(2*(1+4)) = {d}\n", .{root2.evaluate()});
+}

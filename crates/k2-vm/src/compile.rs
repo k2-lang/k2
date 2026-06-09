@@ -449,6 +449,18 @@ impl<'p> FnCompiler<'p> {
             Rvalue::MakeErr(tag, _) => {
                 self.emit(Instr::MakeErr { dst, tag: tag.0 });
             }
+            Rvalue::MakeUnion {
+                variant, payload, ..
+            } => {
+                // Build a `Value::Enum { tag, payload }`: the active variant index
+                // plus its payload (`Unit` for a payload-less variant).
+                let src = self.operand_to_reg(payload, self.op_scratch(0));
+                self.emit(Instr::MakeUnion {
+                    dst,
+                    tag: *variant,
+                    src,
+                });
+            }
             Rvalue::Discriminant { operand, kind } => {
                 let base = self.operand_to_reg(operand, self.op_scratch(0));
                 self.emit(Instr::Discr {

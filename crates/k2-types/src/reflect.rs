@@ -106,10 +106,12 @@ impl crate::check::Checker<'_> {
             variants: vec![
                 EnumVariant {
                     name: "signed".to_string(),
+                    value: 0,
                     span: span(),
                 },
                 EnumVariant {
                     name: "unsigned".to_string(),
+                    value: 1,
                     span: span(),
                 },
             ],
@@ -193,6 +195,22 @@ impl crate::check::Checker<'_> {
             ],
             decls: Vec::new(),
         });
+        // `@typeInfo(U).Union` for a `union(enum)`: its discriminant (tag) type plus
+        // the variants. A union variant is `name : payload_type`, exactly the shape
+        // of a `StructField`, so the variants reuse the `StructField` descriptor
+        // (carrying each variant's payload type — what `EnumField` lacks).
+        let union_fields_slice = arena.slice(true, struct_field);
+        let union_payload = arena.intern_struct(StructInfo {
+            def: None,
+            name: "Type.Union".to_string(),
+            span: span(),
+            layout: crate::ty::StructLayout::Auto,
+            fields: vec![
+                field("tag_type", type_t, span()),
+                field("fields", union_fields_slice, span()),
+            ],
+            decls: Vec::new(),
+        });
         let ptr_payload = arena.intern_struct(StructInfo {
             def: None,
             name: "Type.Pointer".to_string(),
@@ -249,7 +267,7 @@ impl crate::check::Checker<'_> {
             ("ErrorSet", void_t),
             ("Struct", struct_payload),
             ("Enum", enum_payload),
-            ("Union", enum_payload),
+            ("Union", union_payload),
         ] {
             let mut v = variant(name, payload);
             v.span = span();
@@ -388,8 +406,8 @@ impl crate::check::Checker<'_> {
                 let info = self.arena.enums[id.0 as usize].clone();
                 let mut descs = Vec::with_capacity(info.variants.len());
                 let ci = self.arena.t_comptime_int();
-                for (i, v) in info.variants.iter().enumerate() {
-                    descs.push(self.enum_field_value(&v.name, i as i128, ci));
+                for v in info.variants.iter() {
+                    descs.push(self.enum_field_value(&v.name, v.value, ci));
                 }
                 let slice_ty = {
                     let ef = self.reflect.enum_field;
@@ -407,7 +425,41 @@ impl crate::check::Checker<'_> {
                 };
                 Ok(make(type_info_tag("Enum"), payload))
             }
-            Type::Union(_) => Ok(make(type_info_tag("Union"), Value::Void)),
+            Type::Union(id) => {
+                // The tag (discriminant) type: the inferred enum tag — the smallest
+                // unsigned int that distinguishes the variants — matching the layout
+                // oracle. (An untagged `union {…}` has no discriminant; report `void`.)
+                let info = self.arena.unions[id.0 as usize].clone();
+                let tag = match info.tag {
+                    crate::ty::UnionTagKind::None => self.arena.t_void(),
+                    _ => {
+                        let bits = crate::check::enum_tag_bits(info.variants.len());
+                        self.arena.intern(Type::Int {
+                            signed: false,
+                            bits: crate::ty::IntBits::Fixed(bits),
+                        })
+                    }
+                };
+                let mut descs = Vec::with_capacity(info.variants.len());
+                for v in &info.variants {
+                    descs.push(self.struct_field_value(&v.name, v.payload));
+                }
+                let slice_ty = {
+                    let sf = self.reflect.struct_field;
+                    self.arena.slice(true, sf)
+                };
+                let payload = Value::Struct {
+                    ty: self.struct_payload_union(),
+                    fields: vec![
+                        Value::Type(tag),
+                        Value::Array {
+                            ty: slice_ty,
+                            elems: descs,
+                        },
+                    ],
+                };
+                Ok(make(type_info_tag("Union"), payload))
+            }
             // Genuinely opaque/comptime-unknown: stay deferred.
             _ => Err(Diverge::NotComptime),
         }
@@ -457,6 +509,9 @@ impl crate::check::Checker<'_> {
     }
     fn struct_payload_enum(&self) -> TypeId {
         self.type_info_payload("Enum")
+    }
+    fn struct_payload_union(&self) -> TypeId {
+        self.type_info_payload("Union")
     }
 
     /// The payload struct type of a named `TypeInfo` variant.
@@ -878,6 +933,43 @@ impl crate::check::Checker<'_> {
                 let tag = self.arena.enums[id.0 as usize].tag;
                 self.layout_depth(tag, depth + 1)
             }
+            // A `union(enum)` is laid out like a generalized error-union: a
+            // discriminant (tag) at +0, then a payload area sized to the LARGEST
+            // variant and aligned to the strictest variant. The tag is the inferred
+            // enum tag (`enum_tag_bits(n)` bits, unsigned), giving a 1-byte tag for
+            // up to 256 variants. A bare `union {…}` (`UnionTagKind::None`) carries
+            // no tag, so the payload starts at +0. This MUST match the native port
+            // in `k2-codegen/src/layout.rs` exactly. (Explicit `union(TagType)` reuses
+            // the inferred width: the tag expression is not retained past resolution.)
+            Type::Union(id) => {
+                let info = &self.arena.unions[id.0 as usize];
+                let tag = match info.tag {
+                    crate::ty::UnionTagKind::None => Layout { size: 0, align: 1 },
+                    _ => {
+                        let sz = int_byte_size(IntBits::Fixed(crate::check::enum_tag_bits(
+                            info.variants.len(),
+                        )));
+                        Layout {
+                            size: sz,
+                            align: sz.max(1),
+                        }
+                    }
+                };
+                let variants = info.variants.clone();
+                let mut payload_size = 0u64;
+                let mut payload_align = 1u64;
+                for v in &variants {
+                    let pl = self.layout_depth(v.payload, depth + 1)?;
+                    payload_size = payload_size.max(pl.size);
+                    payload_align = payload_align.max(pl.align);
+                }
+                let align = tag.align.max(payload_align);
+                let payload_off = round_up(tag.size, payload_align);
+                Some(Layout {
+                    size: round_up(payload_off + payload_size, align),
+                    align,
+                })
+            }
             _ => None,
         }
     }
@@ -1153,6 +1245,56 @@ impl crate::check::Checker<'_> {
                 // Value-preserving comptime casts: evaluate the (last) operand.
                 let operand = args.last().ok_or(Diverge::NotComptime)?;
                 self.eval_expr(env, operand)
+            }
+            "@intFromEnum" => {
+                // The enum's integer tag VALUE (an explicit `= N`, else the variant
+                // index). `Value::Enum.which` is the declaration index, so map it
+                // through the variant's stored value.
+                let operand = args.last().ok_or(Diverge::NotComptime)?;
+                let v = self.eval_expr(env, operand)?;
+                if let Value::Enum { ty, which } = &v {
+                    if let crate::ty::Type::Enum(id) = self.arena.get(*ty) {
+                        if let Some(var) = self.arena.enums[id.0 as usize]
+                            .variants
+                            .get(*which as usize)
+                        {
+                            let cty = self.arena.t_comptime_int();
+                            return Ok(Value::Int(crate::value::ComptimeInt {
+                                v: var.value,
+                                ty: cty,
+                            }));
+                        }
+                    }
+                }
+                Err(Diverge::NotComptime)
+            }
+            "@enumFromInt" => {
+                // Build the enum value whose tag VALUE equals the integer operand,
+                // recovering its declaration index for `Value::Enum.which`. The
+                // result type comes from the checker's recorded type at this span.
+                let operand = args.last().ok_or(Diverge::NotComptime)?;
+                let n = self
+                    .eval_expr(env, operand)?
+                    .as_int()
+                    .ok_or(Diverge::NotComptime)?;
+                let ty = self
+                    .types
+                    .get(&(span.start, span.end))
+                    .copied()
+                    .ok_or(Diverge::NotComptime)?;
+                if let crate::ty::Type::Enum(id) = self.arena.get(ty) {
+                    if let Some(which) = self.arena.enums[id.0 as usize]
+                        .variants
+                        .iter()
+                        .position(|v| v.value == n)
+                    {
+                        return Ok(Value::Enum {
+                            ty,
+                            which: which as u32,
+                        });
+                    }
+                }
+                Err(Diverge::NotComptime)
             }
             "@compileError" => {
                 let msg = match args.first() {

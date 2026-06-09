@@ -1,0 +1,45 @@
+// random_shuffle.k2 — `std.Random.shuffle` (Fisher–Yates) and `choice`. Shuffle is
+// deterministic for a seed and must be a PERMUTATION (same multiset); choice
+// returns an in-slice element. Pure integer ops, `{d}` — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var rng = std.Random.init(2024);
+    var a = [_]i64{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    rng.shuffle(i64, &a);
+
+    // Permutation invariants: sum preserved (0+..+9=45), every value 0..9 present.
+    var sum: i64 = 0;
+    for (a) |x| sum += x;
+    var all_present: u8 = 1;
+    var v: i64 = 0;
+    while (v < 10) : (v += 1) {
+        if (std.mem.indexOfScalar(i64, &a, v) == null) all_present = 0;
+    }
+    // It actually moved something (vanishingly unlikely to be the identity here).
+    const moved: u8 = if (a[0] != 0 or a[9] != 9) 1 else 0;
+    try out.print("shuffle: sum={d} permutation={d} moved={d}\n", .{ sum, all_present, moved });
+
+    // Determinism: the same seed reproduces the same shuffle.
+    var rng2 = std.Random.init(2024);
+    var b = [_]i64{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    rng2.shuffle(i64, &b);
+    var same: u8 = 1;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        if (a[i] != b[i]) same = 0;
+    }
+    try out.print("deterministic={d}\n", .{same});
+
+    // choice always lands inside the slice; empty -> null.
+    var hits: usize = 0;
+    var n: usize = 0;
+    while (n < 50) : (n += 1) {
+        const c = rng.choice(i64, &a).?;
+        if (std.mem.contains(i64, &a, c)) hits += 1;
+    }
+    var empty = [_]i64{};
+    try out.print("choice in-slice {d}/50 empty_null={}\n", .{ hits, rng.choice(i64, &empty) == null });
+}

@@ -2192,6 +2192,7 @@ fn rvalue_kind(rv: &Rvalue) -> &'static str {
         Rvalue::MakeNull(_) => "MakeNull",
         Rvalue::MakeOk(..) => "MakeOk",
         Rvalue::MakeErr(..) => "MakeErr",
+        Rvalue::MakeUnion { .. } => "MakeUnion",
         Rvalue::Discriminant { .. } => "Discriminant",
         Rvalue::Aggregate { .. } => "Aggregate",
         Rvalue::Call { .. } => "Call",

@@ -1,0 +1,433 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var gpa
+        (call
+          (field init
+            (field GeneralPurposeAllocator
+              (field heap
+                (ident std)
+              )
+            )
+          )
+          (ident sys)
+        )
+      )
+      (defer
+        (block
+          (const leaked
+            (call
+              (field deinit
+                (ident gpa)
+              )
+            )
+          )
+          (if
+            (cond
+              (ident leaked)
+            )
+            (then
+              (block
+                (expr
+                  (builtin @panic
+                    (str "\"memory leak detected\"")
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (const alloc
+        (call
+          (field allocator
+            (ident gpa)
+          )
+        )
+      )
+      (const n
+        (ty
+          (ident usize)
+        )
+        (int 100)
+      )
+      (var composite
+        (unary try
+          (call
+            (field init
+              (field BitSet
+                (ident std)
+              )
+            )
+            (ident alloc)
+            (binary add
+              (ident n)
+              (int 1)
+            )
+          )
+        )
+      )
+      (defer
+        (expr
+          (call
+            (field deinit
+              (ident composite)
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field set
+            (ident composite)
+          )
+          (int 0)
+        )
+      )
+      (expr
+        (call
+          (field set
+            (ident composite)
+          )
+          (int 1)
+        )
+      )
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 2)
+      )
+      (while
+        (cond
+          (binary le
+            (binary mul
+              (ident i)
+              (ident i)
+            )
+            (ident n)
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (if
+              (cond
+                (unary not
+                  (call
+                    (field isSet
+                      (ident composite)
+                    )
+                    (ident i)
+                  )
+                )
+              )
+              (then
+                (block
+                  (var j
+                    (ty
+                      (ident usize)
+                    )
+                    (binary mul
+                      (ident i)
+                      (ident i)
+                    )
+                  )
+                  (while
+                    (cond
+                      (binary le
+                        (ident j)
+                        (ident n)
+                      )
+                    )
+                    (cont
+                      (assign +=
+                        (ident j)
+                        (ident i)
+                      )
+                    )
+                    (body
+                      (block
+                        (expr
+                          (call
+                            (field set
+                              (ident composite)
+                            )
+                            (ident j)
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (var count
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var largest
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var mismatches
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var k
+        (ty
+          (ident usize)
+        )
+        (int 2)
+      )
+      (while
+        (cond
+          (binary le
+            (ident k)
+            (ident n)
+          )
+        )
+        (cont
+          (assign +=
+            (ident k)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (const sieve_says_prime
+              (unary not
+                (call
+                  (field isSet
+                    (ident composite)
+                  )
+                  (ident k)
+                )
+              )
+            )
+            (if
+              (cond
+                (ident sieve_says_prime)
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident count)
+                    (int 1)
+                  )
+                  (assign =
+                    (ident largest)
+                    (ident k)
+                  )
+                )
+              )
+            )
+            (if
+              (cond
+                (binary ne
+                  (ident sieve_says_prime)
+                  (call
+                    (field isPrime
+                      (field math
+                        (ident std)
+                      )
+                    )
+                    (builtin @as
+                      (ident u64)
+                      (ident k)
+                    )
+                  )
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident mismatches)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"primes <= {d}: count={d} largest={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident n)
+                (ident count)
+                (ident largest)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sieve agrees with isPrime: {d} mismatches\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident mismatches)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"first ten: \"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (var printed
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var p
+        (ty
+          (ident usize)
+        )
+        (int 2)
+      )
+      (while
+        (cond
+          (binary and
+            (binary lt
+              (ident printed)
+              (int 10)
+            )
+            (binary le
+              (ident p)
+              (ident n)
+            )
+          )
+        )
+        (cont
+          (assign +=
+            (ident p)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (if
+              (cond
+                (unary not
+                  (call
+                    (field isSet
+                      (ident composite)
+                    )
+                    (ident p)
+                  )
+                )
+              )
+              (then
+                (block
+                  (expr
+                    (unary try
+                      (call
+                        (field print
+                          (ident out)
+                        )
+                        (str "\"{d} \"")
+                        (init
+                          (ty)
+                          (tuple
+                            (ident p)
+                          )
+                        )
+                      )
+                    )
+                  )
+                  (assign +=
+                    (ident printed)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -1,0 +1,39 @@
+// ringbuffer_bitset.k2 — the allocator-owned stdlib containers `std.RingBuffer`
+// (a fixed-capacity circular FIFO) and `std.BitSet` (a dense bit array), under the
+// leak-checking GPA. Like the other generic containers they run on the VM; the
+// native subset cleanly refuses them, so this is a VM conformance case.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    var gpa = std.heap.GeneralPurposeAllocator.init(sys);
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) @panic("memory leak detected");
+    }
+    const alloc = gpa.allocator();
+
+    // RingBuffer: fill to capacity, wrap around, drain.
+    var ring = try std.RingBuffer(i64).init(alloc, 4);
+    defer ring.deinit();
+    var i: i64 = 1;
+    while (i <= 4) : (i += 1) _ = ring.push(i * 10);
+    const rejected = ring.push(999); // full -> false
+    const first = ring.pop().?;
+    _ = ring.push(50);
+    var sum: i64 = 0;
+    while (ring.pop()) |v| sum += v;
+    try out.print("ring: rejected={} first={d} drained_sum={d}\n", .{ rejected, first, sum });
+
+    // BitSet: set a sparse pattern, clear one, count, query.
+    var bs = try std.BitSet.init(alloc, 200);
+    defer bs.deinit();
+    var k: usize = 0;
+    while (k < 200) : (k += 7) bs.set(k); // every 7th bit
+    const before = bs.popcount();
+    bs.clear(0);
+    try out.print("bitset: set0={} set7={} set8={} count={d} after_clear={d}\n", .{
+        bs.isSet(0), bs.isSet(7), bs.isSet(8), before, bs.popcount(),
+    });
+}

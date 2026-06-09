@@ -1,0 +1,7 @@
+trim=[hello, world] len=12
+indexOf(world)=7 starts=true ends=true count(l)=3
+cmp(abc,abd)=-1 less(ab,abc)=true
+isqrt(1000)=31 log2(1024)=10 pop(255)=8 ctz(40)=3
+divFloor(-7,2)=-4 mod(-1,3)=2 pow2(128)=true satSub(3,9)=0
+hex(k2!)=6b3221 decode=[k2!] n=3
+rev[0]=9 idxOf(4)=3 count(1)=2 contains(2)=false

@@ -1,0 +1,396 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn isAnagram
+    (params
+      (param a
+        (slice :const
+          (ident u8)
+        )
+      )
+      (param b
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (ident bool)
+    )
+    (block
+      (if
+        (cond
+          (binary ne
+            (field len
+              (ident a)
+            )
+            (field len
+              (ident b)
+            )
+          )
+        )
+        (then
+          (block
+            (return
+              (bool false)
+            )
+          )
+        )
+      )
+      (var ba
+        (ty
+          (array-type
+            (len
+              (int 128)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (var bb
+        (ty
+          (array-type
+            (len
+              (int 128)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (expr
+        (call
+          (field copy
+            (field mem
+              (ident std)
+            )
+          )
+          (ident u8)
+          (slice-expr
+            (ident ba)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident a)
+              )
+            )
+          )
+          (ident a)
+        )
+      )
+      (expr
+        (call
+          (field copy
+            (field mem
+              (ident std)
+            )
+          )
+          (ident u8)
+          (slice-expr
+            (ident bb)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident b)
+              )
+            )
+          )
+          (ident b)
+        )
+      )
+      (const S
+        (call
+          (field Sorter
+            (field sort
+              (ident std)
+            )
+          )
+          (ident u8)
+          (call
+            (field asc
+              (field sort
+                (ident std)
+              )
+            )
+            (ident u8)
+          )
+        )
+      )
+      (expr
+        (call
+          (field sort
+            (ident S)
+          )
+          (slice-expr
+            (ident ba)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident a)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (call
+          (field sort
+            (ident S)
+          )
+          (slice-expr
+            (ident bb)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident b)
+              )
+            )
+          )
+        )
+      )
+      (return
+        (call
+          (field eql
+            (field mem
+              (ident std)
+            )
+          )
+          (ident u8)
+          (slice-expr
+            (ident ba)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident a)
+              )
+            )
+          )
+          (slice-expr
+            (ident bb)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident b)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"listen/silent: {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident isAnagram)
+                  (str "\"listen\"")
+                  (str "\"silent\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"elbow/below:   {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident isAnagram)
+                  (str "\"elbow\"")
+                  (str "\"below\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"hello/world:   {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident isAnagram)
+                  (str "\"hello\"")
+                  (str "\"world\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"abc/cba:       {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident isAnagram)
+                  (str "\"abc\"")
+                  (str "\"cba\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"a/aa:          {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident isAnagram)
+                  (str "\"a\"")
+                  (str "\"aa\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (const candidates
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (slice :const
+                (ident u8)
+              )
+            )
+          )
+          (tuple
+            (str "\"tops\"")
+            (str "\"pots\"")
+            (str "\"opts\"")
+            (str "\"spot\"")
+            (str "\"stops\"")
+            (str "\"post\"")
+          )
+        )
+      )
+      (var matches
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident candidates)
+        )
+        (capture c)
+        (body
+          (block
+            (if
+              (cond
+                (call
+                  (ident isAnagram)
+                  (str "\"stop\"")
+                  (ident c)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident matches)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"anagrams of \\\"stop\\\" among 6 candidates: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident matches)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

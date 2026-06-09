@@ -949,6 +949,9 @@ impl<'p> FnLower<'p> {
                         Type::ErrorUnion { .. } => {
                             layout::error_union_payload_off(&self.prog.arena, cur_ty)
                         }
+                        // A `union(enum)` payload sits after the tag, at the union's
+                        // payload offset; an optional's payload is at +0.
+                        Type::Union(_) => layout::union_payload_off(&self.prog.arena, cur_ty),
                         _ => self
                             .eu_payload_of(place.base)
                             .filter(|_| place.proj.len() == 1)
@@ -1543,6 +1546,25 @@ impl<'p> FnLower<'p> {
         operand: &Operand,
     ) -> Result<(), CodegenError> {
         let ty = self.operand_type(operand);
+        // A real `union(enum)` value: read its tag (the active variant index) at
+        // +0 from its stack home, sized to the union's tag width. This is the
+        // generalization of the error-union discriminant (a fixed u16 at +0).
+        if let Some(t) = ty {
+            if let Type::Union(_) = self.prog.arena.get(t) {
+                let tag_size = layout::union_tag_layout(&self.prog.arena, t).size;
+                self.aggregate_operand_addr(operand, ADDR)?;
+                match tag_size {
+                    2 => self.asm.movzx16_mem(Gpr::Rax, ADDR, 0),
+                    4 => self.asm.mov_load32_mem(Gpr::Rax, ADDR, 0),
+                    8 => self.asm.mov_load_mem(Gpr::Rax, ADDR, 0),
+                    // 1 byte (≤256 variants) — and the degenerate untagged 0 case,
+                    // which never reaches here (untagged construction is refused).
+                    _ => self.asm.movzx8_mem(Gpr::Rax, ADDR, 0),
+                }
+                self.store_scalar_result(dst);
+                return Ok(());
+            }
+        }
         let is_enum = ty
             .map(|t| matches!(self.prog.arena.get(t), Type::Enum(_)))
             .unwrap_or(false);
@@ -1689,6 +1711,11 @@ impl<'p> FnLower<'p> {
             Rvalue::MakeNull(oty) => self.build_make_null(home, *oty),
             Rvalue::MakeOk(op, ety) => self.build_make_ok(home, op, *ety, rodata),
             Rvalue::MakeErr(tag, ety) => self.build_make_err(home, tag.0, *ety),
+            Rvalue::MakeUnion {
+                variant,
+                payload,
+                ty,
+            } => self.build_union(home, *variant, payload, *ty, rodata),
             Rvalue::Call { func, args, ty } => {
                 self.lower_call_aggregate(dst, *func, args, *ty, rodata)
             }
@@ -1761,6 +1788,20 @@ impl<'p> FnLower<'p> {
     ) -> Result<(), CodegenError> {
         match op {
             Operand::Copy(src) => {
+                // Reading an AGGREGATE payload out of a `union(enum)` (a `.pair => |p|`
+                // capture whose payload is a struct/array/slice) is outside the native
+                // subset — the same scalar/void-only restriction as union construction
+                // (`build_union`). Refuse cleanly rather than emit a binary that
+                // mis-reads the aggregate payload (these run on the VM).
+                if src.proj.len() == 1 && matches!(src.proj[0], Proj::Payload { .. }) {
+                    let base_ty = self.func.locals[src.base.index()].ty;
+                    if matches!(self.prog.arena.get(base_ty), Type::Union(_)) {
+                        return Err(self.unsup(
+                            "capturing an aggregate (struct/array/slice) union(enum) payload \
+                             (native subset: scalar/void payloads only — run it on the VM)",
+                        ));
+                    }
+                }
                 let src_ty = if src.is_local() {
                     self.func.locals[src.base.index()].ty
                 } else {
@@ -2262,6 +2303,63 @@ impl<'p> FnLower<'p> {
         self.asm.mov_ri(Gpr::Rax, tag as i64);
         self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax);
         Ok(())
+    }
+
+    /// Builds a `union(enum)` value `{tag, payload}` into `home`: the active
+    /// variant's index (tag) at +0, sized to the union's tag width, then the
+    /// variant's payload at the union payload offset. A payload-less variant writes
+    /// only the tag — its payload area is never read (the matching `switch` arm has
+    /// no capture). The payload-storage twin of `build_make_ok`, generalized to N
+    /// variants and a variable tag width; `store_field_operand` handles a scalar,
+    /// float, or nested-aggregate (`struct`) payload uniformly.
+    fn build_union(
+        &mut self,
+        home: i32,
+        variant: u32,
+        payload: &Operand,
+        union_ty: TypeId,
+        rodata: &mut RoData,
+    ) -> Result<(), CodegenError> {
+        // Tag (discriminant) at +0.
+        let tag_size = layout::union_tag_layout(&self.prog.arena, union_ty).size;
+        self.asm.mov_ri(Gpr::Rax, variant as i64);
+        match tag_size {
+            2 => self.asm.mov_store16_mem(Gpr::Rbp, home, Gpr::Rax),
+            4 => self.asm.mov_store32_mem(Gpr::Rbp, home, Gpr::Rax),
+            8 => self.asm.mov_store_mem(Gpr::Rbp, home, Gpr::Rax),
+            _ => self.asm.mov_store8_mem(Gpr::Rbp, home, Gpr::Rax),
+        }
+        // The active variant's payload type (for sizing the store).
+        let payload_ty = if let Type::Union(uid) = self.prog.arena.get(union_ty) {
+            let uid = *uid;
+            self.prog.arena.unions[uid.0 as usize]
+                .variants
+                .get(variant as usize)
+                .map(|v| v.payload)
+        } else {
+            None
+        };
+        let payload_ty = payload_ty.unwrap_or(union_ty);
+        // A payload-less variant (`void` payload): the tag alone defines it.
+        if matches!(self.prog.arena.get(payload_ty), Type::Void) {
+            return Ok(());
+        }
+        // The native subset stores only SCALAR (and `void`) union payloads. A union
+        // with an aggregate (`struct`/array/slice) payload is correct on the VM but
+        // not yet on native: the payload area's second word can be clobbered by an
+        // intermediate temp's frame slot (the union home's padded extent is not
+        // fully reserved against other locals). Rather than miscompile, refuse
+        // cleanly — these unions run on the VM. (Broadening native to aggregate
+        // union payloads is tracked future work; the scalar/void path is verified
+        // byte-identical to the VM across all build modes.)
+        if frame::is_memory_aggregate(&self.prog.arena, payload_ty) {
+            return Err(self.unsup(
+                "union(enum) variant with an aggregate (struct/array/slice) payload \
+                 (native subset: scalar/void payloads only — run it on the VM)",
+            ));
+        }
+        let poff = layout::union_payload_off(&self.prog.arena, union_ty) as i32;
+        self.store_field_operand(home + poff, payload, payload_ty, rodata)
     }
 
     /// Builds `@errorName(e)`'s `[]const u8` name slice into `home`: load the error
@@ -5535,6 +5633,7 @@ fn rvalue_kind(rv: &Rvalue) -> &'static str {
         Rvalue::MakeNull(_) => "MakeNull",
         Rvalue::MakeOk(..) => "MakeOk",
         Rvalue::MakeErr(..) => "MakeErr",
+        Rvalue::MakeUnion { .. } => "MakeUnion",
         Rvalue::Discriminant { .. } => "Discriminant",
         Rvalue::Aggregate { .. } => "Aggregate",
         Rvalue::Call { .. } => "Call",
@@ -5587,6 +5686,7 @@ fn rvalue_builds_aggregate(rv: &Rvalue) -> bool {
             | Rvalue::MakeNull(_)
             | Rvalue::MakeOk(..)
             | Rvalue::MakeErr(..)
+            | Rvalue::MakeUnion { .. }
             | Rvalue::Use(_)
     )
 }

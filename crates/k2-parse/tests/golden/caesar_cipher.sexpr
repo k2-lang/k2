@@ -1,0 +1,385 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn shift
+    (params
+      (param dst
+        (slice
+          (ident u8)
+        )
+      )
+      (param src
+        (slice :const
+          (ident u8)
+        )
+      )
+      (param key
+        (ident u8)
+      )
+    )
+    (ret
+      (slice
+        (ident u8)
+      )
+    )
+    (block
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (field len
+              (ident src)
+            )
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (const c
+              (index
+                (ident src)
+                (ident i)
+              )
+            )
+            (if
+              (cond
+                (binary and
+                  (binary ge
+                    (ident c)
+                    (char "'a'")
+                  )
+                  (binary le
+                    (ident c)
+                    (char "'z'")
+                  )
+                )
+              )
+              (then
+                (block
+                  (assign =
+                    (index
+                      (ident dst)
+                      (ident i)
+                    )
+                    (binary add
+                      (char "'a'")
+                      (binary rem
+                        (binary add
+                          (binary sub
+                            (ident c)
+                            (char "'a'")
+                          )
+                          (ident key)
+                        )
+                        (int 26)
+                      )
+                    )
+                  )
+                )
+              )
+              (else
+                (block
+                  (if
+                    (cond
+                      (binary and
+                        (binary ge
+                          (ident c)
+                          (char "'A'")
+                        )
+                        (binary le
+                          (ident c)
+                          (char "'Z'")
+                        )
+                      )
+                    )
+                    (then
+                      (block
+                        (assign =
+                          (index
+                            (ident dst)
+                            (ident i)
+                          )
+                          (binary add
+                            (char "'A'")
+                            (binary rem
+                              (binary add
+                                (binary sub
+                                  (ident c)
+                                  (char "'A'")
+                                )
+                                (ident key)
+                              )
+                              (int 26)
+                            )
+                          )
+                        )
+                      )
+                    )
+                    (else
+                      (block
+                        (assign =
+                          (index
+                            (ident dst)
+                            (ident i)
+                          )
+                          (ident c)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (slice-expr
+          (ident dst)
+          (lo
+            (int 0)
+          )
+          (hi
+            (field len
+              (ident src)
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (const message
+        (str "\"Attack at Dawn, k2!\"")
+      )
+      (const key
+        (ty
+          (ident u8)
+        )
+        (int 3)
+      )
+      (var enc_buf
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const encrypted
+        (call
+          (ident shift)
+          (unary addrof
+            (ident enc_buf)
+          )
+          (ident message)
+          (ident key)
+        )
+      )
+      (var dec_buf
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const decrypted
+        (call
+          (ident shift)
+          (unary addrof
+            (ident dec_buf)
+          )
+          (ident encrypted)
+          (binary sub
+            (int 26)
+            (ident key)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"plain:     {s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident message)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"encrypted: {s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident encrypted)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"decrypted: {s}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident decrypted)
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"round-trip ok: {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field equal
+                    (field str
+                      (ident std)
+                    )
+                  )
+                  (ident message)
+                  (ident decrypted)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var r1
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (var r2
+        (ty
+          (array-type
+            (len
+              (int 64)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const once
+        (call
+          (ident shift)
+          (unary addrof
+            (ident r1)
+          )
+          (ident message)
+          (int 13)
+        )
+      )
+      (const twice
+        (call
+          (ident shift)
+          (unary addrof
+            (ident r2)
+          )
+          (ident once)
+          (int 13)
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"rot13 twice == plain: {}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (field equal
+                    (field str
+                      (ident std)
+                    )
+                  )
+                  (ident message)
+                  (ident twice)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

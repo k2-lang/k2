@@ -1,0 +1,268 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var data
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident i64)
+            )
+          )
+          (tuple
+            (int 23)
+            (int 7)
+            (int 42)
+            (int 15)
+            (int 8)
+            (int 4)
+            (int 16)
+            (int 99)
+            (int 1)
+            (int 30)
+          )
+        )
+      )
+      (const n
+        (field len
+          (ident data)
+        )
+      )
+      (expr
+        (call
+          (field sort
+            (call
+              (field Sorter
+                (field sort
+                  (ident std)
+                )
+              )
+              (ident i64)
+              (call
+                (field asc
+                  (field sort
+                    (ident std)
+                  )
+                )
+                (ident i64)
+              )
+            )
+          )
+          (unary addrof
+            (ident data)
+          )
+        )
+      )
+      (const min
+        (index
+          (ident data)
+          (int 0)
+        )
+      )
+      (const max
+        (index
+          (ident data)
+          (binary sub
+            (ident n)
+            (int 1)
+          )
+        )
+      )
+      (const sum
+        (call
+          (field sumSlice
+            (field math
+              (ident std)
+            )
+          )
+          (ident i64)
+          (unary addrof
+            (ident data)
+          )
+        )
+      )
+      (const count
+        (ty
+          (ident i64)
+        )
+        (builtin @as
+          (ident i64)
+          (builtin @intCast
+            (ident n)
+          )
+        )
+      )
+      (const mean
+        (binary div
+          (ident sum)
+          (ident count)
+        )
+      )
+      (const median
+        (if
+          (cond
+            (binary eq
+              (binary rem
+                (ident n)
+                (int 2)
+              )
+              (int 1)
+            )
+          )
+          (then
+            (index
+              (ident data)
+              (binary div
+                (ident n)
+                (int 2)
+              )
+            )
+          )
+          (else
+            (binary div
+              (binary add
+                (index
+                  (ident data)
+                  (binary sub
+                    (binary div
+                      (ident n)
+                      (int 2)
+                    )
+                    (int 1)
+                  )
+                )
+                (index
+                  (ident data)
+                  (binary div
+                    (ident n)
+                    (int 2)
+                  )
+                )
+              )
+              (int 2)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"n={d} min={d} max={d} range={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident n)
+                (ident min)
+                (ident max)
+                (binary sub
+                  (ident max)
+                  (ident min)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"sum={d} mean={d} median={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident sum)
+                (ident mean)
+                (ident median)
+              )
+            )
+          )
+        )
+      )
+      (var above
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (for
+        (operands
+          (ident data)
+        )
+        (capture x)
+        (body
+          (block
+            (if
+              (cond
+                (binary gt
+                  (ident x)
+                  (ident mean)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident above)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"above mean: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident above)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

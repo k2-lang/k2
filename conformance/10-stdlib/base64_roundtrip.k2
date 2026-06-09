@@ -1,0 +1,25 @@
+// base64_roundtrip.k2 — `std.base64` (RFC 4648, `=`-padded) over caller buffers.
+// The canonical test vectors ("" "f" "fo" "foo" "foob" "fooba" "foobar") pin the
+// `=`-padding edge cases, and every input round-trips back through `decode`. Pure
+// (no allocator) and `{s}`/`{d}` only — native-capable.
+const std = @import("std");
+
+fn check(out: anytype, src: []const u8) !void {
+    var ebuf: [32]u8 = undefined;
+    const enc = std.base64.encode(&ebuf, src);
+    var dbuf: [32]u8 = undefined;
+    const n = std.base64.decode(&dbuf, enc).?;
+    const ok: u8 = if (std.str.equal(src, dbuf[0..n])) 1 else 0;
+    try out.print("{s} rt={d}\n", .{ enc, ok });
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    try check(out, "");
+    try check(out, "f");
+    try check(out, "fo");
+    try check(out, "foo");
+    try check(out, "foob");
+    try check(out, "fooba");
+    try check(out, "foobar");
+}

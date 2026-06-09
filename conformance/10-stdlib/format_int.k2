@@ -1,0 +1,45 @@
+// format_int.k2 — `std.fmt.formatUintRadix`/`formatInt`: integer-to-string into a
+// caller buffer (base 2–36, lowercase; signed decimal incl. i64::MIN), and a
+// parse→format round-trip. Pure (no allocator), `{s}` only — native-capable.
+const std = @import("std");
+
+fn fu(out: anytype, v: u64, radix: u8) !void {
+    var b: [64]u8 = undefined;
+    try out.print("{s} ", .{std.fmt.formatUintRadix(&b, v, radix)});
+}
+fn fi(out: anytype, v: i64) !void {
+    var b: [32]u8 = undefined;
+    try out.print("{s} ", .{std.fmt.formatInt(&b, v)});
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Unsigned across radices.
+    try out.print("radix: ", .{});
+    try fu(out, 255, 10);
+    try fu(out, 255, 16);
+    try fu(out, 10, 2);
+    try fu(out, 1299629, 36); // "rust"
+    try fu(out, 0, 10);
+    try out.print("\n", .{});
+
+    // Signed decimal, including the i64 minimum.
+    try out.print("signed: ", .{});
+    try fi(out, 42);
+    try fi(out, -987);
+    try fi(out, -9223372036854775808);
+    try fi(out, 9223372036854775807);
+    try out.print("\n", .{});
+
+    // Round-trip every value through parseInt -> formatInt.
+    const samples = [_][]const u8{ "0", "-1", "2147483647", "-9223372036854775808" };
+    try out.print("roundtrip: ", .{});
+    for (samples) |s| {
+        const v = std.fmt.parseInt(s).?;
+        var b: [32]u8 = undefined;
+        const back = std.fmt.formatInt(&b, v);
+        try out.print("{} ", .{std.str.equal(s, back)});
+    }
+    try out.print("\n", .{});
+}

@@ -63,6 +63,7 @@ const VM_RUNNABLE: &[&str] = &[
     "hello",
     "errors",
     "allocators",
+    "unions",
     "generic_list",
     "data_structures",
     "concurrency",
@@ -70,8 +71,9 @@ const VM_RUNNABLE: &[&str] = &[
 ];
 
 /// Examples whose native binary matches the VM byte-for-byte (the differential
-/// contract). The rest are cleanly refused by the native subset.
-const NATIVE_PARITY: &[&str] = &["hello", "errors", "allocators"];
+/// contract). The rest are cleanly refused by the native subset. `unions` uses
+/// only scalar union payloads, which the native backend fully supports.
+const NATIVE_PARITY: &[&str] = &["hello", "errors", "allocators", "unions"];
 
 /// Examples the native backend must cleanly REFUSE (outside the native subset),
 /// never miscompile. (They all run on the VM.)

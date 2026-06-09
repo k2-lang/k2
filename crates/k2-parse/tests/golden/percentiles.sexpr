@@ -1,0 +1,300 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (const S
+    (call
+      (field Sorter
+        (field sort
+          (ident std)
+        )
+      )
+      (ident i64)
+      (call
+        (field asc
+          (field sort
+            (ident std)
+          )
+        )
+        (ident i64)
+      )
+    )
+  )
+  (const data
+    (init
+      (ty
+        (array-type
+          (len
+            (ident _)
+          )
+          (ident i64)
+        )
+      )
+      (tuple
+        (int 23)
+        (int 7)
+        (int 91)
+        (int 42)
+        (int 15)
+        (int 68)
+        (int 4)
+        (int 50)
+        (int 33)
+        (int 80)
+        (int 12)
+        (int 60)
+        (int 28)
+        (int 75)
+        (int 19)
+        (int 88)
+        (int 1)
+        (int 55)
+        (int 37)
+        (int 99)
+      )
+    )
+  )
+  (fn percentile
+    (params
+      (param p
+        (ident u64)
+      )
+    )
+    (ret
+      (ident i64)
+    )
+    (block
+      (var copy
+        (ident data)
+      )
+      (const n
+        (field len
+          (ident copy)
+        )
+      )
+      (var rank
+        (ty
+          (ident usize)
+        )
+        (builtin @as
+          (ident usize)
+          (builtin @intCast
+            (binary div
+              (binary mul
+                (ident p)
+                (builtin @as
+                  (ident u64)
+                  (ident n)
+                )
+              )
+              (int 100)
+            )
+          )
+        )
+      )
+      (if
+        (cond
+          (binary ge
+            (ident rank)
+            (ident n)
+          )
+        )
+        (then
+          (block
+            (assign =
+              (ident rank)
+              (binary sub
+                (ident n)
+                (int 1)
+              )
+            )
+          )
+        )
+      )
+      (return
+        (unwrap
+          (call
+            (field quickselect
+              (ident S)
+            )
+            (slice-expr
+              (ident copy)
+              (lo
+                (int 0)
+              )
+              (hi
+                (ident n)
+              )
+            )
+            (ident rank)
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"n={d} min={d} max={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (field len
+                  (ident data)
+                )
+                (call
+                  (ident percentile)
+                  (int 0)
+                )
+                (call
+                  (ident percentile)
+                  (int 100)
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"p25={d} p50={d} p75={d} p90={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident percentile)
+                  (int 25)
+                )
+                (call
+                  (ident percentile)
+                  (int 50)
+                )
+                (call
+                  (ident percentile)
+                  (int 75)
+                )
+                (call
+                  (ident percentile)
+                  (int 90)
+                )
+              )
+            )
+          )
+        )
+      )
+      (var sorted
+        (ident data)
+      )
+      (expr
+        (call
+          (field sort
+            (ident S)
+          )
+          (slice-expr
+            (ident sorted)
+            (lo
+              (int 0)
+            )
+            (hi
+              (field len
+                (ident sorted)
+              )
+            )
+          )
+        )
+      )
+      (var copy
+        (ident data)
+      )
+      (const med
+        (unwrap
+          (call
+            (field median
+              (ident S)
+            )
+            (slice-expr
+              (ident copy)
+              (lo
+                (int 0)
+              )
+              (hi
+                (field len
+                  (ident copy)
+                )
+              )
+            )
+          )
+        )
+      )
+      (const ref
+        (index
+          (ident sorted)
+          (binary div
+            (binary sub
+              (field len
+                (ident sorted)
+              )
+              (int 1)
+            )
+            (int 2)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"median={d} matches_sorted={}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident med)
+                (binary eq
+                  (ident med)
+                  (ident ref)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

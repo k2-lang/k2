@@ -1,0 +1,33 @@
+// enum_explicit_values.k2 — an `enum(u8) { a = N, … }` honors its explicit integer
+// values (spec §9): `@intFromEnum` yields the value, `switch` matches by value, and
+// `@enumFromInt` recovers the variant. A bare (valueless) enum still numbers its
+// variants 0, 1, 2, …. All values fit u8 here, keeping it in the native subset.
+const std = @import("std");
+
+const Status = enum(u8) { ok = 0, busy = 10, gone = 200 };
+const Plain = enum { x, y, z }; // 0, 1, 2
+
+fn classify(s: Status) u8 {
+    return switch (s) {
+        .ok => 1,
+        .busy => 2,
+        .gone => 3,
+    };
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const a: Status = .busy;
+    const b: Status = .gone;
+    // @intFromEnum yields the EXPLICIT value.
+    try out.print("values: {d} {d}\n", .{ @intFromEnum(a), @intFromEnum(b) });
+    // switch dispatches on the value.
+    try out.print("classify: {d} {d}\n", .{ classify(a), classify(b) });
+    // @enumFromInt recovers the variant from its value, then re-classify.
+    const c: Status = @enumFromInt(@as(u8, 200));
+    try out.print("roundtrip: {d}\n", .{classify(c)});
+    // a plain enum still uses 0/1/2.
+    const p: Plain = .z;
+    try out.print("plain: {d}\n", .{@intFromEnum(p)});
+}

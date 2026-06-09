@@ -1,0 +1,57 @@
+// recursive_types.k2 — a struct field may point to its OWN type via `?*@This()`,
+// the building block for linked lists, trees, and graphs. This was previously
+// rejected ("expected ?*deferred, found *Node"): the struct's type was not visible
+// while its fields were evaluated. Both a TOP-LEVEL self-referential struct and a
+// GENERIC node type `Node(T)` are exercised; the nodes live on the stack here and
+// are linked by pointer, so it stays in the native subset.
+const std = @import("std");
+
+// A top-level self-referential singly-linked node.
+const IntNode = struct {
+    value: i64,
+    next: ?*@This(),
+};
+
+// A generic recursive binary-tree node.
+fn TreeNode(comptime T: type) type {
+    return struct {
+        value: T,
+        left: ?*@This(),
+        right: ?*@This(),
+    };
+}
+
+// Recursive in-order sum over a generic tree (a function taking the node pointer).
+fn treeSum(node: ?*TreeNode(i64)) i64 {
+    if (node) |n| {
+        return treeSum(n.left) + n.value + treeSum(n.right);
+    }
+    return 0;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Build 1 -> 2 -> 3 on the stack and sum by walking `next`.
+    var c = IntNode{ .value = 3, .next = null };
+    var b = IntNode{ .value = 2, .next = &c };
+    var a = IntNode{ .value = 1, .next = &b };
+    var sum: i64 = 0;
+    var cur: ?*IntNode = &a;
+    while (cur) |node| {
+        sum += node.value;
+        cur = node.next;
+    }
+    try out.print("list sum={d}\n", .{sum});
+
+    // Build a small BST and sum it in order:        4
+    //                                              / \
+    //                                             2   6
+    const N = TreeNode(i64);
+    var n2 = N{ .value = 2, .left = null, .right = null };
+    var n6 = N{ .value = 6, .left = null, .right = null };
+    var root = N{ .value = 4, .left = &n2, .right = &n6 };
+    try out.print("tree sum={d} root.left={d} root.right={d}\n", .{
+        treeSum(&root), root.left.?.*.value, root.right.?.*.value,
+    });
+}

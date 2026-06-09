@@ -1,0 +1,34 @@
+// struct_by_value_abi.k2 — passing a struct BY VALUE across the System V ABI at
+// the sizes that exercise each register class: 8 bytes (one INTEGER eightbyte),
+// 12 bytes (a register PAIR whose second word is partial), and 16 bytes (two full
+// eightbytes). The 9–15 byte case is the one that needs the home padded up to a
+// multiple of 8: the callee receives the value with two 8-byte register stores,
+// so a home sized to the exact 12 bytes would have the second store spill into the
+// adjacent frame slot. This must read back every field correctly on both backends.
+const std = @import("std");
+
+const Pair = struct { a: u32, b: u32 }; //  8 bytes — OneInt
+const Trio = struct { a: u32, b: u32, c: u32 }; // 12 bytes — TwoInt (partial 2nd word)
+const Quad = struct { a: u32, b: u32, c: u32, d: u32 }; // 16 bytes — TwoInt (full)
+
+fn sumPair(p: Pair) u32 {
+    return p.a + p.b;
+}
+fn sumTrio(t: Trio) u32 {
+    return t.a + t.b + t.c;
+}
+fn sumQuad(q: Quad) u32 {
+    return q.a + q.b + q.c + q.d;
+}
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    const p: Pair = .{ .a = 10, .b = 20 };
+    const t: Trio = .{ .a = 100, .b = 20, .c = 3 };
+    const q: Quad = .{ .a = 1, .b = 2, .c = 3, .d = 4 };
+
+    try out.print("pair = {d}\n", .{sumPair(p)});
+    try out.print("trio = {d}\n", .{sumTrio(t)});
+    try out.print("quad = {d}\n", .{sumQuad(q)});
+}

@@ -1,0 +1,616 @@
+(source-file
+  (const std
+    (builtin @import
+      (str "\"std\"")
+    )
+  )
+  (const values
+    (init
+      (ty
+        (array-type
+          (len
+            (ident _)
+          )
+          (ident u64)
+        )
+      )
+      (tuple
+        (int 1000)
+        (int 900)
+        (int 500)
+        (int 400)
+        (int 100)
+        (int 90)
+        (int 50)
+        (int 40)
+        (int 10)
+        (int 9)
+        (int 5)
+        (int 4)
+        (int 1)
+      )
+    )
+  )
+  (const symbols
+    (init
+      (ty
+        (array-type
+          (len
+            (ident _)
+          )
+          (slice :const
+            (ident u8)
+          )
+        )
+      )
+      (tuple
+        (str "\"M\"")
+        (str "\"CM\"")
+        (str "\"D\"")
+        (str "\"CD\"")
+        (str "\"C\"")
+        (str "\"XC\"")
+        (str "\"L\"")
+        (str "\"XL\"")
+        (str "\"X\"")
+        (str "\"IX\"")
+        (str "\"V\"")
+        (str "\"IV\"")
+        (str "\"I\"")
+      )
+    )
+  )
+  (fn toRoman
+    (params
+      (param dst
+        (slice
+          (ident u8)
+        )
+      )
+      (param n
+        (ident u64)
+      )
+    )
+    (ret
+      (slice
+        (ident u8)
+      )
+    )
+    (block
+      (var rem
+        (ident n)
+      )
+      (var di
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var k
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident k)
+            (field len
+              (ident values)
+            )
+          )
+        )
+        (cont
+          (assign +=
+            (ident k)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (while
+              (cond
+                (binary ge
+                  (ident rem)
+                  (index
+                    (ident values)
+                    (ident k)
+                  )
+                )
+              )
+              (body
+                (block
+                  (const sym
+                    (index
+                      (ident symbols)
+                      (ident k)
+                    )
+                  )
+                  (var j
+                    (ty
+                      (ident usize)
+                    )
+                    (int 0)
+                  )
+                  (while
+                    (cond
+                      (binary lt
+                        (ident j)
+                        (field len
+                          (ident sym)
+                        )
+                      )
+                    )
+                    (cont
+                      (assign +=
+                        (ident j)
+                        (int 1)
+                      )
+                    )
+                    (body
+                      (block
+                        (assign =
+                          (index
+                            (ident dst)
+                            (ident di)
+                          )
+                          (index
+                            (ident sym)
+                            (ident j)
+                          )
+                        )
+                        (assign +=
+                          (ident di)
+                          (int 1)
+                        )
+                      )
+                    )
+                  )
+                  (assign -=
+                    (ident rem)
+                    (index
+                      (ident values)
+                      (ident k)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (slice-expr
+          (ident dst)
+          (lo
+            (int 0)
+          )
+          (hi
+            (ident di)
+          )
+        )
+      )
+    )
+  )
+  (fn digit
+    (params
+      (param c
+        (ident u8)
+      )
+    )
+    (ret
+      (ident u64)
+    )
+    (block
+      (return
+        (switch
+          (on
+            (ident c)
+          )
+          (arm
+            (pattern
+              (char "'I'")
+            )
+            (body
+              (int 1)
+            )
+          )
+          (arm
+            (pattern
+              (char "'V'")
+            )
+            (body
+              (int 5)
+            )
+          )
+          (arm
+            (pattern
+              (char "'X'")
+            )
+            (body
+              (int 10)
+            )
+          )
+          (arm
+            (pattern
+              (char "'L'")
+            )
+            (body
+              (int 50)
+            )
+          )
+          (arm
+            (pattern
+              (char "'C'")
+            )
+            (body
+              (int 100)
+            )
+          )
+          (arm
+            (pattern
+              (char "'D'")
+            )
+            (body
+              (int 500)
+            )
+          )
+          (arm
+            (pattern
+              (char "'M'")
+            )
+            (body
+              (int 1000)
+            )
+          )
+          (arm
+            (else)
+            (body
+              (int 0)
+            )
+          )
+        )
+      )
+    )
+  )
+  (fn fromRoman
+    (params
+      (param s
+        (slice :const
+          (ident u8)
+        )
+      )
+    )
+    (ret
+      (ident u64)
+    )
+    (block
+      (var total
+        (ty
+          (ident i64)
+        )
+        (int 0)
+      )
+      (var i
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (while
+        (cond
+          (binary lt
+            (ident i)
+            (field len
+              (ident s)
+            )
+          )
+        )
+        (cont
+          (assign +=
+            (ident i)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (const cur
+              (builtin @as
+                (ident i64)
+                (builtin @intCast
+                  (call
+                    (ident digit)
+                    (index
+                      (ident s)
+                      (ident i)
+                    )
+                  )
+                )
+              )
+            )
+            (if
+              (cond
+                (binary and
+                  (binary lt
+                    (binary add
+                      (ident i)
+                      (int 1)
+                    )
+                    (field len
+                      (ident s)
+                    )
+                  )
+                  (binary lt
+                    (ident cur)
+                    (builtin @as
+                      (ident i64)
+                      (builtin @intCast
+                        (call
+                          (ident digit)
+                          (index
+                            (ident s)
+                            (binary add
+                              (ident i)
+                              (int 1)
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+              (then
+                (block
+                  (assign -=
+                    (ident total)
+                    (ident cur)
+                  )
+                )
+              )
+              (else
+                (block
+                  (assign +=
+                    (ident total)
+                    (ident cur)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (return
+        (builtin @as
+          (ident u64)
+          (builtin @intCast
+            (ident total)
+          )
+        )
+      )
+    )
+  )
+  (fn :pub main
+    (params
+      (param sys
+        (ptr
+          (ident System)
+        )
+      )
+    )
+    (ret
+      (err-union
+        (err)
+        (ok
+          (ident void)
+        )
+      )
+    )
+    (block
+      (const out
+        (call
+          (field stdout
+            (field io
+              (ident sys)
+            )
+          )
+        )
+      )
+      (var buf
+        (ty
+          (array-type
+            (len
+              (int 32)
+            )
+            (ident u8)
+          )
+        )
+        (undefined)
+      )
+      (const samples
+        (init
+          (ty
+            (array-type
+              (len
+                (ident _)
+              )
+              (ident u64)
+            )
+          )
+          (tuple
+            (int 4)
+            (int 9)
+            (int 14)
+            (int 40)
+            (int 90)
+            (int 2024)
+            (int 3888)
+            (int 1994)
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"to roman: \"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (for
+        (operands
+          (ident samples)
+        )
+        (capture n)
+        (body
+          (block
+            (expr
+              (unary try
+                (call
+                  (field print
+                    (ident out)
+                  )
+                  (str "\"{s} \"")
+                  (init
+                    (ty)
+                    (tuple
+                      (call
+                        (ident toRoman)
+                        (unary addrof
+                          (ident buf)
+                        )
+                        (ident n)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"\\n\"")
+            (init
+              (ty)
+              (tuple)
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"from roman: MMXXIV={d} MCMXCIV={d} MMMDCCCLXXXVIII={d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (call
+                  (ident fromRoman)
+                  (str "\"MMXXIV\"")
+                )
+                (call
+                  (ident fromRoman)
+                  (str "\"MCMXCIV\"")
+                )
+                (call
+                  (ident fromRoman)
+                  (str "\"MMMDCCCLXXXVIII\"")
+                )
+              )
+            )
+          )
+        )
+      )
+      (var mismatches
+        (ty
+          (ident usize)
+        )
+        (int 0)
+      )
+      (var v
+        (ty
+          (ident u64)
+        )
+        (int 1)
+      )
+      (while
+        (cond
+          (binary le
+            (ident v)
+            (int 1000)
+          )
+        )
+        (cont
+          (assign +=
+            (ident v)
+            (int 1)
+          )
+        )
+        (body
+          (block
+            (const r
+              (call
+                (ident toRoman)
+                (unary addrof
+                  (ident buf)
+                )
+                (ident v)
+              )
+            )
+            (if
+              (cond
+                (binary ne
+                  (call
+                    (ident fromRoman)
+                    (ident r)
+                  )
+                  (ident v)
+                )
+              )
+              (then
+                (block
+                  (assign +=
+                    (ident mismatches)
+                    (int 1)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr
+        (unary try
+          (call
+            (field print
+              (ident out)
+            )
+            (str "\"round-trip 1..1000 mismatches: {d}\\n\"")
+            (init
+              (ty)
+              (tuple
+                (ident mismatches)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

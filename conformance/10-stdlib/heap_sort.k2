@@ -1,0 +1,39 @@
+// heap_sort.k2 — `std.sort.Sorter.heapSort`, the in-place O(n log n)-worst-case
+// sort, checked for correctness and against the existing quicksort `sort` on the
+// same data, plus edge cases (empty / single / all-equal). VM case.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+    const S = std.sort.Sorter(i64, std.sort.asc(i64));
+
+    // A reversed run with duplicates; heapSort must fully order it.
+    var a = [_]i64{ 9, 7, 5, 3, 1, 8, 6, 4, 2, 0, 5, 5, 1 };
+    S.heapSort(&a);
+    var sum: i64 = 0;
+    for (a) |x| sum += x;
+    try out.print("sorted={} first={d} last={d} sum={d}\n", .{ S.isSorted(&a), a[0], a[a.len - 1], sum });
+
+    // heapSort and quicksort `sort` agree on the same input.
+    var b1 = [_]i64{ 42, -7, 0, 99, -7, 13, 42, 1, -100 };
+    var b2 = [_]i64{ 42, -7, 0, 99, -7, 13, 42, 1, -100 };
+    S.heapSort(&b1);
+    S.sort(&b2);
+    var agree: u8 = 1;
+    var i: usize = 0;
+    while (i < b1.len) : (i += 1) {
+        if (b1[i] != b2[i]) agree = 0;
+    }
+    try out.print("heap==quick: {d} median={d}\n", .{ agree, b1[b1.len / 2] });
+
+    // Edge cases: empty, single, all-equal stay valid.
+    var e0 = [_]i64{};
+    var e1 = [_]i64{77};
+    var eq = [_]i64{ 5, 5, 5, 5 };
+    S.heapSort(&e0);
+    S.heapSort(&e1);
+    S.heapSort(&eq);
+    try out.print("edges: empty={} single={} equal={}\n", .{
+        S.isSorted(&e0), S.isSorted(&e1), S.isSorted(&eq),
+    });
+}

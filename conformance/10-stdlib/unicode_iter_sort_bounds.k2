@@ -1,0 +1,28 @@
+// unicode_iter_sort_bounds.k2 — `std.unicode.iterate` (a UTF-8 codepoint
+// iterator) and the sorted-array `lowerBound`/`upperBound` binary-search variants
+// on `std.sort.Sorter`. Pure (no allocator); `{d}`/`{x}` only — native-capable.
+const std = @import("std");
+
+pub fn main(sys: *System) !void {
+    const out = sys.io.stdout();
+
+    // Walk the codepoints of a mixed ASCII/multibyte string and tally bytes-per-cp.
+    var it = std.unicode.iterate("aé→𝄞z"); // 1 + 2 + 3 + 4 + 1 bytes
+    var count: usize = 0;
+    var maxcp: u32 = 0;
+    while (it.next()) |cp| {
+        count += 1;
+        if (cp > maxcp) maxcp = cp;
+    }
+    try out.print("codepoints={d} max=0x{x}\n", .{ count, maxcp });
+
+    // lowerBound / upperBound bracket a run of equal keys in a sorted array.
+    const arr = [_]i64{ 10, 20, 20, 20, 30, 40, 40 };
+    const lb20 = std.sort.Sorter(i64, std.sort.asc(i64)).lowerBound(&arr, 20);
+    const ub20 = std.sort.Sorter(i64, std.sort.asc(i64)).upperBound(&arr, 20);
+    const lb25 = std.sort.Sorter(i64, std.sort.asc(i64)).lowerBound(&arr, 25);
+    const ub40 = std.sort.Sorter(i64, std.sort.asc(i64)).upperBound(&arr, 40);
+    try out.print("lb20={d} ub20={d} mult20={d} lb25={d} ub40={d}\n", .{
+        lb20, ub20, ub20 - lb20, lb25, ub40,
+    });
+}

@@ -1,0 +1,3 @@
+nfields=4 first=[usr] last=[k2]
+joined=[usr > local > bin > k2]
+empty-fields count=4
